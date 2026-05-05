@@ -12,21 +12,20 @@ import argparse
 import json
 import os
 import subprocess
-import sys
-import textwrap
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+from openclaw_speed_research_core import (
+    RESULTS_HEADER,
+    append_result,
+    ensure_research_state,
+)
 
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8091/v1"
-RESULTS_HEADER = (
-    "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
-    "wall_s\tmemory_gb\tcommit\tnotes\n"
-)
 
 
 def home() -> Path:
@@ -331,7 +330,7 @@ The wrapper and autopilot own workspace bootstrap. Do not spend a model turn rea
 
 In a fresh agent run, perform one of these narrow actions:
 
-1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`.
 2. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
 3. Run exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 
@@ -344,7 +343,7 @@ Allowed narrow actions are:
 - `read` a single explicit file path from Scope or `sources/queue.md`.
 - `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 - `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
-- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`.
 - `exec` one exact log tail, such as `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
 
 Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`, recursive `rg` over home, `mdfind`, and any broad command intended to discover files. If you need a file, use the explicit paths in this program.
@@ -364,7 +363,7 @@ Useful commands:
 openclaw speed-research-setup
 openclaw speed-research-prompt
 openclaw speed-research-auto
-openclaw speed-research-benchmark --quick
+openclaw speed-research-benchmark --mode streaming-ttft
 ```
 
 Implementation is intentionally a separate gated phase. Before keeping production changes, read `implementation-skill.md` and follow its plan/test/deploy/record checklist.
@@ -383,6 +382,16 @@ Use this skill when a research finding is ready to become a source change. The g
 Start implementation only when there is one accepted insight with evidence from `results.tsv`, a benchmark JSON file, a log excerpt, or a source note in `ideas.md`.
 
 Do not implement from a vague hunch. If evidence is missing, run one narrow experiment first.
+
+## Pre-Implementation Gate
+
+Before editing source, state:
+
+- The OpenClaw subsystem being changed and how it affects runtime, memory, tool calling, context size, and live deployment.
+- Why the design is minimal, readable, and efficient enough for another software engineer to maintain.
+- The exact metric, guardrail, failure mode, and rollback path.
+- The prompt-size, memory, timeout, tool-loop, and context-regression blind spots.
+- That opencode is out of scope and untouched.
 
 ## Implementation Loop
 
@@ -417,6 +426,7 @@ Before marking a change `keep`, verify:
 - The test would fail without the change.
 - The deployment path is explicit.
 - The benchmark or blocker is recorded.
+- A staged diff secret scan found no `.env`, tokens, passwords, keys, private config, or sensitive logs.
 
 ## Rollback
 
@@ -444,18 +454,13 @@ This is a local 31B MLX workflow. Every tool result is expensive on the next tur
 def research_method_section() -> str:
     return """## Research Method
 
-Use the autoresearch loop, but never begin with open-ended filesystem discovery.
+Use a Ralph-style continuation loop with Karpathy-style measurable experiments and Hermes-style self-evolution gates. Never begin with open-ended filesystem discovery.
 
-1. Follow the Bootstrap Ladder below until it is complete.
-2. Pick one concrete speed or reliability hypothesis from the Realistic Experiment Backlog.
-3. Inspect exactly one named source file, config file, log tail, or benchmark output.
-4. Make the smallest source change that tests the hypothesis.
-5. Run focused tests first.
-6. Deploy to `~/.openclaw` only when tests pass.
-7. Run a bounded benchmark if memory pressure is acceptable.
-8. Record the result in `results.tsv`.
-9. Keep the change if it improves speed/reliability without degrading UX. Revert your own failed experiment if it does not.
-10. Continue automatically until interrupted by the user.
+Each cycle follows one exact state transition:
+
+`select task -> source/evidence check -> baseline -> probe or patch -> focused test -> benchmark -> analyze -> keep/discard/rework`
+
+Progress requires a quality artifact: `STRATEGY.md`, `findings.jsonl`, `experiments.jsonl`, `rejections.jsonl`, `tasks.jsonl`, benchmark JSON with comparison, source patch with tests, or a blocker with evidence.
 
 Do not ask the user to continue after each experiment. Do not ask the user to manually test unless permissions or hardware state make testing impossible.
 """
@@ -566,6 +571,14 @@ def implementation_gate_section() -> str:
 
 Research and implementation are separate phases. Before keeping any source/config change, read `/Users/kristian/.openclaw/research/speed/implementation-skill.md` and follow it.
 
+Before entering implementation, pass the pre-implementation gate:
+
+1. Name the OpenClaw subsystem touched and how it affects runtime, memory, tool calling, context size, and live deployment.
+2. State why the patch is the smallest clean change and how a normal developer can understand it.
+3. Define the speed metric, reliability guard, rollback path, and exact failure mode being improved.
+4. Identify prompt-size, memory, timeout, tool-loop, and context-regression blind spots.
+5. Confirm opencode is untouched and out of scope.
+
 Before implementing an idea, prove it belongs in this setup:
 
 1. Identify the specific source file or model profile knob.
@@ -581,6 +594,8 @@ Before implementing an idea, prove it belongs in this setup:
 If a change requires an upstream Rapid-MLX feature that is not present locally, record the gap clearly and move to the next implementable improvement.
 
 Do not bundle unrelated cleanup with speed experiments. Do not keep a patch that only rearranges code without measured speed, reliability, or maintainability value.
+
+Before pushing, run a staged diff secret scan and confirm no `.env`, passwords, tokens, keys, private config, or sensitive logs are included.
 """
 
 
@@ -590,7 +605,7 @@ def prompt_text(root: Path) -> str:
 Workspace: {root}
 
 First assistant action: run exactly this narrow benchmark command:
-`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`
+`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`
 
 Then read exactly:
 `{root / 'results.tsv'}`
@@ -610,9 +625,7 @@ Hard constraints:
 def setup_workspace(args: argparse.Namespace) -> int:
     root = workspace_root()
     root.mkdir(parents=True, exist_ok=True)
-    (root / "experiments").mkdir(exist_ok=True)
-    (root / "benchmarks").mkdir(exist_ok=True)
-    (root / "logs").mkdir(exist_ok=True)
+    ensure_research_state(root)
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
     write_if_missing(root / "program.md", program_md())
@@ -637,8 +650,10 @@ def setup_workspace(args: argparse.Namespace) -> int:
         "and incorporate relevant sources without broad speculative searches.\n\n",
     )
     normalize_source_queue(root / "sources" / "queue.md")
-    write_if_missing(root / "results.tsv", RESULTS_HEADER)
-    write_if_missing(root / ".gitignore", "logs/\nbenchmarks/*.json\n*.tmp\n")
+    write_if_missing(
+        root / ".gitignore",
+        "logs/\nbenchmarks/*.json\nexperiments/*.json\n*.tmp\n",
+    )
     print(root)
     print(clone_status)
     return 0
@@ -676,9 +691,135 @@ def model_request(base_url: str, payload: dict[str, Any], timeout: float) -> tup
         return time.monotonic() - start, response.read()
 
 
+def stream_model_request(base_url: str, payload: dict[str, Any], timeout: float) -> tuple[float, float, str]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    start = time.monotonic()
+    first_token_at = 0.0
+    chunks: list[str] = []
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if data == "[DONE]":
+                break
+            try:
+                parsed = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choice = parsed.get("choices", [{}])[0]
+            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+            text = delta.get("content") or delta.get("reasoning_content") or ""
+            if text:
+                if not first_token_at:
+                    first_token_at = time.monotonic()
+                chunks.append(str(text))
+    finished = time.monotonic()
+    return (first_token_at - start if first_token_at else finished - start), finished - start, "".join(chunks)
+
+
+def memory_snapshot() -> dict[str, int]:
+    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
+    try:
+        output = subprocess.check_output(["/usr/bin/vm_stat"], text=True, stderr=subprocess.DEVNULL)
+        page_size = 16384
+        free_pages = speculative_pages = compressor_pages = 0
+        for line in output.splitlines():
+            if "page size of" in line:
+                digits = "".join(ch for ch in line.split("page size of", 1)[1] if ch.isdigit())
+                if digits:
+                    page_size = int(digits)
+            elif line.startswith("Pages free:"):
+                free_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+            elif line.startswith("Pages speculative:"):
+                speculative_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+            elif line.startswith("Pages occupied by compressor:"):
+                compressor_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+        snapshot["free_mb"] = int((free_pages + speculative_pages) * page_size / 1048576)
+        snapshot["compressor_mb"] = int(compressor_pages * page_size / 1048576)
+    except Exception:
+        pass
+    try:
+        output = subprocess.check_output(["/usr/sbin/sysctl", "vm.swapusage"], text=True, stderr=subprocess.DEVNULL)
+        if "used = " in output:
+            snapshot["swap_used_mb"] = int(float(output.split("used = ", 1)[1].split("M", 1)[0].strip()))
+    except Exception:
+        pass
+    return snapshot
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / 3.8))
+
+
+def benchmark_prompt(mode: str) -> tuple[str, int]:
+    if mode == "tool-roundtrip":
+        return (
+            "For OpenClaw speed research, reply with exactly TOOL_ROUNDTRIP_OK and no extra text.",
+            24,
+        )
+    if mode == "decode-sample":
+        return (
+            "Write one compact paragraph about reducing local LLM decode latency. Keep it practical.",
+            96,
+        )
+    if mode == "prefill-reuse":
+        return (
+            "Reply with one sentence about prefix-cache reuse in local agent harnesses.",
+            48,
+        )
+    return ("Reply with exactly: OK", 12)
+
+
+def prompt_size_probe(root: Path) -> dict[str, Any]:
+    files = ["program.md", "STRATEGY.md", "results.tsv", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
+    measured: dict[str, int] = {}
+    total_chars = 0
+    for name in files:
+        path = root / name
+        try:
+            chars = len(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            chars = 0
+        measured[name] = chars
+        total_chars += chars
+    return {
+        "ok": True,
+        "mode": "prompt-size",
+        "timestamp": int(time.time()),
+        "chars": measured,
+        "total_chars": total_chars,
+        "estimated_prompt_tokens": estimate_tokens("x" * total_chars),
+    }
+
+
 def benchmark(args: argparse.Namespace) -> int:
     root = workspace_root()
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_research_state(root)
+    mode = "quick-health" if args.quick else args.mode
+    commit = current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch")))
+    if mode == "prompt-size":
+        result = prompt_size_probe(root)
+        out = root / "benchmarks" / f"benchmark-{result['timestamp']}-{mode}.json"
+        out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        append_result(
+            root,
+            run_id=f"benchmark-{result['timestamp']}",
+            status="keep",
+            target=mode,
+            hypothesis="measure prompt/context size pressure before changing prompt policy",
+            commit=commit,
+            notes=f"estimated_prompt_tokens={result['estimated_prompt_tokens']} total_chars={result['total_chars']}",
+        )
+        print(json.dumps(result, indent=2))
+        return 0
     base_url = args.base_url
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=3) as response:
@@ -688,49 +829,65 @@ def benchmark(args: argparse.Namespace) -> int:
         return 2
     data = models.get("data") if isinstance(models, dict) else None
     model = args.model or (data[0].get("id") if isinstance(data, list) and data and isinstance(data[0], dict) else "local-model")
-    prompt = "Reply with exactly: OK" if args.quick else "Briefly explain one way to reduce perceived latency in a local agent harness."
+    prompt, max_tokens = benchmark_prompt(mode)
+    before_memory = memory_snapshot()
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": 12 if args.quick else 96,
-        "stream": False,
+        "max_tokens": max_tokens,
+        "stream": mode == "streaming-ttft",
     }
     try:
-        wall_s, body = model_request(base_url, payload, args.timeout)
-        parsed = json.loads(body.decode("utf-8"))
-        content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if mode == "streaming-ttft":
+            ttft_s, wall_s, content = stream_model_request(base_url, payload, args.timeout)
+        elif mode == "prefill-reuse":
+            first_wall_s, _body = model_request(base_url, payload, args.timeout)
+            wall_s, body = model_request(base_url, payload, args.timeout)
+            parsed = json.loads(body.decode("utf-8"))
+            content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+            ttft_s = ""
+        else:
+            wall_s, body = model_request(base_url, payload, args.timeout)
+            parsed = json.loads(body.decode("utf-8"))
+            content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+            first_wall_s = None
+            ttft_s = ""
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "status": "blocked", "reason": str(error)}, indent=2))
         return 2
+    after_memory = memory_snapshot()
+    words = max(1, len(str(content).split()))
+    decode_tps = round(words / wall_s, 3) if mode == "decode-sample" and wall_s > 0 else ""
     result = {
         "ok": True,
         "model": model,
-        "quick": args.quick,
+        "mode": mode,
         "wall_s": round(wall_s, 3),
+        "ttft_s": round(ttft_s, 3) if isinstance(ttft_s, float) else ttft_s,
+        "decode_tps_estimate": decode_tps,
+        "first_wall_s": round(first_wall_s, 3) if mode == "prefill-reuse" and first_wall_s is not None else "",
+        "second_wall_s": round(wall_s, 3) if mode == "prefill-reuse" else "",
+        "memory_before_mb": before_memory,
+        "memory_after_mb": after_memory,
         "content_preview": str(content)[:120],
         "timestamp": int(time.time()),
     }
-    out = root / "benchmarks" / f"benchmark-{result['timestamp']}.json"
+    out = root / "benchmarks" / f"benchmark-{result['timestamp']}-{mode}.json"
     out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    results = root / "results.tsv"
-    write_if_missing(results, RESULTS_HEADER)
-    row = [
-        time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        f"benchmark-{result['timestamp']}",
-        "keep",
-        "quick-benchmark" if args.quick else "benchmark",
-        "bounded OpenClaw model latency probe",
-        "",
-        "",
-        "",
-        result["wall_s"],
-        "",
-        current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
-        f"model={model} preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}",
-    ]
-    with results.open("a", encoding="utf-8") as file:
-        file.write("\t".join(str(item).replace("\t", " ").replace("\n", " ") for item in row) + "\n")
+    append_result(
+        root,
+        run_id=f"benchmark-{result['timestamp']}",
+        status="keep",
+        target=mode,
+        hypothesis=f"bounded OpenClaw {mode} probe",
+        ttft_s=result["ttft_s"],
+        decode_tps=decode_tps,
+        wall_s=result["wall_s"],
+        memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
+        commit=commit,
+        notes=f"model={model} preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}",
+    )
     print(json.dumps(result, indent=2))
     return 0
 
@@ -781,6 +938,11 @@ def main() -> int:
     bench.add_argument("--base-url", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_URL", DEFAULT_MODEL_URL))
     bench.add_argument("--model", default="")
     bench.add_argument("--quick", action="store_true")
+    bench.add_argument(
+        "--mode",
+        choices=["quick-health", "streaming-ttft", "tool-roundtrip", "prompt-size", "decode-sample", "prefill-reuse"],
+        default="quick-health",
+    )
     bench.add_argument("--timeout", type=float, default=180.0)
     bench.set_defaults(func=benchmark)
 

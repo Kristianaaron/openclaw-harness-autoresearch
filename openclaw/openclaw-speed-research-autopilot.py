@@ -9,12 +9,19 @@ bounded `openclaw agent` turns against the same session.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import time
 from pathlib import Path
 
+from openclaw_speed_research_core import (
+    RESULTS_HEADER,
+    cycle_quality,
+    ensure_research_state,
+    record_rejection,
+    select_next_task,
+    task_summary,
+)
 
 HOME = Path.home()
 OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", HOME / ".openclaw")).expanduser()
@@ -23,43 +30,13 @@ RESULTS = WORKSPACE / "results.tsv"
 IDEAS = WORKSPACE / "ideas.md"
 TASKS = WORKSPACE / "tasks.jsonl"
 BENCHMARKS = WORKSPACE / "benchmarks"
+STRATEGY = WORKSPACE / "STRATEGY.md"
+FINDINGS = WORKSPACE / "findings.jsonl"
+EXPERIMENTS = WORKSPACE / "experiments.jsonl"
+REJECTIONS = WORKSPACE / "rejections.jsonl"
 LOG_DIR = WORKSPACE / "logs"
 PROGRAM = WORKSPACE / "program.md"
 DEFAULT_REPO = "/Users/kristian/Documents/openclaw-harness-autoresearch"
-RESULTS_HEADER = (
-    "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
-    "wall_s\tmemory_gb\tcommit\tnotes\n"
-)
-DEFAULT_TASKS = (
-    {
-        "id": "bootstrap-quick-benchmark",
-        "status": "ready",
-        "target": "quick-benchmark",
-        "hypothesis": "A bounded benchmark gives the supervisor a fresh latency baseline.",
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick",
-    },
-    {
-        "id": "rapid-launcher-settings",
-        "status": "ready",
-        "target": "openclaw/openclaw-rapid-launcher.py",
-        "hypothesis": "One Rapid-MLX runtime knob can improve perceived latency without reducing reliability.",
-        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-rapid-launcher.py",
-    },
-    {
-        "id": "proxy-tool-latency",
-        "status": "ready",
-        "target": "openclaw/openclaw-model-proxy.py",
-        "hypothesis": "Proxy tool-call shaping can reduce wasted prefill and prevent loop-driven stalls.",
-        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-model-proxy.py",
-    },
-    {
-        "id": "jang-bridge-stability",
-        "status": "ready",
-        "target": "openclaw/rapid-overlay/openclaw_rapid_jang.py",
-        "hypothesis": "The JANG bridge can preserve Gemma4 behavior while keeping Rapid-MLX on the fast path.",
-        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/rapid-overlay/openclaw_rapid_jang.py",
-    },
-)
 BLOCKED_PATTERNS = (
     "OpenClaw blocked a broad local tool command",
     "blocked this request before model execution",
@@ -156,6 +133,10 @@ def durable_snapshot() -> dict[str, object]:
         "ideas_mtime": file_mtime(IDEAS),
         "tasks_mtime": file_mtime(TASKS),
         "benchmarks_mtime": latest_mtime(BENCHMARKS),
+        "strategy_mtime": file_mtime(STRATEGY),
+        "findings_mtime": file_mtime(FINDINGS),
+        "experiments_mtime": file_mtime(EXPERIMENTS),
+        "rejections_mtime": file_mtime(REJECTIONS),
         "repo_status": repo_status_fingerprint(),
     }
 
@@ -172,37 +153,25 @@ def durable_progress(before: dict[str, object], after: dict[str, object]) -> lis
         reasons.append("task queue update")
     if float(after["benchmarks_mtime"]) > float(before["benchmarks_mtime"]):
         reasons.append("benchmark artifact")
+    if float(after["strategy_mtime"]) > float(before["strategy_mtime"]):
+        reasons.append("strategy update")
+    if float(after["findings_mtime"]) > float(before["findings_mtime"]):
+        reasons.append("findings update")
+    if float(after["experiments_mtime"]) > float(before["experiments_mtime"]):
+        reasons.append("experiments update")
+    if float(after["rejections_mtime"]) > float(before["rejections_mtime"]):
+        reasons.append("rejections update")
     if str(after["repo_status"]) != str(before["repo_status"]):
         reasons.append("repo patch")
     return reasons
 
 
 def ensure_task_queue() -> None:
-    TASKS.parent.mkdir(parents=True, exist_ok=True)
-    if TASKS.exists() and TASKS.stat().st_size > 0:
-        return
-    with TASKS.open("w", encoding="utf-8") as file:
-        for task in DEFAULT_TASKS:
-            file.write(json.dumps(task, sort_keys=True) + "\n")
+    ensure_research_state(WORKSPACE)
 
 
 def next_task_summary(limit: int = 3) -> str:
-    try:
-        tasks = []
-        for line in TASKS.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.strip():
-                continue
-            task = json.loads(line)
-            if task.get("status") in {"ready", "in_progress"}:
-                tasks.append(
-                    f"- {task.get('id', 'task')}: target={task.get('target', 'unknown')} "
-                    f"next={task.get('next_action', 'record evidence')}"
-                )
-            if len(tasks) >= limit:
-                break
-        return "\n".join(tasks)
-    except Exception:
-        return ""
+    return task_summary(WORKSPACE, limit=limit)
 
 
 def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
@@ -234,7 +203,7 @@ def recovery_instruction(stalled_cycles: int, last_issue: str) -> str:
         return (
             "\n\nSupervisor recovery: two recent cycles did not produce useful durable progress. "
             "Your next tool call must be exactly "
-            "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick` "
+            "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft` "
             "unless memory pressure blocks it. If blocked, append one blocked row to results.tsv and end."
         )
     if mode == "diagnose":
@@ -373,6 +342,17 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
     task_summary = next_task_summary()
     if task_summary:
         task_summary = f"\n\nCurrent machine-readable research queue:\n{task_summary}"
+    selected_task = select_next_task(WORKSPACE)
+    task_contract = ""
+    if selected_task:
+        task_contract = (
+            "\n\nSelected task for this cycle:\n"
+            f"- id: {selected_task.get('id', 'unknown')}\n"
+            f"- target: {selected_task.get('target', 'unknown')}\n"
+            f"- hypothesis: {selected_task.get('hypothesis', 'unknown')}\n"
+            f"- metric: {selected_task.get('metric', 'unknown')}\n"
+            f"- required next action: {selected_task.get('next_action', 'record evidence')}\n"
+        )
     return (
         "Continue OpenClaw Speed Autoresearch autonomously.\n\n"
         f"Workspace: {WORKSPACE}\n"
@@ -381,7 +361,9 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "Prefer realistic backend work over toy prompts: "
         "Rapid-MLX settings, JANG/JANQ bridge behavior, prefix/cache/prompt shaping, tool-call TTFT, "
         "Metal/KV/cache memory, or grounded frontier proposals toward 50-70 tok/s.\n\n"
-        "Best next actions are: run `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`, "
+        "Best next actions are: run a specific benchmark mode such as "
+        "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`, "
+        "`--mode tool-roundtrip`, `--mode prompt-size`, `--mode decode-sample`, or `--mode prefill-reuse`; "
         "read `/Users/kristian/.openclaw/research/speed/results.tsv`, read one named OpenClaw source file, "
         "or run `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
         "Do not run setup commands, `find`, recursive `ls`, recursive grep, or broad local search.\n\n"
@@ -390,9 +372,12 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "Do not ask me whether to continue. If a test or benchmark cannot run safely, record blocked evidence "
         "and move to the next implementable item.\n\n"
         "Cycle contract: each cycle must finish with one durable artifact: a results.tsv row, ideas.md note, "
-        "tasks.jsonl update, benchmark JSON, source patch, test result, or explicit blocked row. "
-        "No durable artifact means the supervisor will narrow the next cycle automatically."
+        "STRATEGY.md update, findings.jsonl entry, experiments.jsonl entry, tasks.jsonl update, benchmark JSON, "
+        "source patch, test result, rejection entry, or explicit blocked row. "
+        "Do not repeat quick-health benchmarks unless comparing variance or validating a changed hypothesis. "
+        "No quality artifact means the supervisor will narrow the next cycle automatically."
         f"{task_summary}"
+        f"{task_contract}"
         f"\n\nAutopilot cycle: {cycle}.{pressure}{recovery_instruction(stalled_cycles, last_issue)}"
     )
 
@@ -540,6 +525,11 @@ def main() -> int:
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_ROTATE_AFTER_STALLS", "3")),
         help="start a fresh recovery session after this many cycles without durable progress",
     )
+    parser.add_argument(
+        "--reuse-session",
+        action="store_true",
+        help="reuse one OpenClaw session instead of Ralph-style fresh sessions per cycle",
+    )
     args = parser.parse_args()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -554,6 +544,8 @@ def main() -> int:
     blocked_cycles = 0
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
     for cycle in range(1, args.cycles + 1):
+        if not args.reuse_session:
+            current_session = f"{args.session}-cycle-{cycle:03d}"
         if time.monotonic() >= deadline:
             log("autopilot max-hours reached")
             break
@@ -583,11 +575,12 @@ def main() -> int:
         code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file)
         after = durable_snapshot()
         progress_reasons = durable_progress(before, after)
-        progressed = bool(progress_reasons)
+        quality = cycle_quality(WORKSPACE, before, after, progress_reasons, issue)
+        progressed = int(quality["score"]) >= 2
         if progressed:
             progress_cycles += 1
         stalled_cycles = 0 if progressed else stalled_cycles + 1
-        last_issue = "" if progressed else (issue or "no durable progress")
+        last_issue = "" if progressed else (issue or str(quality["reason"]))
         if not progressed:
             blocked_cycles += 1
         log(
@@ -595,11 +588,18 @@ def main() -> int:
             f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
             f"results_lines={before['results_lines']}->{after['results_lines']} "
             f"stalled_cycles={stalled_cycles} issue={last_issue or 'none'} "
-            f"health={progress_cycles}/{cycle} blocked={blocked_cycles}"
+            f"quality={quality['status']}:{quality['score']} health={progress_cycles}/{cycle} blocked={blocked_cycles}"
         )
         if code not in {0, 124}:
             log(f"agent turn returned nonzero exit={code}; continuing after a short pause")
         if not progressed:
+            record_rejection(
+                WORKSPACE,
+                cycle=cycle,
+                task_id=str((select_next_task(WORKSPACE) or {}).get("id", "unknown")),
+                reason=str(quality["reason"]),
+                evidence=",".join(progress_reasons) if progress_reasons else last_issue,
+            )
             append_supervisor_result(cycle, current_session, "blocked", last_issue)
             log(f"cycle={cycle} recorded supervisor blocked row for issue={last_issue}")
         if (

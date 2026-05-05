@@ -47,7 +47,7 @@ def main() -> int:
             prompt = helper.prompt_text(root)
             assert "OpenClaw Speed Autoresearch" in prompt
             assert "First assistant action" in prompt
-            assert "benchmark --quick" in prompt
+            assert "benchmark --mode streaming-ttft" in prompt
             assert "Use one narrow tool call" in prompt
             assert "results.tsv" in prompt
             program = (root / "program.md").read_text(encoding="utf-8")
@@ -73,6 +73,17 @@ def main() -> int:
             assert "The patch is smaller than the problem it solves" in implementation
             assert (root / "experiments").is_dir()
             assert (root / "benchmarks").is_dir()
+            assert (root / "STRATEGY.md").exists()
+            assert (root / "tasks.jsonl").exists()
+            assert (root / "findings.jsonl").exists()
+            assert (root / "experiments.jsonl").exists()
+            assert (root / "rejections.jsonl").exists()
+            assert "Pre-Implementation Gate" in implementation
+            assert helper.benchmark(
+                Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-size", timeout=1.0)
+            ) == 0
+            benchmark_rows = (root / "results.tsv").read_text(encoding="utf-8")
+            assert "prompt-size" in benchmark_rows
     return 0
 
 

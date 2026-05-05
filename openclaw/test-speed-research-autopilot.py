@@ -26,9 +26,11 @@ def main() -> int:
     prompt = helper.continuation_prompt(1, 0)
     assert "do not read it this turn" in prompt
     assert "Do not touch opencode" in prompt
-    assert "openclaw-speed-research benchmark --quick" in prompt
+    assert "benchmark --mode streaming-ttft" in prompt
+    assert "--mode tool-roundtrip" in prompt
     assert "Do not run setup commands" in prompt
     assert "implementation-skill.md" in prompt
+    assert "Do not repeat quick-health benchmarks" in prompt
 
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
@@ -67,23 +69,38 @@ def main() -> int:
         "Last cycle issue"
     ) == 1
     with tempfile.TemporaryDirectory() as tmp:
-        helper.RESULTS = Path(tmp) / "results.tsv"
-        helper.IDEAS = Path(tmp) / "ideas.md"
-        helper.TASKS = Path(tmp) / "tasks.jsonl"
-        helper.BENCHMARKS = Path(tmp) / "benchmarks"
+        helper.WORKSPACE = Path(tmp)
+        helper.RESULTS = helper.WORKSPACE / "results.tsv"
+        helper.IDEAS = helper.WORKSPACE / "ideas.md"
+        helper.TASKS = helper.WORKSPACE / "tasks.jsonl"
+        helper.BENCHMARKS = helper.WORKSPACE / "benchmarks"
+        helper.STRATEGY = helper.WORKSPACE / "STRATEGY.md"
+        helper.FINDINGS = helper.WORKSPACE / "findings.jsonl"
+        helper.EXPERIMENTS = helper.WORKSPACE / "experiments.jsonl"
+        helper.REJECTIONS = helper.WORKSPACE / "rejections.jsonl"
         helper.OPENCLAW_HOME = Path(tmp) / "home"
         helper.ensure_task_queue()
         task_text = helper.TASKS.read_text(encoding="utf-8")
-        assert "bootstrap-quick-benchmark" in task_text
-        assert "rapid-launcher-settings" in helper.next_task_summary()
+        assert "baseline-streaming-ttft" in task_text
+        assert "streaming-ttft" in helper.next_task_summary()
         before = helper.durable_snapshot()
         helper.IDEAS.write_text("# idea\n", encoding="utf-8")
-        helper.BENCHMARKS.mkdir()
+        helper.BENCHMARKS.mkdir(exist_ok=True)
         (helper.BENCHMARKS / "one.json").write_text("{}", encoding="utf-8")
         after = helper.durable_snapshot()
         progress = helper.durable_progress(before, after)
         assert "ideas update" in progress
         assert "benchmark artifact" in progress
+        quick_before = dict(before)
+        quick_before["results_lines"] = 1
+        helper.RESULTS.write_text(
+            helper.RESULTS_HEADER
+            + "2026-05-05T00:00:00+0000\tbenchmark-x\tkeep\tquick-health\th\t\t\t\t1\t\tc\tn\n",
+            encoding="utf-8",
+        )
+        quick_after = helper.durable_snapshot()
+        quality = helper.cycle_quality(helper.WORKSPACE, quick_before, quick_after, ["results row"], "")
+        assert quality["status"] == "noise"
         session_dir = helper.OPENCLAW_HOME / "agents" / "main" / "sessions"
         session_dir.mkdir(parents=True)
         session_file = session_dir / "cycle-count.jsonl"
