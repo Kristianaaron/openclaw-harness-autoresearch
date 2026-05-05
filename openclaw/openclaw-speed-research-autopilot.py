@@ -131,22 +131,51 @@ def memory_snapshot() -> dict[str, int]:
     return snapshot
 
 
+def model_ready() -> bool:
+    url = os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_HEALTH_URL", "http://127.0.0.1:8091/v1/models")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/curl", "-fsS", "--max-time", "2", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready: bool) -> str:
+    min_free_mb = args.ready_min_free_mb if ready else args.min_free_mb
+    if snap["compressor_mb"] >= args.max_compressor_mb:
+        return (
+            f"compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB "
+            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
+        )
+    if snap["swap_used_mb"] >= args.max_swap_mb:
+        return (
+            f"swap={snap['swap_used_mb']}MB>={args.max_swap_mb}MB "
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB ready={ready}"
+        )
+    if snap["free_mb"] and snap["free_mb"] < min_free_mb:
+        return (
+            f"free={snap['free_mb']}MB<{min_free_mb}MB "
+            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
+        )
+    return ""
+
+
 def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
     started = time.monotonic()
     last_reason = ""
     while True:
         snap = memory_snapshot()
-        too_hot = (
-            snap["compressor_mb"] >= args.max_compressor_mb
-            or snap["swap_used_mb"] >= args.max_swap_mb
-            or (snap["free_mb"] and snap["free_mb"] < args.min_free_mb)
-        )
-        if not too_hot:
+        ready = model_ready()
+        reason = memory_gate_reason(args, snap, ready=ready)
+        if not reason:
             return True, ""
-        last_reason = (
-            f"memory gate waiting: free={snap['free_mb']}MB "
-            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
-        )
+        last_reason = f"memory gate waiting: {reason}"
         if args.max_memory_wait_seconds > 0 and time.monotonic() - started >= args.max_memory_wait_seconds:
             return False, f"{last_reason}; exceeded {args.max_memory_wait_seconds:.0f}s wait budget"
         log(
@@ -280,6 +309,7 @@ def main() -> int:
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
     parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "3072")))
+    parser.add_argument("--ready-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_READY_MIN_FREE_MB", "512")))
     parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "4096")))
     parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "2048")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)

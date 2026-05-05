@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import tempfile
+from argparse import Namespace
 from pathlib import Path
 
 
@@ -45,6 +46,12 @@ def main() -> int:
     assert helper.summarize_issue("all good", "", 0) == ""
     assert helper.as_text(b"hello") == "hello"
     assert helper.as_text(None) == ""
+    args = Namespace(min_free_mb=3072, ready_min_free_mb=512, max_compressor_mb=4096, max_swap_mb=2048)
+    resident_snap = {"free_mb": 1396, "compressor_mb": 2088, "swap_used_mb": 1559}
+    assert helper.memory_gate_reason(args, resident_snap, ready=True) == ""
+    assert helper.memory_gate_reason(args, resident_snap, ready=False).startswith("free=1396MB<3072MB")
+    swap_hot = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 3000}
+    assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=3000MB>=2048MB")
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1
