@@ -27,6 +27,7 @@ from typing import Any
 
 MODEL = None
 PROCESSOR = None
+DRAFT_MODEL = None
 MODEL_PATH = ""
 MODEL_ID = ""
 GENERATION_LOCK = threading.Lock()
@@ -88,7 +89,7 @@ def configure_mlx_memory() -> None:
 
 
 def load_model(model_path: str) -> None:
-    global MODEL, PROCESSOR, MODEL_PATH
+    global MODEL, PROCESSOR, DRAFT_MODEL, MODEL_PATH
     configure_mlx_memory()
     from jang_tools.loader import load_jang_vlm_model
 
@@ -96,6 +97,18 @@ def load_model(model_path: str) -> None:
     MODEL, PROCESSOR = load_jang_vlm_model(model_path)
     MODEL_PATH = model_path
     log(f"loaded JANG VLM model in {time.monotonic() - start:.2f}s: {model_path}")
+    draft_path = os.environ.get("OPENCLAW_JANG_DRAFT_MODEL")
+    if draft_path:
+        from mlx_vlm.speculative.drafters import load_drafter
+
+        draft_kind = os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "mtp")
+        draft_start = time.monotonic()
+        DRAFT_MODEL = load_drafter(draft_path, kind=draft_kind)
+        block = getattr(getattr(DRAFT_MODEL, "config", None), "block_size", "?")
+        log(
+            "loaded Gemma drafter "
+            f"kind={draft_kind} block={block} in {time.monotonic() - draft_start:.2f}s: {draft_path}"
+        )
 
 
 def model_worker(model_path: str) -> None:
@@ -243,6 +256,14 @@ def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         max_kv_size = env_int("OPENCLAW_JANG_MAX_KV_SIZE", 0)
     if max_kv_size:
         kwargs["max_kv_size"] = max(1, int(max_kv_size))
+    if DRAFT_MODEL is not None:
+        kwargs["draft_model"] = DRAFT_MODEL
+        kwargs["draft_kind"] = os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "mtp")
+        draft_block_size = payload.get("draft_block_size")
+        if draft_block_size is None:
+            draft_block_size = env_int("OPENCLAW_JANG_DRAFT_BLOCK_SIZE", 0)
+        if draft_block_size:
+            kwargs["draft_block_size"] = max(1, int(draft_block_size))
     return kwargs
 
 
@@ -384,6 +405,48 @@ def parse_tool_call(text: str) -> tuple[str, list[dict[str, Any]]]:
     return cleaned, [make_tool_call(name, arguments)]
 
 
+def speculative_stats_since(start_index: int) -> str:
+    if DRAFT_MODEL is None:
+        return ""
+    accept_lens = getattr(DRAFT_MODEL, "accept_lens", None) or []
+    recent = accept_lens[start_index:]
+    if not recent:
+        return ""
+    mean_accept = sum(recent) / len(recent)
+    return f" mtp_rounds={len(recent)} mean_accept={mean_accept:.2f}"
+
+
+def current_speculative_stat_index() -> int:
+    if DRAFT_MODEL is None:
+        return 0
+    return len(getattr(DRAFT_MODEL, "accept_lens", None) or [])
+
+
+def stream_visible_text(raw_text: str) -> str:
+    """Return only content that is safe to stream before final parsing."""
+    first_tool = len(raw_text)
+    for marker in ("<|tool_call>", "<tool_call"):
+        index = raw_text.find(marker)
+        if index >= 0:
+            first_tool = min(first_tool, index)
+    visible = raw_text[:first_tool]
+    while GEMMA_THOUGHT_START in visible:
+        before, rest = visible.split(GEMMA_THOUGHT_START, 1)
+        if GEMMA_THOUGHT_END not in rest:
+            visible = before
+            break
+        _thought, after = rest.split(GEMMA_THOUGHT_END, 1)
+        visible = before + after
+    visible = re.sub(r"(?is)<think>.*?</think>", "", visible)
+    for partial in ("<|channel>thought", "<think", "<|tool", "<tool"):
+        index = visible.rfind(partial)
+        if index >= 0 and index > len(visible) - 64:
+            visible = visible[:index]
+    visible = visible.replace(GEMMA_TURN_END, "")
+    visible = re.sub(r"(?im)^(?:\\s*thought\\s*\\n){2,}", "", visible)
+    return visible
+
+
 def chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
     return run_model_task(lambda: _chat_completion_on_worker(payload))
 
@@ -394,6 +457,7 @@ def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = build_prompt(payload)
     kwargs = generation_kwargs(payload)
     start = time.monotonic()
+    speculative_start = current_speculative_stat_index()
     result = generate(MODEL, PROCESSOR, prompt, verbose=False, **kwargs)
     raw_text = str(getattr(result, "text", result) or "")
     content, reasoning = strip_reasoning_markers(raw_text)
@@ -407,9 +471,10 @@ def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
     completion_tokens = int(getattr(result, "generation_tokens", 0) or 0)
     elapsed = time.monotonic() - start
     tok_s = completion_tokens / elapsed if elapsed > 0 else 0
+    speculative = speculative_stats_since(speculative_start)
     log(
         f"chat completion: prompt={prompt_tokens} completion={completion_tokens} "
-        f"elapsed={elapsed:.2f}s tok_s={tok_s:.1f}"
+        f"elapsed={elapsed:.2f}s tok_s={tok_s:.1f}{speculative}"
     )
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning and os.environ.get("OPENCLAW_JANG_FORWARD_REASONING", "0").lower() in {"1", "true", "yes", "on"}:
@@ -428,6 +493,90 @@ def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+
+def _stream_chat_completion_on_worker(
+    payload: dict[str, Any],
+    event_queue: "queue.Queue[tuple[str, Any]]",
+) -> dict[str, Any]:
+    from mlx_vlm import stream_generate
+
+    prompt = build_prompt(payload)
+    kwargs = generation_kwargs(payload)
+    start = time.monotonic()
+    speculative_start = current_speculative_stat_index()
+    raw_text = ""
+    emitted = ""
+    last_response = None
+    prompt_tokens = 0
+    completion_tokens = 0
+    finish_reason = "stop"
+    try:
+        for response in stream_generate(MODEL, PROCESSOR, prompt, verbose=False, **kwargs):
+            last_response = response
+            segment = str(getattr(response, "text", "") or "")
+            if segment:
+                raw_text += segment
+            prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+            completion_tokens = int(getattr(response, "generation_tokens", completion_tokens) or completion_tokens)
+            visible = stream_visible_text(raw_text)
+            if has_repeated_token_loop(visible or raw_text):
+                log(f"suppressed repeated-token loop in stream output: {(visible or raw_text)[:120]!r}")
+                raw_text = ""
+                emitted = ""
+                finish_reason = "content_filter"
+                break
+            if visible.startswith(emitted) and len(visible) > len(emitted):
+                delta = visible[len(emitted) :]
+                emitted = visible
+                event_queue.put(("content", delta))
+        if last_response is not None:
+            prompt_tokens = int(getattr(last_response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+            completion_tokens = int(getattr(last_response, "generation_tokens", completion_tokens) or completion_tokens)
+        content, reasoning = strip_reasoning_markers(raw_text)
+        content, tool_calls = parse_tool_call(content)
+        if finish_reason != "content_filter":
+            finish_reason = "tool_calls" if tool_calls else "stop"
+        if has_repeated_token_loop(content):
+            log(f"suppressed repeated-token loop in final stream output: {content[:120]!r}")
+            content = ""
+            tool_calls = []
+            finish_reason = "content_filter"
+        if tool_calls:
+            event_queue.put(("tool_calls", tool_calls))
+        elif content.startswith(emitted) and len(content) > len(emitted):
+            event_queue.put(("content", content[len(emitted) :]))
+        elif content and not emitted.startswith(content):
+            event_queue.put(("content", content))
+        elapsed = time.monotonic() - start
+        tok_s = completion_tokens / elapsed if elapsed > 0 else 0
+        speculative = speculative_stats_since(speculative_start)
+        log(
+            f"stream chat completion: prompt={prompt_tokens} completion={completion_tokens} "
+            f"elapsed={elapsed:.2f}s tok_s={tok_s:.1f}{speculative}"
+        )
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning and os.environ.get("OPENCLAW_JANG_FORWARD_REASONING", "0").lower() in {"1", "true", "yes", "on"}:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        result = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": MODEL_ID,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        event_queue.put(("done", result))
+        return result
+    except Exception as error:
+        event_queue.put(("error", error))
+        raise
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -508,50 +657,64 @@ class Handler(BaseHTTPRequestHandler):
         )
         completion_payload = dict(payload)
         completion_payload["stream"] = False
-        result_queue = submit_model_task(lambda: _chat_completion_on_worker(completion_payload))
+        event_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        result_queue = submit_model_task(
+            lambda: _stream_chat_completion_on_worker(completion_payload, event_queue)
+        )
+        final_result: dict[str, Any] | None = None
         while True:
-            if result_queue.empty():
+            try:
+                event, value = event_queue.get(timeout=0.25)
+            except queue.Empty:
                 try:
                     self.wfile.write(b": openclaw-jang-vlm-server: generation still running\n\n")
                     self.wfile.flush()
                 except BrokenPipeError:
                     return
-                time.sleep(0.25)
                 continue
-            break
-        ok, result = result_queue.get()
-        if not ok:
-            raise result
-        choice = result.get("choices", [{}])[0]
+            if event == "content":
+                if isinstance(value, str) and value:
+                    self.write_sse(
+                        {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": MODEL_ID,
+                            "choices": [{"index": 0, "delta": {"content": value}, "finish_reason": None}],
+                        }
+                    )
+                continue
+            if event == "tool_calls":
+                self.write_sse(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [{"index": 0, "delta": {"tool_calls": value}, "finish_reason": None}],
+                    }
+                )
+                continue
+            if event == "error":
+                raise value
+            if event == "done":
+                final_result = value
+                break
+        if not result_queue.empty():
+            ok, queued_result = result_queue.get()
+            if not ok:
+                raise queued_result
+            if final_result is None:
+                final_result = queued_result
+        if final_result is None:
+            raise RuntimeError("stream finished without a final result")
+        choice = final_result.get("choices", [{}])[0]
         message = choice.get("message") if isinstance(choice, dict) else {}
         if not isinstance(message, dict):
             message = {}
         tool_calls = message.get("tool_calls")
         content = message.get("content")
-        emitted = False
-        if isinstance(tool_calls, list) and tool_calls:
-            self.write_sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": MODEL_ID,
-                    "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": None}],
-                }
-            )
-            emitted = True
-        if isinstance(content, str) and content:
-            self.write_sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": MODEL_ID,
-                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                }
-            )
-            emitted = True
-        if not emitted:
+        if not tool_calls and not content:
             self.write_sse(
                 {
                     "id": request_id,
@@ -569,7 +732,7 @@ class Handler(BaseHTTPRequestHandler):
                 "created": created,
                 "model": MODEL_ID,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                "usage": result.get("usage"),
+                "usage": final_result.get("usage"),
             }
         )
         self.wfile.write(b"data: [DONE]\n\n")

@@ -850,6 +850,8 @@ def prefer_nonstreaming(payload: dict[str, Any]) -> bool:
     max_tokens = payload.get("max_tokens")
     if isinstance(max_tokens, int) and max_tokens <= 32:
         return True
+    if not bool_env("OPENCLAW_MODEL_EXACT_REQUESTS_NONSTREAMING", False):
+        return False
     text = last_user_text(payload).lower()
     exact_patterns = (
         r"\breply with exactly\b",

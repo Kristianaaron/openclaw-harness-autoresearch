@@ -27,9 +27,15 @@ def rapid_python() -> str:
     explicit = os.environ.get("OPENCLAW_RAPID_PYTHON") or os.environ.get("OPENCLAW_JANG_PYTHON")
     if explicit:
         return explicit
-    candidate = Path("/opt/homebrew/Cellar/rapid-mlx/0.6.1/libexec/bin/python")
-    if candidate.exists():
-        return str(candidate)
+    for candidate in (
+        Path("/opt/homebrew/opt/rapid-mlx/libexec/bin/python"),
+        Path("/opt/homebrew/opt/rapid-mlx/libexec/bin/python3.12"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    for candidate in sorted(Path("/opt/homebrew/Cellar/rapid-mlx").glob("*/libexec/bin/python"), reverse=True):
+        if candidate.exists():
+            return str(candidate)
     return sys.executable
 
 
@@ -58,6 +64,41 @@ def ensure_jang_target() -> None:
     )
     if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         raise RuntimeError("JANG dependency target installed but imports still fail")
+
+
+def ensure_mtp_runtime() -> None:
+    if not os.environ.get("OPENCLAW_JANG_DRAFT_MODEL"):
+        return
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(JANG_TARGET)
+    check = [
+        rapid_python(),
+        "-c",
+        "import mlx_vlm.speculative.drafters.gemma4_assistant",
+    ]
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    package = os.environ.get(
+        "OPENCLAW_JANG_MLX_VLM_PACKAGE",
+        "git+https://github.com/Blaizzy/mlx-vlm.git@173829b1227d07b74bbbda419c6a90a28c409fe5",
+    )
+    log(f"installing OpenClaw-managed mlx-vlm MTP runtime: {package}")
+    subprocess.check_call(
+        [
+            rapid_python(),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--target",
+            str(JANG_TARGET),
+            "--upgrade",
+            "--no-deps",
+            package,
+        ]
+    )
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        raise RuntimeError("mlx-vlm MTP runtime installed but Gemma4 assistant import still fails")
 
 
 def health_ready(host: str, port: int) -> bool:
@@ -112,6 +153,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     args = parse_args()
     ensure_jang_target()
+    ensure_mtp_runtime()
     argv = [
         rapid_python(),
         str(OPENCLAW_DIR / "servers/openclaw-jang-vlm-server.py"),

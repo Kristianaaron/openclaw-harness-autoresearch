@@ -454,7 +454,9 @@ def main() -> int:
     compacted_args = compacted_assistant["tool_calls"][0]["function"]["arguments"]
     assert len(compacted_args) < 1200
     assert "openclaw_compacted" in compacted_args
-    assert proxy.prefer_nonstreaming({"messages": [{"role": "user", "content": "Reply with exactly: OK"}]})
+    with patch.dict(os.environ, {"OPENCLAW_MODEL_EXACT_REQUESTS_NONSTREAMING": "1"}):
+        assert proxy.prefer_nonstreaming({"messages": [{"role": "user", "content": "Reply with exactly: OK"}]})
+    assert not proxy.prefer_nonstreaming({"messages": [{"role": "user", "content": "Reply with exactly: OK"}]})
     assert not proxy.prefer_nonstreaming({"messages": [{"role": "user", "content": "Write a paragraph"}], "max_tokens": 180})
 
     guard = proxy.StreamGuard(hold_chars=8)
