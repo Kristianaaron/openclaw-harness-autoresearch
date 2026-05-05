@@ -29,6 +29,8 @@ CHILD: subprocess.Popen[bytes] | None = None
 RAPID_SERVE_HELP: str | None = None
 COMPATIBILITY_FAILED = False
 STOPPING = False
+MEMORY_BLOCKED = False
+MEMORY_BLOCK_EXIT = 75
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,39 @@ def choose_profile() -> LaunchProfile:
     ):
         return PROFILES["turbo"]
     return PROFILES["balanced"]
+
+
+def memory_block_reason(phase: str, snap: dict[str, int] | None = None) -> str | None:
+    snap = snap or memory_snapshot()
+    min_free_mb = env_int("OPENCLAW_RAPID_MIN_FREE_MB", 2048)
+    max_compressor_mb = env_int("OPENCLAW_RAPID_MAX_COMPRESSOR_MB", 8192)
+    max_swap_mb = env_int("OPENCLAW_RAPID_MAX_SWAP_MB", 8192)
+    if snap["compressor_mb"] >= max_compressor_mb:
+        return (
+            f"{phase}: compressor_mb={snap['compressor_mb']}>={max_compressor_mb} "
+            f"free_mb={snap['free_mb']} swap_mb={snap['swap_used_mb']}"
+        )
+    if snap["swap_used_mb"] >= max_swap_mb:
+        return (
+            f"{phase}: swap_mb={snap['swap_used_mb']}>={max_swap_mb} "
+            f"free_mb={snap['free_mb']} compressor_mb={snap['compressor_mb']}"
+        )
+    if snap["free_mb"] and snap["free_mb"] < min_free_mb:
+        return (
+            f"{phase}: free_mb={snap['free_mb']}<{min_free_mb} "
+            f"compressor_mb={snap['compressor_mb']} swap_mb={snap['swap_used_mb']}"
+        )
+    return None
+
+
+def require_memory_safe(phase: str) -> bool:
+    global MEMORY_BLOCKED
+    reason = memory_block_reason(phase)
+    if not reason:
+        return True
+    MEMORY_BLOCKED = True
+    log(f"memory circuit breaker blocked Rapid-MLX {reason}")
+    return False
 
 
 def rapid_python() -> str:
@@ -382,6 +417,42 @@ def stop_child() -> None:
     STOPPING = True
     if CHILD is None or CHILD.poll() is not None:
         STOPPING = False
+
+
+def child_exit_summary(returncode: int | None) -> str:
+    if returncode is None:
+        return "running"
+    if returncode == 0:
+        return "clean exit"
+    if returncode < 0:
+        signal_name = {
+            -6: "SIGABRT",
+            -9: "SIGKILL",
+            -11: "SIGSEGV",
+            -15: "SIGTERM",
+        }.get(returncode, f"signal {-returncode}")
+        return f"fatal process exit via {signal_name}"
+    return f"process exit code {returncode}"
+
+
+def wait_child_with_memory_guard(profile: LaunchProfile) -> int:
+    assert CHILD is not None
+    interval = max(1.0, env_float("OPENCLAW_RAPID_MEMORY_CHECK_INTERVAL_SECONDS", 3.0))
+    next_check = time.monotonic() + interval
+    while True:
+        returncode = CHILD.poll()
+        if returncode is not None:
+            if returncode != 0:
+                log(f"profile={profile.name} stopped: {child_exit_summary(returncode)}")
+            return returncode
+        now = time.monotonic()
+        if now >= next_check:
+            if not require_memory_safe("runtime"):
+                log("memory circuit breaker stopping Rapid-MLX child before macOS/Metal crash")
+                stop_child()
+                return MEMORY_BLOCK_EXIT
+            next_check = now + interval
+        time.sleep(0.25)
         return
     CHILD.terminate()
     try:
@@ -405,6 +476,8 @@ def handle_signal(_signum: int, _frame: object) -> None:
 def run_profile(args: argparse.Namespace, profile: LaunchProfile, startup_wait: int) -> bool:
     global CHILD, COMPATIBILITY_FAILED
     ensure_jang_target()
+    if not require_memory_safe("launch"):
+        return False
     env = build_env()
     argv = build_argv(args, profile)
     snap = memory_snapshot()
@@ -429,7 +502,11 @@ def run_profile(args: argparse.Namespace, profile: LaunchProfile, startup_wait: 
             log(f"ready profile={profile.name}")
             return True
         if CHILD.poll() is not None:
-            log(f"profile={profile.name} exited early code={CHILD.returncode}")
+            log(f"profile={profile.name} exited early: {child_exit_summary(CHILD.returncode)}")
+            return False
+        if not require_memory_safe("startup"):
+            log("memory circuit breaker stopping startup before macOS/Metal crash")
+            stop_child()
             return False
         time.sleep(1)
     log(f"startup timed out profile={profile.name}")
@@ -457,15 +534,19 @@ def main() -> int:
     fallback = PROFILES["safe"]
     if run_profile(args, first, args.startup_wait_seconds):
         assert CHILD is not None
-        return CHILD.wait()
+        return wait_child_with_memory_guard(first)
     if COMPATIBILITY_FAILED:
         return 1
+    if MEMORY_BLOCKED:
+        return MEMORY_BLOCK_EXIT
     if first.name != fallback.name:
         stop_child()
         log("retrying with safe profile")
         if run_profile(args, fallback, args.startup_wait_seconds):
             assert CHILD is not None
-            return CHILD.wait()
+            return wait_child_with_memory_guard(fallback)
+        if MEMORY_BLOCKED:
+            return MEMORY_BLOCK_EXIT
     return 1
 
 

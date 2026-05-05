@@ -28,6 +28,9 @@ BLOCKED_PATTERNS = (
     "OpenClaw blocked a broad local tool command",
     "blocked this request before model execution",
     "memory pressure is too high",
+    "memory circuit breaker",
+    "fatal process exit",
+    "Metal",
     "SSE read timed out",
     "timed out",
 )
@@ -220,9 +223,9 @@ def main() -> int:
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
-    parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "1024")))
-    parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "8192")))
-    parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "8192")))
+    parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "3072")))
+    parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "4096")))
+    parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "2048")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
         "--rotate-session-after-stalls",

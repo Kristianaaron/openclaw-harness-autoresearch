@@ -41,8 +41,12 @@
           "OPENCLAW_RAPID_COMPLETION_BATCH_SIZE": "1",
           "OPENCLAW_RAPID_PREFILL_STEP_SIZE": "4096",
           "OPENCLAW_RAPID_CHUNKED_PREFILL_TOKENS": "2048",
-          "OPENCLAW_RAPID_CACHE_MEMORY_MB": "8192",
-          "OPENCLAW_RAPID_GPU_MEMORY_UTILIZATION": "0.88",
+          "OPENCLAW_RAPID_CACHE_MEMORY_MB": "1536",
+          "OPENCLAW_RAPID_GPU_MEMORY_UTILIZATION": "0.82",
+          "OPENCLAW_RAPID_MIN_FREE_MB": "4096",
+          "OPENCLAW_RAPID_MAX_COMPRESSOR_MB": "4096",
+          "OPENCLAW_RAPID_MAX_SWAP_MB": "2048",
+          "OPENCLAW_RAPID_MEMORY_CHECK_INTERVAL_SECONDS": "2",
           "OPENCLAW_RAPID_DEFAULT_TEMPERATURE": "0.0",
           "OPENCLAW_RAPID_DEFAULT_TOP_P": "0.95",
           "OPENCLAW_RAPID_REPETITION_PENALTY": "1.0",
@@ -52,7 +56,7 @@
           "OPENCLAW_RAPID_PREFIX_CACHE_SIZE": "64",
           "OPENCLAW_RAPID_KV_QUANTIZATION": "1",
           "OPENCLAW_RAPID_NO_GC_CONTROL": "1",
-          "OPENCLAW_MODEL_UPSTREAM_ARGV_JSON": "[\"/usr/bin/python3\",\"{openclawDir}/bin/openclaw-rapid-launcher\",\"--model-path\",\"{home}/.cache/huggingface/hub/models--dealignai--Gemma-4-31B-JANG_4M-CRACK/snapshots/bb11360eacf55506f6e51eaacc6b0f65f9209b14\",\"--served-model-name\",\"Gemma-4-31B-JANG_4M-CRACK\",\"--host\",\"127.0.0.1\",\"--port\",\"8086\",\"--max-tokens\",\"4096\",\"--timeout\",\"900\",\"--startup-wait-seconds\",\"180\"]"
+          "OPENCLAW_MODEL_UPSTREAM_ARGV_JSON": "[\"/usr/bin/python3\",\"{openclawDir}/bin/openclaw-rapid-launcher\",\"--model-path\",\"{home}/.cache/huggingface/hub/models--dealignai--Gemma-4-31B-JANG_4M-CRACK/snapshots/bb11360eacf55506f6e51eaacc6b0f65f9209b14\",\"--served-model-name\",\"Gemma-4-31B-JANG_4M-CRACK\",\"--host\",\"127.0.0.1\",\"--port\",\"8086\",\"--max-tokens\",\"4096\",\"--timeout\",\"900\",\"--startup-wait-seconds\",\"420\"]"
         },
         "argv": [
           "/usr/bin/python3",

@@ -36,6 +36,8 @@ def main() -> int:
     assert helper.summarize_issue("x OpenClaw blocked a broad local tool command y", "", 0) == (
         "OpenClaw blocked a broad local tool command"
     )
+    assert helper.summarize_issue("memory circuit breaker stopped backend", "", 0) == "memory circuit breaker"
+    assert helper.summarize_issue("", "fatal process exit via SIGABRT", 1) == "fatal process exit"
     assert helper.summarize_issue("", "", 124) == "turn timeout"
     assert helper.summarize_issue("", "", 7) == "agent exit 7"
     assert helper.summarize_issue("all good", "", 0) == ""
