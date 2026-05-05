@@ -51,6 +51,15 @@ def main() -> int:
         assert launcher.memory_block_reason(
             "test", {"free_mb": 8000, "compressor_mb": 1, "swap_used_mb": 0, "pressure_free_pct": 0}
         ) is None
+        assert launcher.memory_block_reason(
+            "startup", {"free_mb": 3000, "compressor_mb": 1, "swap_used_mb": 0, "pressure_free_pct": 0}
+        ) is None
+        assert launcher.memory_block_reason(
+            "runtime", {"free_mb": 64, "compressor_mb": 1, "swap_used_mb": 0, "pressure_free_pct": 0}
+        ) is None
+        assert launcher.memory_block_reason(
+            "runtime", {"free_mb": 8000, "compressor_mb": 5000, "swap_used_mb": 0, "pressure_free_pct": 0}
+        ).startswith("runtime: compressor_mb=5000>=4096")
     assert "SIGABRT" in launcher.child_exit_summary(-6)
     assert "SIGSEGV" in launcher.child_exit_summary(-11)
     print("ok openclaw Rapid launcher guards")

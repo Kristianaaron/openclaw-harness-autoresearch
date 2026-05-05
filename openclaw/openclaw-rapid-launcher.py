@@ -134,6 +134,8 @@ def choose_profile() -> LaunchProfile:
 def memory_block_reason(phase: str, snap: dict[str, int] | None = None) -> str | None:
     snap = snap or memory_snapshot()
     min_free_mb = env_int("OPENCLAW_RAPID_MIN_FREE_MB", 2048)
+    if phase in {"startup", "runtime"}:
+        min_free_mb = env_int(f"OPENCLAW_RAPID_{phase.upper()}_MIN_FREE_MB", 0)
     max_compressor_mb = env_int("OPENCLAW_RAPID_MAX_COMPRESSOR_MB", 8192)
     max_swap_mb = env_int("OPENCLAW_RAPID_MAX_SWAP_MB", 8192)
     if snap["compressor_mb"] >= max_compressor_mb:
@@ -415,7 +417,20 @@ def stop_child() -> None:
     if STOPPING:
         return
     STOPPING = True
-    if CHILD is None or CHILD.poll() is not None:
+    try:
+        if CHILD is None or CHILD.poll() is not None:
+            return
+        CHILD.terminate()
+        try:
+            CHILD.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            CHILD.kill()
+            deadline = time.monotonic() + 5
+            while CHILD.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if CHILD.poll() is None:
+                log(f"model server process {CHILD.pid} did not exit after SIGKILL")
+    finally:
         STOPPING = False
 
 
@@ -453,19 +468,6 @@ def wait_child_with_memory_guard(profile: LaunchProfile) -> int:
                 return MEMORY_BLOCK_EXIT
             next_check = now + interval
         time.sleep(0.25)
-        return
-    CHILD.terminate()
-    try:
-        CHILD.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        CHILD.kill()
-        deadline = time.monotonic() + 5
-        while CHILD.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if CHILD.poll() is None:
-            log(f"model server process {CHILD.pid} did not exit after SIGKILL")
-    finally:
-        STOPPING = False
 
 
 def handle_signal(_signum: int, _frame: object) -> None:
