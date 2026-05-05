@@ -17,13 +17,16 @@ from pathlib import Path
 
 from openclaw_speed_research_core import (
     RESULTS_HEADER,
+    append_jsonl,
     claim_task_evidence_window,
     complete_task_from_evidence,
     cycle_quality,
     ensure_research_state,
+    read_jsonl,
     record_rejection,
     select_next_task,
     task_summary,
+    write_jsonl,
 )
 
 HOME = Path.home()
@@ -219,6 +222,12 @@ def recovery_instruction(
             "Use the smallest action that can satisfy that contract."
         )
     if mode == "force-benchmark":
+        if (selected_task or {}).get("task_type") == "implementation":
+            return (
+                "\n\nSupervisor recovery: the implementation task stalled. "
+                "Do not switch to a generic benchmark. Make the smallest source patch, run the focused test named "
+                "by the task, or record a blocked row with the exact reason."
+            )
         action = str((selected_task or {}).get("next_action", "")).strip()
         if "openclaw-speed-research benchmark --mode" not in action:
             action = "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft"
@@ -397,6 +406,16 @@ def continuation_prompt(
                 "`/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier`. "
                 "Do not run another benchmark until synthesis has created new measurable tasks.\n"
             )
+        if selected_task.get("task_type") == "implementation":
+            task_contract += (
+                "\nThis is an implementation task, not another measurement loop. Follow the implementation gate: "
+                "read the implementation skill if needed, inspect only the listed target files, make the smallest "
+                "OpenClaw-only patch, run the focused test, and record keep/discard/blocked evidence. "
+                "Do not change live model settings, do not touch opencode, and do not bundle unrelated cleanup.\n"
+                f"- source files: {', '.join(str(item) for item in selected_task.get('source_files', []))}\n"
+                f"- acceptance: {selected_task.get('acceptance', 'focused tests and recorded evidence')}\n"
+                f"- rollback: {selected_task.get('rollback', 'revert only this experiment')}\n"
+            )
     return (
         "Continue OpenClaw Speed Autoresearch autonomously.\n\n"
         f"Workspace: {WORKSPACE}\n"
@@ -407,7 +426,7 @@ def continuation_prompt(
         "Metal/KV/cache memory, or grounded frontier proposals toward 50-70 tok/s.\n\n"
         "Best next actions are: run a specific benchmark mode such as "
         "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`, "
-        "`--mode tool-roundtrip`, `--mode prompt-size`, `--mode decode-sample`, or `--mode prefill-reuse`; "
+        "`--mode tool-roundtrip`, `--mode prompt-size`, `--mode prompt-shape`, `--mode decode-sample`, or `--mode prefill-reuse`; "
         "read `/Users/kristian/.openclaw/research/speed/results.tsv`, read one named OpenClaw source file, "
         "or run `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
         "Do not run setup commands, `find`, recursive `ls`, recursive grep, or broad local search.\n\n"
@@ -543,6 +562,9 @@ def run_turn(
     selected_task: dict[str, object] | None = None,
 ) -> tuple[int, str]:
     prompt = continuation_prompt(cycle, stalled_cycles, last_issue, selected_task)
+    tool_result_cap = args.max_tool_results_per_turn
+    if selected_task and selected_task.get("task_type") == "implementation":
+        tool_result_cap = args.max_implementation_tool_results_per_turn
     cmd = [
         args.openclaw_bin,
         "agent",
@@ -627,11 +649,11 @@ def run_turn(
                         stop_process_tree(process)
                         return 124, failure
                     next_failure_check = now + 2
-                if args.max_tool_results_per_turn > 0 and now >= next_tool_check:
+                if tool_result_cap > 0 and now >= next_tool_check:
                     tool_results = max(0, session_tool_result_count(session) - starting_tool_results)
                     if tool_results > 0 and first_new_tool_at == 0.0:
                         first_new_tool_at = now
-                    if tool_results > args.max_tool_results_per_turn:
+                    if tool_results > tool_result_cap:
                         file.write(
                             f"\nTOOL RESULT CAP after {tool_results} tool results "
                             f"and {now - started:.1f}s\n"
@@ -641,7 +663,7 @@ def run_turn(
                         stop_process_tree(process)
                         break
                     if (
-                        tool_results >= args.max_tool_results_per_turn
+                        tool_results >= tool_result_cap
                         and first_new_tool_at > 0
                         and now - first_new_tool_at >= args.tool_result_synthesis_grace_seconds
                     ):
@@ -663,6 +685,57 @@ def run_turn(
         file.write(f"\n===== cycle {cycle} exit {returncode} elapsed {time.monotonic() - started:.1f}s =====\n")
         tail = log_file.read_text(encoding="utf-8", errors="replace")[-12000:]
         return returncode, summarize_issue(tail, "", returncode)
+
+
+def complete_implementation_task(
+    task: dict[str, object] | None,
+    progress_reasons: list[str],
+    *,
+    commit: str,
+) -> dict[str, object] | None:
+    if not task or task.get("task_type") != "implementation":
+        return None
+    if task.get("status", "ready") not in {"ready", "rework"}:
+        return None
+    if "repo patch" not in progress_reasons:
+        return None
+    if not any(reason in progress_reasons for reason in ("results row", "benchmark artifact", "findings update", "experiments update")):
+        return None
+    tasks = read_jsonl(TASKS)
+    completed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    updated = False
+    for item in tasks:
+        if item.get("id") != task.get("id"):
+            continue
+        item["status"] = "done"
+        item["completed_at"] = completed_at
+        item["completion_commit"] = commit
+        item["completion_artifacts"] = progress_reasons
+        updated = True
+        break
+    if not updated:
+        return None
+    write_jsonl(TASKS, tasks)
+    summary = {
+        "timestamp": completed_at,
+        "task_id": str(task.get("id", "unknown")),
+        "status": "implementation-recorded",
+        "target": str(task.get("target", "")),
+        "artifacts": progress_reasons,
+        "commit": commit,
+    }
+    append_jsonl(EXPERIMENTS, summary)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": completed_at,
+            "task_id": summary["task_id"],
+            "finding": "implementation task produced a source patch plus durable evidence; supervisor marked it done",
+            "evidence": summary,
+            "next": "run_followup_benchmark_or_review",
+        },
+    )
+    return summary
 
 
 def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
@@ -707,6 +780,12 @@ def main() -> int:
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
+    parser.add_argument(
+        "--max-implementation-tool-results-per-turn",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_IMPLEMENTATION_TOOL_RESULTS", "6")),
+        help="allow bounded read/patch/test/record cycles for implementation tasks",
+    )
     parser.add_argument("--tool-result-synthesis-grace-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TOOL_SYNTHESIS_GRACE", "20")))
     parser.add_argument("--session-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SESSION_START_TIMEOUT", "90")))
     parser.add_argument("--session-idle-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SESSION_IDLE_TIMEOUT", "180")))
@@ -819,6 +898,12 @@ def main() -> int:
                 min_samples=args.task_min_samples,
                 commit=current_commit(),
             )
+            if advancement is None:
+                advancement = complete_implementation_task(
+                    selected_task,
+                    progress_reasons,
+                    commit=current_commit(),
+                )
         if progressed:
             progress_cycles += 1
         stalled_cycles = 0 if progressed else stalled_cycles + 1
@@ -833,10 +918,16 @@ def main() -> int:
             f"quality={quality['status']}:{quality['score']} health={progress_cycles}/{cycle} blocked={blocked_cycles}"
         )
         if advancement:
-            log(
-                f"cycle={cycle} advanced task={advancement['task_id']} "
-                f"samples={advancement['sample_count']} mode={advancement['benchmark_mode']}"
-            )
+            if "sample_count" in advancement:
+                log(
+                    f"cycle={cycle} advanced task={advancement['task_id']} "
+                    f"samples={advancement['sample_count']} mode={advancement['benchmark_mode']}"
+                )
+            else:
+                log(
+                    f"cycle={cycle} advanced implementation task={advancement['task_id']} "
+                    f"artifacts={','.join(str(item) for item in advancement.get('artifacts', []))}"
+                )
         if code not in {0, 124}:
             log(f"agent turn returned nonzero exit={code}; continuing after a short pause")
         if not progressed:

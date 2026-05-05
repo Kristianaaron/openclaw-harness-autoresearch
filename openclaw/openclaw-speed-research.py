@@ -850,6 +850,91 @@ def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     ]
 
 
+def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    decode = mean_value(float_values(rows, "decode-sample", "decode_tps"))
+    prompt_tokens = ""
+    for row in reversed(rows):
+        if row.get("status") == "keep" and row.get("target") == "prompt-size":
+            prompt_tokens = row.get("notes", "")
+            break
+    speed_gap = (
+        f"Current measured decode is {decode} tok/s, below the practical 20 tok/s floor and far below the 50-70 tok/s frontier target."
+        if decode is not None
+        else "Decode speed has not been measured yet; measure it before enabling risky acceleration."
+    )
+    return [
+        {
+            "id": "prompt-shape-report",
+            "status": "ready",
+            "priority": 76,
+            "lane": "current-stack",
+            "target": "prompt-context",
+            "hypothesis": "Prompt/context bloat must be split into stable cacheable context and volatile ledger growth before trimming anything.",
+            "metric": "stable_tokens_vs_volatile_tokens",
+            "benchmark_mode": "prompt-shape",
+            "guard_checks": ["context_within_limit", "semantic_preservation"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-shape",
+        },
+        {
+            "id": "implement-prompt-shape-compaction",
+            "status": "ready",
+            "priority": 74,
+            "lane": "current-stack",
+            "task_type": "implementation",
+            "target": "openclaw/openclaw-speed-research.py",
+            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "Autoresearch should compact or summarize volatile prompt ledger inputs once prompt-shape shows the largest contributors.",
+            "metric": "estimated_prompt_tokens",
+            "guard_checks": ["tests_pass", "context_within_limit", "semantic_preservation", "no_opencode_changes"],
+            "acceptance": "Focused tests pass and prompt-size or prompt-shape rows show bounded or reduced volatile context.",
+            "rollback": "Revert only the prompt-shape/compaction patch and record discard if semantic context is lost.",
+            "evidence": prompt_tokens or "prompt-size rows exist in results.tsv",
+            "next_action": (
+                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then make the smallest "
+                "OpenClaw-only prompt compaction/reporting patch and run python3 openclaw/test-speed-research.py."
+            ),
+        },
+        {
+            "id": "implement-rapid-profile-bandit-plan",
+            "status": "ready",
+            "priority": 72,
+            "lane": "current-stack",
+            "task_type": "implementation",
+            "target": "openclaw/openclaw-speed-research.py",
+            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "A bounded UCB-style Rapid-MLX profile manifest can replace manual knob guessing without risking memory crashes.",
+            "metric": "profile_score",
+            "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change"],
+            "acceptance": "A dry-run profile matrix is generated with crash/memory penalties before any live profile is promoted.",
+            "rollback": "Remove the profile planner if it creates ambiguous or unsafe profile recommendations.",
+            "evidence": speed_gap,
+            "next_action": (
+                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then implement a dry-run "
+                "Rapid profile scoring/planning helper; do not change live model settings in the same patch."
+            ),
+        },
+        {
+            "id": "implement-speculative-pld-compat-probe",
+            "status": "ready",
+            "priority": 68,
+            "lane": "frontier",
+            "task_type": "implementation",
+            "target": "openclaw/openclaw-speed-research.py",
+            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "Speculative decoding or PLD must be blocked unless tokenizer identity, acceptance rate, and tool/reasoning safety are proven.",
+            "metric": "compatibility_gate_pass",
+            "guard_checks": ["same_tokenizer", "no_tool_json_regression", "no_reasoning_leak", "no_model_change"],
+            "acceptance": "The helper can record pass/fail evidence without enabling speculation automatically.",
+            "rollback": "Remove the compatibility probe if it cannot distinguish safe from unsafe draft/helper paths.",
+            "evidence": speed_gap,
+            "next_action": (
+                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then add a dry-run "
+                "compatibility probe only; do not enable speculative decoding automatically."
+            ),
+        },
+    ]
+
+
 def synthesize(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -878,6 +963,30 @@ def synthesize(args: argparse.Namespace) -> int:
                 "",
             ]
         )
+    implementation_tasks = implementation_candidate_tasks(rows)
+    idea_lines.extend(
+        [
+            "## Implementation Candidates",
+            "",
+            "These are small, gated source-change candidates created from the synthesis. They are not live-setting changes by themselves.",
+            "",
+        ]
+    )
+    for task in implementation_tasks:
+        if task.get("task_type") != "implementation":
+            continue
+        idea_lines.extend(
+            [
+                f"### {task['id']}",
+                "",
+                f"- target: {task['target']}",
+                f"- hypothesis: {task['hypothesis']}",
+                f"- metric: {task['metric']}",
+                f"- acceptance: {task['acceptance']}",
+                f"- rollback: {task['rollback']}",
+                "",
+            ]
+        )
     ideas_path = root / "ideas.md"
     ideas_path.write_text("\n".join(idea_lines).rstrip() + "\n", encoding="utf-8")
 
@@ -895,46 +1004,48 @@ def synthesize(args: argparse.Namespace) -> int:
     )
     upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_note)
 
+    candidate_tasks = [
+        {
+            "id": "decode-sample-baseline",
+            "status": "ready",
+            "priority": 66,
+            "lane": "current-stack",
+            "target": "decode-sample",
+            "hypothesis": "Decode sample speed is required before judging 20 tok/s and 50-70 tok/s targets.",
+            "metric": "decode_tps",
+            "benchmark_mode": "decode-sample",
+            "guard_checks": ["no_reasoning_leak", "memory_ok"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+        },
+        {
+            "id": "prompt-size-after-synthesis",
+            "status": "ready",
+            "priority": 64,
+            "lane": "current-stack",
+            "target": "prompt-context",
+            "hypothesis": "Prompt/context size should stay bounded after synthesis and task growth.",
+            "metric": "estimated_prompt_tokens",
+            "benchmark_mode": "prompt-size",
+            "guard_checks": ["context_within_limit"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
+        },
+        {
+            "id": "streaming-ttft-post-synthesis",
+            "status": "ready",
+            "priority": 62,
+            "lane": "current-stack",
+            "target": "openclaw-model-proxy",
+            "hypothesis": "TTFT should remain stable after synthesis and queue expansion.",
+            "metric": "ttft_s",
+            "benchmark_mode": "streaming-ttft",
+            "guard_checks": ["no_sse_timeout", "memory_ok"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft",
+        },
+        *implementation_tasks,
+    ]
     seeded = upsert_tasks(
         root,
-        [
-            {
-                "id": "decode-sample-baseline",
-                "status": "ready",
-                "priority": 66,
-                "lane": "current-stack",
-                "target": "decode-sample",
-                "hypothesis": "Decode sample speed is required before judging 20 tok/s and 50-70 tok/s targets.",
-                "metric": "decode_tps",
-                "benchmark_mode": "decode-sample",
-                "guard_checks": ["no_reasoning_leak", "memory_ok"],
-                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
-            },
-            {
-                "id": "prompt-size-after-synthesis",
-                "status": "ready",
-                "priority": 64,
-                "lane": "current-stack",
-                "target": "prompt-context",
-                "hypothesis": "Prompt/context size should stay bounded after synthesis and task growth.",
-                "metric": "estimated_prompt_tokens",
-                "benchmark_mode": "prompt-size",
-                "guard_checks": ["context_within_limit"],
-                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
-            },
-            {
-                "id": "streaming-ttft-post-synthesis",
-                "status": "ready",
-                "priority": 62,
-                "lane": "current-stack",
-                "target": "openclaw-model-proxy",
-                "hypothesis": "TTFT should remain stable after synthesis and queue expansion.",
-                "metric": "ttft_s",
-                "benchmark_mode": "streaming-ttft",
-                "guard_checks": ["no_sse_timeout", "memory_ok"],
-                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft",
-            },
-        ],
+        candidate_tasks,
     )
     append_jsonl(
         root / "findings.jsonl",
@@ -943,6 +1054,9 @@ def synthesize(args: argparse.Namespace) -> int:
             "task_id": "synthesize-speed-ideas",
             "finding": "benchmark queue exhausted; synthesized ranked speed ideas and seeded measurable follow-up tasks",
             "ideas": [idea["id"] for idea in ideas],
+            "implementation_candidates": [
+                task["id"] for task in candidate_tasks if task.get("task_type") == "implementation"
+            ],
             "seeded_tasks": seeded,
             "kind": args.kind,
         },
@@ -1001,6 +1115,46 @@ def prompt_size_probe(root: Path) -> dict[str, Any]:
     }
 
 
+def prompt_shape_probe(root: Path) -> dict[str, Any]:
+    files = ["program.md", "STRATEGY.md", "ideas.md", "tasks.jsonl", "findings.jsonl", "experiments.jsonl", "results.tsv"]
+    entries: list[dict[str, Any]] = []
+    stable_tokens = 0
+    volatile_tokens = 0
+    for name in files:
+        path = root / name
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        tokens = estimate_tokens(text)
+        role = "stable" if name in {"program.md", "STRATEGY.md", "ideas.md"} else "volatile"
+        if role == "stable":
+            stable_tokens += tokens
+        else:
+            volatile_tokens += tokens
+        entries.append(
+            {
+                "file": name,
+                "role": role,
+                "chars": len(text),
+                "estimated_tokens": tokens,
+                "lines": len(text.splitlines()),
+            }
+        )
+    entries = sorted(entries, key=lambda item: int(item["estimated_tokens"]), reverse=True)
+    total_tokens = stable_tokens + volatile_tokens
+    return {
+        "ok": True,
+        "mode": "prompt-shape",
+        "timestamp": int(time.time()),
+        "total_estimated_tokens": total_tokens,
+        "stable_estimated_tokens": stable_tokens,
+        "volatile_estimated_tokens": volatile_tokens,
+        "volatile_ratio": round(volatile_tokens / total_tokens, 3) if total_tokens else 0,
+        "largest": entries[:5],
+    }
+
+
 def benchmark(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -1018,6 +1172,27 @@ def benchmark(args: argparse.Namespace) -> int:
             hypothesis="measure prompt/context size pressure before changing prompt policy",
             commit=commit,
             notes=f"estimated_prompt_tokens={result['estimated_prompt_tokens']} total_chars={result['total_chars']}",
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+    if mode == "prompt-shape":
+        result = prompt_shape_probe(root)
+        out = root / "benchmarks" / f"benchmark-{result['timestamp']}-{mode}.json"
+        out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        largest = result["largest"][0]["file"] if result["largest"] else "none"
+        append_result(
+            root,
+            run_id=f"benchmark-{result['timestamp']}",
+            status="keep",
+            target=mode,
+            hypothesis="separate stable prompt/cacheable context from volatile research ledger growth",
+            commit=commit,
+            notes=(
+                f"total_tokens={result['total_estimated_tokens']} "
+                f"stable_tokens={result['stable_estimated_tokens']} "
+                f"volatile_tokens={result['volatile_estimated_tokens']} "
+                f"volatile_ratio={result['volatile_ratio']} largest={largest}"
+            ),
         )
         print(json.dumps(result, indent=2))
         return 0
@@ -1141,7 +1316,15 @@ def main() -> int:
     bench.add_argument("--quick", action="store_true")
     bench.add_argument(
         "--mode",
-        choices=["quick-health", "streaming-ttft", "tool-roundtrip", "prompt-size", "decode-sample", "prefill-reuse"],
+        choices=[
+            "quick-health",
+            "streaming-ttft",
+            "tool-roundtrip",
+            "prompt-size",
+            "prompt-shape",
+            "decode-sample",
+            "prefill-reuse",
+        ],
         default="quick-health",
     )
     bench.add_argument("--timeout", type=float, default=180.0)

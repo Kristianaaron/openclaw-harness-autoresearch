@@ -28,6 +28,7 @@ def main() -> int:
     assert "Do not touch opencode" in prompt
     assert "benchmark --mode streaming-ttft" in prompt
     assert "--mode tool-roundtrip" in prompt
+    assert "--mode prompt-shape" in prompt
     assert "Do not run setup commands" in prompt
     assert "implementation-skill.md" in prompt
     assert "Do not repeat quick-health benchmarks" in prompt
@@ -36,6 +37,21 @@ def main() -> int:
     assert "benchmark queue is exhausted" in synthesis_prompt
     assert "synthesize --kind frontier" in synthesis_prompt
     assert "Do not run another benchmark until synthesis" in synthesis_prompt
+    implementation_task = {
+        "id": "implement-prompt-shape-compaction",
+        "task_type": "implementation",
+        "target": "openclaw/openclaw-speed-research.py",
+        "metric": "estimated_prompt_tokens",
+        "hypothesis": "compact volatile prompt state",
+        "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+        "acceptance": "tests pass and context stays bounded",
+        "rollback": "revert only this experiment",
+        "next_action": "make one source patch",
+    }
+    implementation_prompt = helper.continuation_prompt(11, 0, "", implementation_task)
+    assert "This is an implementation task" in implementation_prompt
+    assert "OpenClaw-only patch" in implementation_prompt
+    assert "openclaw/test-speed-research.py" in implementation_prompt
 
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
@@ -215,6 +231,24 @@ def main() -> int:
         assert ok
         assert issue == ""
         assert synth_marker.read_text(encoding="utf-8") == "synthesize --kind frontier"
+        tasks = [
+            {
+                "id": "impl",
+                "status": "ready",
+                "task_type": "implementation",
+                "target": "openclaw/example.py",
+            }
+        ]
+        helper.write_jsonl(helper.TASKS, tasks)
+        impl_summary = helper.complete_implementation_task(
+            tasks[0],
+            ["repo patch", "findings update"],
+            commit="abc123",
+        )
+        assert impl_summary is not None
+        assert impl_summary["task_id"] == "impl"
+        assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+        assert "implementation-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
     return 0
 
 

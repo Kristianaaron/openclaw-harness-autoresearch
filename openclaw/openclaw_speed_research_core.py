@@ -482,7 +482,8 @@ def task_summary(root: Path, limit: int = 3) -> str:
     ]
     tasks = sorted(tasks, key=lambda task: int(task.get("priority", 0)), reverse=True)[:limit]
     return "\n".join(
-        f"- {task.get('id', 'task')}: metric={task.get('metric', 'unknown')} next={task.get('next_action', 'record evidence')}"
+        f"- {task.get('id', 'task')}: type={task.get('task_type', 'benchmark')} "
+        f"metric={task.get('metric', 'unknown')} next={task.get('next_action', 'record evidence')}"
         for task in tasks
     )
 

@@ -82,20 +82,32 @@ def main() -> int:
             assert helper.benchmark(
                 Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-size", timeout=1.0)
             ) == 0
+            assert helper.benchmark(
+                Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-shape", timeout=1.0)
+            ) == 0
             benchmark_rows = (root / "results.tsv").read_text(encoding="utf-8")
             assert "prompt-size" in benchmark_rows
+            assert "prompt-shape" in benchmark_rows
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "prefix-dag-stable-context" in ideas
             assert "bandit-rapid-knob-search" in ideas
             assert "speculative-or-pld-gate" in ideas
             assert "mathematical handle" in ideas
+            assert "Implementation Candidates" in ideas
+            assert "implement-prompt-shape-compaction" in ideas
             tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "decode-sample-baseline" in tasks
+            assert "prompt-shape-report" in tasks
             assert "prompt-size-after-synthesis" in tasks
             assert "streaming-ttft-post-synthesis" in tasks
+            assert "implement-prompt-shape-compaction" in tasks
+            assert "implement-rapid-profile-bandit-plan" in tasks
+            assert "implement-speculative-pld-compat-probe" in tasks
+            assert '"task_type": "implementation"' in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
             assert "synthesize-speed-ideas" in findings
+            assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
     return 0
 
