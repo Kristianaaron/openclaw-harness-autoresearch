@@ -31,6 +31,7 @@ def main() -> int:
     assert "Do not run setup commands" in prompt
     assert "implementation-skill.md" in prompt
     assert "Do not repeat quick-health benchmarks" in prompt
+    assert "do not append another" in prompt
 
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
@@ -101,6 +102,14 @@ def main() -> int:
         quick_after = helper.durable_snapshot()
         quality = helper.cycle_quality(helper.WORKSPACE, quick_before, quick_after, ["results row"], "")
         assert quality["status"] == "noise"
+        malformed_before = dict(quick_after)
+        malformed_before["results_lines"] = 2
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            file.write("bad\trow\n")
+        malformed_after = helper.durable_snapshot()
+        quality = helper.cycle_quality(helper.WORKSPACE, malformed_before, malformed_after, ["results row"], "")
+        assert quality["status"] == "blocked"
+        assert "malformed results.tsv" in quality["reason"]
         session_dir = helper.OPENCLAW_HOME / "agents" / "main" / "sessions"
         session_dir.mkdir(parents=True)
         session_file = session_dir / "cycle-count.jsonl"

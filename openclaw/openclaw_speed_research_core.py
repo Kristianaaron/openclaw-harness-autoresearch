@@ -123,6 +123,8 @@ def ensure_research_state(root: Path) -> None:
     (root / "experiments").mkdir(exist_ok=True)
     if not (root / "results.tsv").exists():
         (root / "results.tsv").write_text(RESULTS_HEADER, encoding="utf-8")
+    else:
+        normalize_results_ledger(root / "results.tsv")
     if not (root / "STRATEGY.md").exists():
         (root / "STRATEGY.md").write_text(strategy_template(), encoding="utf-8")
     for name in ("findings.jsonl", "experiments.jsonl", "rejections.jsonl"):
@@ -138,6 +140,62 @@ def ensure_research_state(root: Path) -> None:
         missing = [dict(task) for task in DEFAULT_TASKS if str(task["id"]) not in existing_ids]
         if missing:
             write_jsonl(tasks_path, existing + missing)
+
+
+def normalize_results_ledger(path: Path) -> None:
+    """Keep the ledger parseable while preserving historical evidence.
+
+    Early bootstraps used a 5-column TSV. Current autoresearch uses the
+    canonical 12-column ledger. Convert old rows and quarantine malformed rows
+    instead of letting future quality scoring read a mixed schema.
+    """
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        path.write_text(RESULTS_HEADER, encoding="utf-8")
+        return
+    expected = len(RESULTS_HEADER.rstrip("\n").split("\t"))
+    header = lines[0].split("\t")
+    converted = [RESULTS_HEADER.rstrip("\n")]
+    quarantined: list[str] = []
+    changed = header != RESULTS_HEADER.rstrip("\n").split("\t")
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) == expected:
+            converted.append(line)
+            continue
+        if len(fields) == 5:
+            timestamp, hypothesis, method, result, verdict = fields
+            converted.append(
+                "\t".join(
+                    clean_tsv(item)
+                    for item in [
+                        timestamp,
+                        f"legacy-{method.lower().replace(' ', '-')}",
+                        "keep" if verdict.upper() == "PASS" else "blocked",
+                        method,
+                        hypothesis,
+                        "",
+                        "",
+                        "",
+                        result.removesuffix("s") if result.endswith("s") else result,
+                        "",
+                        "legacy",
+                        f"legacy_result={result} verdict={verdict}",
+                    ]
+                )
+            )
+            changed = True
+            continue
+        quarantined.append(line)
+        changed = True
+    if not changed:
+        return
+    backup = path.with_suffix(f".tsv.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(converted) + "\n", encoding="utf-8")
+    if quarantined:
+        quarantine = path.with_suffix(f".tsv.quarantine-{time.strftime('%Y%m%d-%H%M%S')}")
+        quarantine.write_text("\n".join(quarantined) + "\n", encoding="utf-8")
 
 
 def strategy_template() -> str:
@@ -204,12 +262,25 @@ def result_rows_since(root: Path, before_line_count: int) -> list[dict[str, str]
     lines = results.read_text(encoding="utf-8", errors="replace").splitlines()
     if len(lines) <= before_line_count:
         return []
-    headers = lines[0].split("\t") if lines else []
+    headers = RESULTS_HEADER.rstrip("\n").split("\t")
     rows: list[dict[str, str]] = []
     for line in lines[max(before_line_count, 1) :]:
         values = line.split("\t")
+        if len(values) != len(headers):
+            continue
         rows.append({headers[index]: values[index] if index < len(values) else "" for index in range(len(headers))})
     return rows
+
+
+def malformed_result_rows_since(root: Path, before_line_count: int) -> int:
+    results = root / "results.tsv"
+    if not results.exists():
+        return 0
+    lines = results.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) <= before_line_count:
+        return 0
+    expected = len(RESULTS_HEADER.rstrip("\n").split("\t"))
+    return sum(1 for line in lines[max(before_line_count, 1) :] if len(line.split("\t")) != expected)
 
 
 def select_next_task(root: Path) -> dict[str, Any] | None:
@@ -254,6 +325,9 @@ def cycle_quality(
 ) -> dict[str, Any]:
     if not progress_reasons:
         return {"score": 0, "status": "blocked", "reason": issue or "no durable artifact"}
+    malformed_rows = malformed_result_rows_since(root, int(before.get("results_lines", 0)))
+    if malformed_rows:
+        return {"score": 0, "status": "blocked", "reason": f"malformed results.tsv rows={malformed_rows}"}
     rows = result_rows_since(root, int(before.get("results_lines", 0)))
     targets = {row.get("target", "") for row in rows}
     if targets and targets <= {"quick-benchmark", "quick-health"} and len(progress_reasons) <= 2:

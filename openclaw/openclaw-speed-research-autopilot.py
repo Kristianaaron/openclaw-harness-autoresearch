@@ -374,6 +374,8 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "Cycle contract: each cycle must finish with one durable artifact: a results.tsv row, ideas.md note, "
         "STRATEGY.md update, findings.jsonl entry, experiments.jsonl entry, tasks.jsonl update, benchmark JSON, "
         "source patch, test result, rejection entry, or explicit blocked row. "
+        "Benchmark commands already write results.tsv and benchmark JSON; after running one, do not append another "
+        "results row by hand. Use a later cycle for synthesis or task updates. "
         "Do not repeat quick-health benchmarks unless comparing variance or validating a changed hypothesis. "
         "No quality artifact means the supervisor will narrow the next cycle automatically."
         f"{task_summary}"
@@ -505,7 +507,7 @@ def main() -> int:
     parser.add_argument("--max-hours", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_HOURS", "8")))
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
-    parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "2")))
+    parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
     parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "1024")))
