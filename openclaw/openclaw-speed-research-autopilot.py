@@ -723,6 +723,7 @@ def main() -> int:
         before = durable_snapshot()
         selected_task = select_next_task(WORKSPACE)
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
+        before = durable_snapshot()
         code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file)
         after = durable_snapshot()
         progress_reasons = durable_progress(before, after)

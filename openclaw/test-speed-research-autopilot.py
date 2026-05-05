@@ -111,8 +111,14 @@ def main() -> int:
         assert helper.select_next_task(helper.WORKSPACE)["id"] == "tool-roundtrip-overhead"
         selected_tool = helper.select_next_task(helper.WORKSPACE)
         start_line = helper.results_line_count()
+        before_claim = helper.durable_snapshot()
         selected_tool = helper.claim_task_evidence_window(helper.WORKSPACE, selected_tool, start_line)
         assert selected_tool["evidence_start_line"] == start_line
+        after_claim = helper.durable_snapshot()
+        claim_progress = helper.durable_progress(before_claim, after_claim)
+        assert "task queue update" in claim_progress
+        quality = helper.cycle_quality(helper.WORKSPACE, after_claim, after_claim, [], "")
+        assert quality["status"] == "blocked"
         with helper.RESULTS.open("a", encoding="utf-8") as file:
             for index in range(1, 3):
                 file.write(
