@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 
@@ -47,6 +48,13 @@ def main() -> int:
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1
+    with tempfile.TemporaryDirectory() as tmp:
+        helper.RESULTS = Path(tmp) / "results.tsv"
+        helper.append_supervisor_result(7, "nightly", "blocked", "memory gate\tstill hot\nretry")
+        text = helper.RESULTS.read_text(encoding="utf-8")
+        assert text.startswith("timestamp\trun_id\tstatus")
+        assert "autopilot-cycle-7" in text
+        assert "session=nightly issue=memory gate still hot retry" in text
     return 0
 
 

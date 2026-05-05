@@ -24,6 +24,10 @@ RESULTS = WORKSPACE / "results.tsv"
 IDEAS = WORKSPACE / "ideas.md"
 LOG_DIR = WORKSPACE / "logs"
 PROGRAM = WORKSPACE / "program.md"
+RESULTS_HEADER = (
+    "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
+    "wall_s\tmemory_gb\tcommit\tnotes\n"
+)
 BLOCKED_PATTERNS = (
     "OpenClaw blocked a broad local tool command",
     "blocked this request before model execution",
@@ -53,6 +57,48 @@ def file_mtime(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def clean_tsv(value: object) -> str:
+    return str(value).replace("\t", " ").replace("\n", " ").strip()
+
+
+def current_commit() -> str:
+    repo = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short=7", "HEAD"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def append_supervisor_result(cycle: int, session: str, status: str, issue: str) -> None:
+    RESULTS.parent.mkdir(parents=True, exist_ok=True)
+    if not RESULTS.exists():
+        RESULTS.write_text(RESULTS_HEADER, encoding="utf-8")
+    row = [
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        f"autopilot-cycle-{cycle}",
+        status,
+        "autopilot",
+        "overnight progress watchdog",
+        "",
+        "",
+        "",
+        "",
+        "",
+        current_commit(),
+        f"session={session} issue={clean_tsv(issue)}",
+    ]
+    with RESULTS.open("a", encoding="utf-8") as file:
+        file.write("\t".join(clean_tsv(item) for item in row) + "\n")
 
 
 def memory_snapshot() -> dict[str, int]:
@@ -85,7 +131,9 @@ def memory_snapshot() -> dict[str, int]:
     return snapshot
 
 
-def wait_for_memory(args: argparse.Namespace) -> None:
+def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
+    started = time.monotonic()
+    last_reason = ""
     while True:
         snap = memory_snapshot()
         too_hot = (
@@ -94,10 +142,15 @@ def wait_for_memory(args: argparse.Namespace) -> None:
             or (snap["free_mb"] and snap["free_mb"] < args.min_free_mb)
         )
         if not too_hot:
-            return
+            return True, ""
+        last_reason = (
+            f"memory gate waiting: free={snap['free_mb']}MB "
+            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
+        )
+        if args.max_memory_wait_seconds > 0 and time.monotonic() - started >= args.max_memory_wait_seconds:
+            return False, f"{last_reason}; exceeded {args.max_memory_wait_seconds:.0f}s wait budget"
         log(
-            "memory gate waiting: "
-            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
+            last_reason
         )
         time.sleep(args.memory_wait_seconds)
 
@@ -231,6 +284,12 @@ def main() -> int:
     parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "2048")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
+        "--max-memory-wait-seconds",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_MEMORY_WAIT", "1800")),
+        help="record a blocked row and continue recovery after memory remains unsafe for this long",
+    )
+    parser.add_argument(
         "--rotate-session-after-stalls",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_ROTATE_AFTER_STALLS", "3")),
@@ -250,7 +309,27 @@ def main() -> int:
         if time.monotonic() >= deadline:
             log("autopilot max-hours reached")
             break
-        wait_for_memory(args)
+        memory_ok, memory_issue = wait_for_memory(args)
+        if not memory_ok:
+            stalled_cycles += 1
+            last_issue = memory_issue
+            append_supervisor_result(cycle, current_session, "blocked", memory_issue)
+            log(
+                f"cycle={cycle} skipped model turn due to memory gate stalled_cycles={stalled_cycles} "
+                f"issue={memory_issue}"
+            )
+            if (
+                args.rotate_session_after_stalls > 0
+                and stalled_cycles >= args.rotate_session_after_stalls
+                and cycle < args.cycles
+            ):
+                recovery_epoch += 1
+                current_session = f"{args.session}-recovery-{recovery_epoch}"
+                last_issue = f"rotated to fresh session after {stalled_cycles} stalled cycles"
+                stalled_cycles = 0
+                log(f"rotating to fresh recovery session={current_session}")
+            time.sleep(args.sleep_seconds)
+            continue
         before_lines = results_line_count()
         before_results_mtime = file_mtime(RESULTS)
         before_ideas_mtime = file_mtime(IDEAS)
@@ -266,6 +345,9 @@ def main() -> int:
         )
         if code not in {0, 124}:
             log(f"agent turn returned nonzero exit={code}; continuing after a short pause")
+        if not progressed:
+            append_supervisor_result(cycle, current_session, "blocked", last_issue)
+            log(f"cycle={cycle} recorded supervisor blocked row for issue={last_issue}")
         if (
             args.rotate_session_after_stalls > 0
             and stalled_cycles >= args.rotate_session_after_stalls
