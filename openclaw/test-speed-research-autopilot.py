@@ -109,8 +109,34 @@ def main() -> int:
         assert advancement["sample_count"] == 3
         assert advancement["mean_ttft_s"] == 0.89
         assert helper.select_next_task(helper.WORKSPACE)["id"] == "tool-roundtrip-overhead"
+        selected_tool = helper.select_next_task(helper.WORKSPACE)
+        start_line = helper.results_line_count()
+        selected_tool = helper.claim_task_evidence_window(helper.WORKSPACE, selected_tool, start_line)
+        assert selected_tool["evidence_start_line"] == start_line
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            for index in range(1, 3):
+                file.write(
+                    f"2026-05-05T00:01:0{index}+0000\ttool-{index}\tkeep\ttool-roundtrip\t"
+                    "bounded OpenClaw tool-roundtrip probe\t\t\t\t1.5\t1.5\tabc123\tmodel=local\n"
+                )
+        assert helper.complete_task_from_evidence(helper.WORKSPACE, selected_tool, min_samples=3, commit="abc123") is None
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            file.write(
+                "2026-05-05T00:01:03+0000\ttool-3\tkeep\ttool-roundtrip\t"
+                "bounded OpenClaw tool-roundtrip probe\t\t\t\t1.6\t1.5\tabc123\tmodel=local\n"
+            )
+        tool_advancement = helper.complete_task_from_evidence(
+            helper.WORKSPACE,
+            selected_tool,
+            min_samples=3,
+            commit="abc123",
+        )
+        assert tool_advancement is not None
+        assert tool_advancement["task_id"] == "tool-roundtrip-overhead"
+        assert tool_advancement["sample_count"] == 3
+        assert helper.select_next_task(helper.WORKSPACE)["id"] == "prompt-size-pressure"
         recovery_after_advance = helper.continuation_prompt(9, 2, "no durable progress")
-        assert "benchmark --mode tool-roundtrip" in recovery_after_advance
+        assert "benchmark --mode prompt-size" in recovery_after_advance
         assert "baseline-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
         assert "supervisor advanced" in helper.FINDINGS.read_text(encoding="utf-8")
         assert "Accepted Baselines" in helper.STRATEGY.read_text(encoding="utf-8")

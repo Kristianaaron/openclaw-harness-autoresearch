@@ -335,7 +335,37 @@ def task_evidence_rows(root: Path, task: dict[str, Any]) -> list[dict[str, str]]
     mode = str(task.get("benchmark_mode", ""))
     if not mode:
         return []
-    return [row for row in all_result_rows(root) if row.get("status") == "keep" and row.get("target") == mode]
+    start_line = int(task.get("evidence_start_line") or 0)
+    rows = result_rows_since(root, start_line) if start_line else all_result_rows(root)
+    return [row for row in rows if row.get("status") == "keep" and row.get("target") == mode]
+
+
+def claim_task_evidence_window(root: Path, task: dict[str, Any] | None, start_line: int) -> dict[str, Any] | None:
+    """Pin task evidence to rows created after the task is first selected.
+
+    Without this, two tasks that share a benchmark mode can accidentally reuse
+    old rows and advance without testing their own hypothesis.
+    """
+    if not task or task.get("status", "ready") not in {"ready", "rework"}:
+        return task
+    if task.get("evidence_start_line"):
+        return task
+    next_action = str(task.get("next_action", ""))
+    if "openclaw-speed-research benchmark --mode" not in next_action:
+        return task
+    tasks = read_jsonl(root / "tasks.jsonl")
+    changed = False
+    updated_task = dict(task)
+    for item in tasks:
+        if item.get("id") != task.get("id"):
+            continue
+        item["evidence_start_line"] = start_line
+        updated_task = dict(item)
+        changed = True
+        break
+    if changed:
+        write_jsonl(root / "tasks.jsonl", tasks)
+    return updated_task
 
 
 def append_strategy_note(root: Path, note: str) -> None:
