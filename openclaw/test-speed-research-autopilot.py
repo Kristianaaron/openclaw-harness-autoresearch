@@ -45,6 +45,7 @@ def main() -> int:
     assert helper.recovery_mode(2, "no durable progress") == "force-benchmark"
     assert helper.recovery_mode(3, "no durable progress") == "fresh-session"
     assert helper.recovery_mode(1, "metal out of memory") == "diagnose"
+    assert helper.recovery_mode(1, "TOOL RESULT CAP") == "force-benchmark"
 
     assert helper.summarize_issue("x OpenClaw blocked a broad local tool command y", "", 0) == (
         "OpenClaw blocked a broad local tool command"
@@ -54,8 +55,12 @@ def main() -> int:
     assert helper.summarize_issue("", "", 124) == "turn timeout"
     assert helper.summarize_issue("", "", 7) == "agent exit 7"
     assert helper.summarize_issue("all good", "", 0) == ""
+    assert helper.summarize_issue("TOOL RESULT CAP after 2 tool results", "", 0) == "TOOL RESULT CAP"
     assert helper.summarize_issue("Warming up Metal shaders", "", 0) == ""
     assert helper.summarize_issue("Metal out of memory while compiling", "", 0) == "metal out of memory"
+    assert helper.early_failure_reason("EMBEDDED FALLBACK: Gateway agent failed") == "gateway embedded fallback"
+    assert helper.early_failure_reason("rawError=Connection error.") == "model connection error"
+    assert helper.early_failure_reason("normal bounded result") == ""
     assert helper.as_text(b"hello") == "hello"
     assert helper.as_text(None) == ""
     args = Namespace(min_free_mb=1024, ready_min_free_mb=0, max_compressor_mb=8192, max_swap_mb=8192)
@@ -145,7 +150,15 @@ def main() -> int:
             encoding="utf-8",
         )
         assert helper.session_tool_result_count("cycle-count") == 2
-        assert helper.session_file_path("cycle-count") == session_file
+        trajectory = session_dir / "trajectory-only.trajectory.jsonl"
+        trajectory.write_text(
+            '{"type":"trace.artifacts","data":{"toolMetas":[{"toolName":"read"},{"toolName":"exec"}]}}\n',
+            encoding="utf-8",
+        )
+        assert helper.session_tool_result_count("trajectory-only") == 2
+        assert helper.session_jsonl_path("cycle-count") == session_file
+        assert helper.session_exists("cycle-count")
+        assert helper.session_exists("trajectory-only")
         assert helper.session_mtime("cycle-count") > 0
         helper.append_supervisor_result(7, "nightly", "blocked", "memory gate\tstill hot\nretry")
         text = helper.RESULTS.read_text(encoding="utf-8")

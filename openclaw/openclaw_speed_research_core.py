@@ -65,7 +65,7 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "metric": "prefill_or_wall_s",
         "benchmark_mode": "prefill-reuse",
         "guard_checks": ["tests_pass", "memory_ok", "no_crash"],
-        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-rapid-launcher.py",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prefill-reuse",
     },
     {
         "id": "jang-bridge-loop-guard",
@@ -77,9 +77,18 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "metric": "loop_or_reasoning_leak_count",
         "benchmark_mode": "tool-roundtrip",
         "guard_checks": ["no_thought_loop", "no_malformed_tool_json", "tests_pass"],
-        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/rapid-overlay/openclaw_rapid_jang.py",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode tool-roundtrip",
     },
 )
+
+TASK_MIGRATIONS: dict[str, dict[str, Any]] = {
+    "rapid-jang-prefill": {
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prefill-reuse",
+    },
+    "jang-bridge-loop-guard": {
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode tool-roundtrip",
+    },
+}
 
 
 def clean_tsv(value: object) -> str:
@@ -138,7 +147,16 @@ def ensure_research_state(root: Path) -> None:
         existing = read_jsonl(tasks_path)
         existing_ids = {str(task.get("id", "")) for task in existing}
         missing = [dict(task) for task in DEFAULT_TASKS if str(task["id"]) not in existing_ids]
-        if missing:
+        changed = False
+        for task in existing:
+            migration = TASK_MIGRATIONS.get(str(task.get("id", "")))
+            if not migration:
+                continue
+            for key, value in migration.items():
+                if task.get(key) != value:
+                    task[key] = value
+                    changed = True
+        if missing or changed:
             write_jsonl(tasks_path, existing + missing)
 
 

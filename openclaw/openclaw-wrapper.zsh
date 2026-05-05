@@ -422,7 +422,8 @@ case "${1:-}" in
     openclaw_cleanup_model=1
     _openclaw_start_model_once || return $?
     _openclaw_warm_model_prefix_once
-    _openclaw_gateway_ready || /usr/sbin/lsof -nP -iTCP:"$gateway_port" -sTCP:LISTEN >/dev/null 2>&1 || openclaw_cleanup_gateway=1
+    openclaw_cleanup_gateway=1
+    _openclaw_stop_gateway_owned
     _openclaw_start_gateway_once || return $?
     if [[ "$openclaw_mode" == "speed-research-tui" || "$openclaw_mode" == "research-speed-tui" ]]; then
       openclaw_args=("tui" "--session" "$speed_research_session" "--history-limit" "${OPENCLAW_SPEED_RESEARCH_HISTORY_LIMIT:-1}" "--timeout-ms" "${OPENCLAW_SPEED_RESEARCH_TIMEOUT_MS:-900000}" "--message" "$research_prompt")

@@ -49,7 +49,17 @@ BLOCKED_PATTERNS = (
     "metal out of memory",
     "metal gpu",
     "SSE read timed out",
+    "TOOL RESULT CAP",
+    "TOOL RESULT SYNTHESIS GRACE",
     "timed out",
+)
+EARLY_FAILURE_PATTERNS = (
+    ("EMBEDDED FALLBACK", "gateway embedded fallback"),
+    ("GatewayClientRequestError", "gateway client request error"),
+    ("FailoverError: LLM request failed: network connection error", "model connection error"),
+    ("embedded run agent end", "embedded agent failure"),
+    ("rawError=Connection error", "model connection error"),
+    ("Connection error.", "model connection error"),
 )
 
 
@@ -180,6 +190,8 @@ def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
     issue = last_issue.lower()
     if "memory" in issue or "metal" in issue or "crash" in issue or "fatal process exit" in issue:
         return "diagnose"
+    if "tool result cap" in issue or "tool result synthesis grace" in issue:
+        return "force-benchmark"
     if stalled_cycles <= 0:
         return "normal"
     if stalled_cycles == 1:
@@ -406,6 +418,26 @@ def summarize_issue(stdout: str, stderr: str, returncode: int) -> str:
     return ""
 
 
+def early_failure_reason(text: str) -> str:
+    for pattern, reason in EARLY_FAILURE_PATTERNS:
+        if pattern in text:
+            return reason
+    return ""
+
+
+def read_log_since(path: Path, offset: int, limit: int = 12000) -> str:
+    try:
+        size = path.stat().st_size
+        start = min(offset, size)
+        if size - start > limit:
+            start = size - limit
+        with path.open("rb") as file:
+            file.seek(start)
+            return file.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def as_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
@@ -415,19 +447,50 @@ def as_text(value: str | bytes | None) -> str:
 
 
 def session_tool_result_count(session: str) -> int:
-    session_file = OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.jsonl"
-    try:
-        return sum(1 for line in session_file.read_text(encoding="utf-8", errors="replace").splitlines() if '"role":"toolResult"' in line)
-    except OSError:
-        return 0
+    count = 0
+    legacy = session_jsonl_path(session)
+    if legacy.exists():
+        try:
+            count += sum(
+                1
+                for line in legacy.read_text(encoding="utf-8", errors="replace").splitlines()
+                if '"role":"toolResult"' in line
+            )
+        except OSError:
+            pass
+    trajectory = session_trajectory_path(session)
+    if trajectory.exists():
+        try:
+            for line in trajectory.read_text(encoding="utf-8", errors="replace").splitlines():
+                if '"toolMetas"' in line:
+                    count += line.count('"toolName"')
+        except OSError:
+            pass
+    return count
 
 
-def session_file_path(session: str) -> Path:
+def session_jsonl_path(session: str) -> Path:
     return OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.jsonl"
 
 
+def session_pointer_path(session: str) -> Path:
+    return OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.trajectory-path.json"
+
+
+def session_trajectory_path(session: str) -> Path:
+    return OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.trajectory.jsonl"
+
+
+def session_paths(session: str) -> tuple[Path, ...]:
+    return (session_jsonl_path(session), session_pointer_path(session), session_trajectory_path(session))
+
+
+def session_exists(session: str) -> bool:
+    return any(path.exists() for path in session_paths(session))
+
+
 def session_mtime(session: str) -> float:
-    return file_mtime(session_file_path(session))
+    return max(file_mtime(path) for path in session_paths(session))
 
 
 def stop_process_tree(process: subprocess.Popen[str], *, terminate_grace_seconds: float = 8.0) -> None:
@@ -481,6 +544,7 @@ def run_turn(
         file.write(f"\n===== cycle {cycle} session {session} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         file.write("$ " + " ".join(cmd[:5] + ["<prompt>", *cmd[6:]]) + "\n")
         file.flush()
+        log_offset = file.tell()
         try:
             process = subprocess.Popen(
                 cmd,
@@ -493,6 +557,7 @@ def run_turn(
             deadline = started + args.turn_timeout_seconds + args.turn_timeout_grace_seconds
             next_heartbeat = started + 30
             next_tool_check = started + 1
+            next_failure_check = started + 2
             capped_by_tool_results = False
             while process.poll() is None:
                 now = time.monotonic()
@@ -507,7 +572,7 @@ def run_turn(
                     return 124, summarize_issue(tail, "", 124)
                 if (
                     args.session_start_timeout_seconds > 0
-                    and not session_file_path(session).exists()
+                    and not session_exists(session)
                     and now - started >= args.session_start_timeout_seconds
                 ):
                     file.write(f"\nSESSION START TIMEOUT after {now - started:.1f}s\n")
@@ -516,7 +581,7 @@ def run_turn(
                     return 124, "agent session bootstrap timeout"
                 if (
                     args.session_idle_timeout_seconds > 0
-                    and session_file_path(session).exists()
+                    and session_exists(session)
                     and last_session_mtime > 0
                     and now - last_session_mtime >= args.session_idle_timeout_seconds
                 ):
@@ -530,6 +595,14 @@ def run_turn(
                         f"elapsed={now - started:.0f}s timeout={args.turn_timeout_seconds}s"
                     )
                     next_heartbeat = now + 30
+                if now >= next_failure_check:
+                    failure = early_failure_reason(read_log_since(log_file, log_offset))
+                    if failure:
+                        file.write(f"\nEARLY FAILURE after {now - started:.1f}s: {failure}\n")
+                        file.flush()
+                        stop_process_tree(process)
+                        return 124, failure
+                    next_failure_check = now + 2
                 if args.max_tool_results_per_turn > 0 and now >= next_tool_check:
                     tool_results = max(0, session_tool_result_count(session) - starting_tool_results)
                     if tool_results > 0 and first_new_tool_at == 0.0:
