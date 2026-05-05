@@ -290,10 +290,17 @@ def recent_task_rejections(task_id: str, reason: str, limit: int = 3) -> int:
 def block_task_after_repeated_guard(task: dict[str, object] | None, reason: str, *, threshold: int = 3) -> bool:
     if not task or task.get("task_type") != "implementation":
         return False
-    if reason != "OpenClaw blocked a broad local tool command":
+    threshold_by_reason = {
+        "OpenClaw blocked a broad local tool command": threshold,
+        "TOOL RESULT SYNTHESIS GRACE": 1,
+        "TOOL RESULT CAP": 1,
+        "turn timeout": 1,
+    }
+    if reason not in threshold_by_reason:
         return False
     task_id = str(task.get("id", ""))
-    if recent_task_rejections(task_id, reason, limit=threshold) < threshold:
+    active_threshold = threshold_by_reason[reason]
+    if recent_task_rejections(task_id, reason, limit=active_threshold) < active_threshold:
         return False
     tasks = read_jsonl(TASKS)
     changed = False
@@ -304,7 +311,7 @@ def block_task_after_repeated_guard(task: dict[str, object] | None, reason: str,
         item["status"] = "blocked"
         item["blocked_at"] = blocked_at
         item["blocked_reason"] = reason
-        item["next"] = "supervisor moved on after repeated guard blocks; refine task into narrower exact file/tool steps"
+        item["next"] = "supervisor moved on after repeated implementation stalls; refine task into narrower exact file/tool steps"
         changed = True
         break
     if not changed:
@@ -315,12 +322,29 @@ def block_task_after_repeated_guard(task: dict[str, object] | None, reason: str,
         {
             "timestamp": blocked_at,
             "task_id": task_id,
-            "finding": "implementation task blocked repeatedly by broad-command guard; supervisor marked it blocked and moved on",
+            "finding": "implementation task stalled or hit a guard without durable evidence; supervisor marked it blocked and moved on",
             "reason": reason,
             "next": "select_next_ready_task",
         },
     )
     return True
+
+
+def block_stale_rejected_implementation_tasks() -> int:
+    blocked = 0
+    for task in read_jsonl(TASKS):
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("task_type") != "implementation":
+            continue
+        for reason in ("TOOL RESULT SYNTHESIS GRACE", "TOOL RESULT CAP", "turn timeout"):
+            if block_task_after_repeated_guard(task, reason):
+                blocked += 1
+                break
+        else:
+            if block_task_after_repeated_guard(task, "OpenClaw blocked a broad local tool command", threshold=3):
+                blocked += 1
+    return blocked
 
 
 def memory_snapshot() -> dict[str, int]:
@@ -835,7 +859,7 @@ def main() -> int:
     parser.add_argument(
         "--max-implementation-tool-results-per-turn",
         type=int,
-        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_IMPLEMENTATION_TOOL_RESULTS", "6")),
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_IMPLEMENTATION_TOOL_RESULTS", "4")),
         help="allow bounded read/patch/test/record cycles for implementation tasks",
     )
     parser.add_argument("--tool-result-synthesis-grace-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TOOL_SYNTHESIS_GRACE", "20")))
@@ -886,6 +910,9 @@ def main() -> int:
         if time.monotonic() >= deadline:
             log("autopilot max-hours reached")
             break
+        stale_blocked = block_stale_rejected_implementation_tasks()
+        if stale_blocked:
+            log(f"supervisor blocked stale rejected implementation tasks count={stale_blocked}")
         memory_ok, memory_issue = wait_for_memory(args)
         if not memory_ok:
             stalled_cycles += 1
@@ -995,7 +1022,7 @@ def main() -> int:
             if block_task_after_repeated_guard(selected_task, last_issue):
                 log(
                     f"cycle={cycle} blocked implementation task={selected_task.get('id', 'unknown')} "
-                    "after repeated broad-command guard hits; moving to next task"
+                    "after repeated implementation stalls or guard hits; moving to next task"
                 )
                 stalled_cycles = 0
                 last_issue = ""

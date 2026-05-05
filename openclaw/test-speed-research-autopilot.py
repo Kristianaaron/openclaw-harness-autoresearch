@@ -239,7 +239,39 @@ def main() -> int:
         )
         blocked_text = helper.TASKS.read_text(encoding="utf-8")
         assert '"status": "blocked"' in blocked_text
-        assert "implementation task blocked" in helper.FINDINGS.read_text(encoding="utf-8")
+        assert "stalled or hit a guard" in helper.FINDINGS.read_text(encoding="utf-8")
+        tool_grace_task = {
+            "id": "tool-grace-impl",
+            "status": "ready",
+            "task_type": "implementation",
+            "target": "openclaw/example.py",
+        }
+        helper.write_jsonl(helper.TASKS, [tool_grace_task])
+        helper.record_rejection(
+            helper.WORKSPACE,
+            cycle=4,
+            task_id="tool-grace-impl",
+            reason="TOOL RESULT SYNTHESIS GRACE",
+            evidence="too many tools",
+        )
+        assert helper.block_task_after_repeated_guard(tool_grace_task, "TOOL RESULT SYNTHESIS GRACE")
+        assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
+        stale_task = {
+            "id": "stale-impl",
+            "status": "ready",
+            "task_type": "implementation",
+            "target": "openclaw/example.py",
+        }
+        helper.write_jsonl(helper.TASKS, [stale_task])
+        helper.record_rejection(
+            helper.WORKSPACE,
+            cycle=5,
+            task_id="stale-impl",
+            reason="turn timeout",
+            evidence="timeout",
+        )
+        assert helper.block_stale_rejected_implementation_tasks() == 1
+        assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
