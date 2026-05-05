@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Launch OpenClaw's production-safe JANG/VLM backend."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+
+OPENCLAW_DIR = Path.home() / ".openclaw"
+RUNTIME_DIR = OPENCLAW_DIR / "runtime" / "rapid-mlx"
+JANG_TARGET = RUNTIME_DIR / "site"
+CHILD: subprocess.Popen[bytes] | None = None
+
+
+def log(message: str) -> None:
+    print(f"[openclaw-jang-vlm-launcher] {message}", file=sys.stderr, flush=True)
+
+
+def rapid_python() -> str:
+    explicit = os.environ.get("OPENCLAW_RAPID_PYTHON") or os.environ.get("OPENCLAW_JANG_PYTHON")
+    if explicit:
+        return explicit
+    candidate = Path("/opt/homebrew/Cellar/rapid-mlx/0.6.1/libexec/bin/python")
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+def ensure_jang_target() -> None:
+    JANG_TARGET.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(JANG_TARGET)
+    check = [rapid_python(), "-c", "import jang_tools, mlx_vlm"]
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    package = os.environ.get("OPENCLAW_RAPID_JANG_PACKAGE", "jang>=2.5.8,<3")
+    log(f"installing OpenClaw-managed JANG dependency target: {package}")
+    subprocess.check_call(
+        [
+            rapid_python(),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--target",
+            str(JANG_TARGET),
+            "--upgrade",
+            "--no-deps",
+            package,
+        ]
+    )
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        raise RuntimeError("JANG dependency target installed but imports still fail")
+
+
+def health_ready(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/v1/models", timeout=2) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def build_env() -> dict[str, str]:
+    env = os.environ.copy()
+    paths = [str(JANG_TARGET)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        paths.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
+
+
+def stop_child() -> None:
+    global CHILD
+    if CHILD is None or CHILD.poll() is not None:
+        return
+    CHILD.terminate()
+    try:
+        CHILD.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        CHILD.kill()
+        CHILD.wait(timeout=5)
+
+
+def handle_signal(_signum: int, _frame: object) -> None:
+    stop_child()
+    raise SystemExit(143)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Launch OpenClaw JANG/VLM server.")
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--served-model-name", required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument("--startup-wait-seconds", type=int, default=180)
+    return parser.parse_args()
+
+
+def main() -> int:
+    global CHILD
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    args = parse_args()
+    ensure_jang_target()
+    argv = [
+        rapid_python(),
+        str(OPENCLAW_DIR / "servers/openclaw-jang-vlm-server.py"),
+        "--model-path",
+        args.model_path,
+        "--served-model-name",
+        args.served_model_name,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+    ]
+    log(f"starting argv={' '.join(argv)}")
+    CHILD = subprocess.Popen(argv, env=build_env())
+    deadline = time.monotonic() + args.startup_wait_seconds
+    while time.monotonic() < deadline:
+        if health_ready(args.host, args.port):
+            log("ready")
+            assert CHILD is not None
+            return CHILD.wait()
+        if CHILD.poll() is not None:
+            log(f"server exited early code={CHILD.returncode}")
+            return CHILD.returncode or 1
+        time.sleep(1)
+    log("startup timed out")
+    stop_child()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

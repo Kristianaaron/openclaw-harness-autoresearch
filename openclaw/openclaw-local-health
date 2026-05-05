@@ -1,0 +1,94 @@
+#!/usr/bin/env zsh
+set -u
+
+gateway_port="${OPENCLAW_GATEWAY_PORT:-18789}"
+profile_helper="$HOME/.openclaw/bin/openclaw-model-profile"
+tui_js="/opt/homebrew/lib/node_modules/openclaw/dist/tui-DN9rW-QU.js"
+runner_js="/opt/homebrew/lib/node_modules/openclaw/dist/pi-embedded-RhaMl0u2.js"
+pi_tui_js="/opt/homebrew/lib/node_modules/openclaw/node_modules/@mariozechner/pi-tui/dist/tui.js"
+loader_js="/opt/homebrew/lib/node_modules/openclaw/node_modules/@mariozechner/pi-tui/dist/components/loader.js"
+config_json="$HOME/.openclaw/openclaw.json"
+profiles_json="$HOME/.openclaw/model-profiles.json"
+plain_tui="$HOME/.openclaw/bin/openclaw-plain-tui"
+model_proxy="$HOME/.openclaw/servers/openclaw-model-proxy.py"
+jang_vlm_server="$HOME/.openclaw/servers/openclaw-jang-vlm-server.py"
+jang_vlm_launcher="$HOME/.openclaw/bin/openclaw-jang-vlm-launcher"
+rapid_launcher="$HOME/.openclaw/bin/openclaw-rapid-launcher"
+rapid_overlay="$HOME/.openclaw/rapid-overlay/openclaw_rapid_jang.py"
+runtime_deps_guard="$HOME/.openclaw/bin/openclaw-runtime-deps-guard"
+prefix_warmer="$HOME/.openclaw/bin/openclaw-prefix-warmer"
+speed_research="$HOME/.openclaw/bin/openclaw-speed-research"
+
+ok=0
+
+check() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf "ok   %s\n" "$label"
+  else
+    printf "fail %s\n" "$label"
+    ok=1
+  fi
+}
+
+check_endpoint() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf "ok   %s\n" "$label"
+  elif [[ "${OPENCLAW_REQUIRE_ENDPOINTS:-0}" == "1" ]]; then
+    printf "fail %s\n" "$label"
+    ok=1
+  else
+    printf "info %s stopped\n" "$label"
+  fi
+}
+
+model_health_url="$("$profile_helper" current --field healthUrl 2>/dev/null || true)"
+
+check "wrapper syntax" /bin/zsh -n "$HOME/.zfunc/openclaw"
+check "config json" /opt/homebrew/bin/node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$config_json"
+check "model profile config" /opt/homebrew/bin/node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$profiles_json"
+check "selected model profile" "$profile_helper" current
+check "selected provider synced" "$profile_helper" sync-config --check
+check "local native config" /opt/homebrew/bin/node -e "const c=JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8')); const p=Object.values(c.models?.providers||{})[0]; process.exit(c.memory?.backend==='builtin' && p?.apiKey==='custom-local' ? 0 : 1)" "$config_json"
+check "plugins enabled" /opt/homebrew/bin/node -e "const c=JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8')); process.exit(c.plugins?.enabled!==false ? 0 : 1)" "$config_json"
+check "bundled public surfaces available" /bin/test -f "/opt/homebrew/lib/node_modules/openclaw/dist/extensions/speech-core/runtime-api.js"
+check "tui autocomplete native" /usr/bin/grep -qv "OPENCLAW_TUI_DISABLE_AUTOCOMPLETE" "$HOME/.zfunc/openclaw"
+check "model profile helper" /bin/test -x "$profile_helper"
+check "local model proxy script" /bin/test -x "$model_proxy"
+check "JANG VLM server" /bin/test -x "$jang_vlm_server"
+check "JANG VLM launcher" /bin/test -x "$jang_vlm_launcher"
+check "Rapid-MLX launcher" /bin/test -x "$rapid_launcher"
+check "Rapid JANG overlay" /bin/test -f "$rapid_overlay"
+check "runtime deps guard" /bin/test -x "$runtime_deps_guard"
+check "prefix warmer" /bin/test -x "$prefix_warmer"
+check "speed research helper" /bin/test -x "$speed_research"
+check "generic model LaunchAgent" /usr/bin/plutil -lint "$HOME/Library/LaunchAgents/local.openclaw-model-server.plist"
+check "stale jang server removed" /bin/test ! -e "$HOME/.openclaw/servers/jang_server.py"
+check "tui submit syntax" /opt/homebrew/bin/node --check "$tui_js"
+check "agent runner syntax" /opt/homebrew/bin/node --check "$runner_js"
+check "pi-tui syntax" /opt/homebrew/bin/node --check "$pi_tui_js"
+check "loader syntax" /opt/homebrew/bin/node --check "$loader_js"
+if [[ -n "$model_health_url" ]]; then
+  check_endpoint "model endpoint" /usr/bin/curl -fsS --max-time 2 "$model_health_url"
+else
+  printf "fail model endpoint\n"
+  ok=1
+fi
+check_endpoint "gateway endpoint" /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:${gateway_port}/health"
+
+printf "\nactive model profile\n"
+"$profile_helper" current --field displayName 2>/dev/null || true
+"$profile_helper" current --field modelRef 2>/dev/null || true
+"$profile_helper" current --field healthUrl 2>/dev/null || true
+
+printf "\nprocess snapshot\n"
+if command -v rg >/dev/null 2>&1; then
+  /bin/ps -axo pid,ppid,stat,%cpu,%mem,rss,command | rg 'openclaw|openclaw-tui|Gemma|rapid-mlx|vllm_mlx|jang-vlm|cmux' || true
+else
+  /bin/ps -axo pid,ppid,stat,%cpu,%mem,rss,command | /usr/bin/grep -E 'openclaw|openclaw-tui|Gemma|rapid-mlx|vllm_mlx|jang-vlm|cmux' | /usr/bin/grep -v grep || true
+fi
+
+exit "$ok"
