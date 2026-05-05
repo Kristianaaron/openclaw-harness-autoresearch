@@ -145,6 +145,8 @@ def main() -> int:
             encoding="utf-8",
         )
         assert helper.session_tool_result_count("cycle-count") == 2
+        assert helper.session_file_path("cycle-count") == session_file
+        assert helper.session_mtime("cycle-count") > 0
         helper.append_supervisor_result(7, "nightly", "blocked", "memory gate\tstill hot\nretry")
         text = helper.RESULTS.read_text(encoding="utf-8")
         assert text.startswith("timestamp\trun_id\tstatus")

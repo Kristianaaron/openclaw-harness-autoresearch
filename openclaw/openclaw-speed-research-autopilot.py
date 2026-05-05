@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -421,6 +422,31 @@ def session_tool_result_count(session: str) -> int:
         return 0
 
 
+def session_file_path(session: str) -> Path:
+    return OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.jsonl"
+
+
+def session_mtime(session: str) -> float:
+    return file_mtime(session_file_path(session))
+
+
+def stop_process_tree(process: subprocess.Popen[str], *, terminate_grace_seconds: float = 8.0) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        process.terminate()
+    try:
+        process.wait(timeout=terminate_grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            process.kill()
+        process.wait(timeout=5)
+
+
 def run_turn(
     args: argparse.Namespace,
     session: str,
@@ -449,6 +475,8 @@ def run_turn(
     env.setdefault("OPENCLAW_DISABLE_MLX_PROVIDER_PLUGIN_HOOKS", "1")
     started = time.monotonic()
     starting_tool_results = session_tool_result_count(session)
+    last_session_mtime = session_mtime(session)
+    first_new_tool_at = 0.0
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         file.write("$ " + " ".join(cmd[:5] + ["<prompt>", *cmd[6:]]) + "\n")
@@ -460,20 +488,42 @@ def run_turn(
                 text=True,
                 stdout=file,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
             deadline = started + args.turn_timeout_seconds + args.turn_timeout_grace_seconds
             next_heartbeat = started + 30
-            next_tool_check = started + 5
+            next_tool_check = started + 1
             capped_by_tool_results = False
             while process.poll() is None:
                 now = time.monotonic()
+                current_session_mtime = session_mtime(session)
+                if current_session_mtime > last_session_mtime:
+                    last_session_mtime = current_session_mtime
                 if now >= deadline:
                     file.write(f"\nTIMEOUT after {now - started:.1f}s\n")
                     file.flush()
-                    process.kill()
-                    process.wait(timeout=5)
+                    stop_process_tree(process, terminate_grace_seconds=2)
                     tail = log_file.read_text(encoding="utf-8", errors="replace")[-8000:]
                     return 124, summarize_issue(tail, "", 124)
+                if (
+                    args.session_start_timeout_seconds > 0
+                    and not session_file_path(session).exists()
+                    and now - started >= args.session_start_timeout_seconds
+                ):
+                    file.write(f"\nSESSION START TIMEOUT after {now - started:.1f}s\n")
+                    file.flush()
+                    stop_process_tree(process)
+                    return 124, "agent session bootstrap timeout"
+                if (
+                    args.session_idle_timeout_seconds > 0
+                    and session_file_path(session).exists()
+                    and last_session_mtime > 0
+                    and now - last_session_mtime >= args.session_idle_timeout_seconds
+                ):
+                    file.write(f"\nSESSION IDLE TIMEOUT after {now - last_session_mtime:.1f}s without session update\n")
+                    file.flush()
+                    stop_process_tree(process)
+                    return 124, "agent session idle timeout"
                 if now >= next_heartbeat:
                     log(
                         f"cycle={cycle} session={session} still running "
@@ -482,21 +532,31 @@ def run_turn(
                     next_heartbeat = now + 30
                 if args.max_tool_results_per_turn > 0 and now >= next_tool_check:
                     tool_results = max(0, session_tool_result_count(session) - starting_tool_results)
-                    if tool_results >= args.max_tool_results_per_turn:
+                    if tool_results > 0 and first_new_tool_at == 0.0:
+                        first_new_tool_at = now
+                    if tool_results > args.max_tool_results_per_turn:
                         file.write(
                             f"\nTOOL RESULT CAP after {tool_results} tool results "
                             f"and {now - started:.1f}s\n"
                         )
                         file.flush()
                         capped_by_tool_results = True
-                        process.terminate()
-                        try:
-                            process.wait(timeout=8)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=5)
+                        stop_process_tree(process)
                         break
-                    next_tool_check = now + 5
+                    if (
+                        tool_results >= args.max_tool_results_per_turn
+                        and first_new_tool_at > 0
+                        and now - first_new_tool_at >= args.tool_result_synthesis_grace_seconds
+                    ):
+                        file.write(
+                            f"\nTOOL RESULT SYNTHESIS GRACE elapsed after {tool_results} tool results "
+                            f"and {now - started:.1f}s\n"
+                        )
+                        file.flush()
+                        capped_by_tool_results = True
+                        stop_process_tree(process)
+                        break
+                    next_tool_check = now + 1
                 time.sleep(1)
         finally:
             file.flush()
@@ -517,6 +577,9 @@ def main() -> int:
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
+    parser.add_argument("--tool-result-synthesis-grace-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TOOL_SYNTHESIS_GRACE", "20")))
+    parser.add_argument("--session-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SESSION_START_TIMEOUT", "90")))
+    parser.add_argument("--session-idle-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SESSION_IDLE_TIMEOUT", "180")))
     parser.add_argument("--task-min-samples", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_TASK_MIN_SAMPLES", "3")))
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
