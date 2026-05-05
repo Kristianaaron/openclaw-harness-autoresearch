@@ -61,6 +61,17 @@ def main() -> int:
     ) == 1
     with tempfile.TemporaryDirectory() as tmp:
         helper.RESULTS = Path(tmp) / "results.tsv"
+        helper.OPENCLAW_HOME = Path(tmp) / "home"
+        session_dir = helper.OPENCLAW_HOME / "agents" / "main" / "sessions"
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "cycle-count.jsonl"
+        session_file.write_text(
+            '{"message":{"role":"toolResult"}}\n'
+            '{"message":{"role":"toolResult"}}\n'
+            '{"message":{"role":"assistant"}}\n',
+            encoding="utf-8",
+        )
+        assert helper.session_tool_result_count("cycle-count") == 2
         helper.append_supervisor_result(7, "nightly", "blocked", "memory gate\tstill hot\nretry")
         text = helper.RESULTS.read_text(encoding="utf-8")
         assert text.startswith("timestamp\trun_id\tstatus")

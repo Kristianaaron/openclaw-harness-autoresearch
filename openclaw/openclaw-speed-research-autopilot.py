@@ -277,6 +277,7 @@ def run_turn(
     env.setdefault("OPENCLAW_AGENT_RUNTIME", "pi")
     env.setdefault("OPENCLAW_DISABLE_MLX_PROVIDER_PLUGIN_HOOKS", "1")
     started = time.monotonic()
+    starting_tool_results = session_tool_result_count(session)
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         file.write("$ " + " ".join(cmd[:5] + ["<prompt>", *cmd[6:]]) + "\n")
@@ -309,7 +310,7 @@ def run_turn(
                     )
                     next_heartbeat = now + 30
                 if args.max_tool_results_per_turn > 0 and now >= next_tool_check:
-                    tool_results = session_tool_result_count(session)
+                    tool_results = max(0, session_tool_result_count(session) - starting_tool_results)
                     if tool_results >= args.max_tool_results_per_turn:
                         file.write(
                             f"\nTOOL RESULT CAP after {tool_results} tool results "
