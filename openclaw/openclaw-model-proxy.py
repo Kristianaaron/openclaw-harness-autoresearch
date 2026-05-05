@@ -89,7 +89,10 @@ BROAD_TOOL_COMMAND_PATTERNS = (
 )
 BROAD_TOOL_BLOCK_MESSAGE = (
     "[OpenClaw blocked a broad local tool command before execution. "
-    "Retry with a narrower path or ask OpenClaw to inspect one specific file/folder.]"
+    "Retry with one exact file or command. For speed research, use the Bootstrap Ladder: "
+    "read /Users/kristian/.openclaw/research/speed/README-openclaw-speed.md, "
+    "read /Users/kristian/.openclaw/research/speed/results.tsv, or run "
+    "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick.]"
 )
 
 

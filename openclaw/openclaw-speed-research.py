@@ -81,6 +81,23 @@ def upsert_section(path: Path, heading: str, section: str) -> None:
         path.write_text(next_text, encoding="utf-8")
 
 
+def remove_section(path: Path, heading: str) -> None:
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start < 0:
+        return
+    next_start = text.find("\n## ", start + 1)
+    if next_start < 0:
+        next_text = text[:start].rstrip() + "\n"
+    else:
+        next_text = text[:start].rstrip() + "\n\n" + text[next_start + 1 :].lstrip()
+    if next_text != text:
+        path.write_text(next_text, encoding="utf-8")
+
+
 def normalize_source_queue(path: Path) -> None:
     if not path.exists():
         return
@@ -169,17 +186,18 @@ Live OpenClaw state is under `~/.openclaw`. Treat it as deployment/runtime state
 
 ## Research Method
 
-Use the autoresearch loop:
+Use the autoresearch loop, but never begin with open-ended filesystem discovery.
 
-1. Inspect current state: git status, recent OpenClaw logs, active model profile, health checks.
-2. Pick one concrete speed or reliability hypothesis.
-3. Make the smallest source change that tests the hypothesis.
-4. Run focused tests first.
-5. Deploy to `~/.openclaw` only when tests pass.
-6. Run a bounded benchmark if memory pressure is acceptable.
-7. Record the result in `results.tsv`.
-8. Keep the change if it improves speed/reliability without degrading UX. Revert your own failed experiment if it does not.
-9. Continue automatically until interrupted by the user.
+1. Follow the Bootstrap Ladder below until it is complete.
+2. Pick one concrete speed or reliability hypothesis from the Realistic Experiment Backlog.
+3. Inspect exactly one named source file, config file, log tail, or benchmark output.
+4. Make the smallest source change that tests the hypothesis.
+5. Run focused tests first.
+6. Deploy to `~/.openclaw` only when tests pass.
+7. Run a bounded benchmark if memory pressure is acceptable.
+8. Record the result in `results.tsv`.
+9. Keep the change if it improves speed/reliability without degrading UX. Revert your own failed experiment if it does not.
+10. Continue automatically until interrupted by the user.
 
 Do not ask the user to continue after each experiment. Do not ask the user to manually test unless permissions or hardware state make testing impossible.
 
@@ -301,17 +319,29 @@ Statuses:
 - `blocked`: could not run due to memory, dependency, or hardware state
 - `crash`: run crashed and was not kept
 
-## Starting Point
+## Bootstrap Ladder
 
-First actions in a fresh run:
+In a fresh run, perform these steps in order. Each step is exactly one assistant turn and exactly one narrow tool call.
 
-1. Read this file only.
-2. Summarize the operating loop in one short paragraph.
-3. Read `README-openclaw-speed.md`.
-4. Read `results.tsv`.
-5. Start with a realistic OpenClaw backend benchmark entry before changing code.
+1. Read exactly `/Users/kristian/.openclaw/research/speed/program.md`.
+2. Read exactly `/Users/kristian/.openclaw/research/speed/README-openclaw-speed.md`.
+3. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
+4. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+5. Record a TSV row only if the benchmark helper did not already record the result.
 
-Read `reference/autoresearch/program.md` later only when you need to compare loop methodology. Do not read it during bootstrap.
+Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only, not required for the first experiment.
+
+## Narrow Tool Catalog
+
+Allowed narrow actions are:
+
+- `read` a single explicit file path from Scope, Bootstrap Ladder, or `sources/queue.md`.
+- `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
+- `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
+- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+- `exec` one exact log tail, such as `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
+
+Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`, recursive `rg` over home, `mdfind`, and any broad command intended to discover files. If you need a file, use the explicit paths in this program.
 """
 
 
@@ -327,7 +357,7 @@ Useful commands:
 ```bash
 openclaw speed-research-setup
 openclaw speed-research-prompt
-openclaw speed-research
+openclaw speed-research-auto
 openclaw speed-research-benchmark --quick
 ```
 
@@ -344,9 +374,61 @@ This is a local 31B MLX workflow. Every tool result is expensive on the next tur
 - Read one specific file or run one bounded command at a time.
 - Never use broad commands such as `find ~`, `find /`, `find /Users`, `ls -R`, recursive grep over home, or whole-disk search.
 - Prefer the setup repository path and explicit files listed above.
+- If you need repository state, use exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
+- If you need recent proxy logs, use exactly `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
 - After each tool result, summarize the useful finding in your own words before choosing the next tool.
 - If a command is blocked as broad, immediately retry with one narrower path; do not keep emitting more broad commands.
 - Keep `results.tsv` entries short.
+"""
+
+
+def research_method_section() -> str:
+    return """## Research Method
+
+Use the autoresearch loop, but never begin with open-ended filesystem discovery.
+
+1. Follow the Bootstrap Ladder below until it is complete.
+2. Pick one concrete speed or reliability hypothesis from the Realistic Experiment Backlog.
+3. Inspect exactly one named source file, config file, log tail, or benchmark output.
+4. Make the smallest source change that tests the hypothesis.
+5. Run focused tests first.
+6. Deploy to `~/.openclaw` only when tests pass.
+7. Run a bounded benchmark if memory pressure is acceptable.
+8. Record the result in `results.tsv`.
+9. Keep the change if it improves speed/reliability without degrading UX. Revert your own failed experiment if it does not.
+10. Continue automatically until interrupted by the user.
+
+Do not ask the user to continue after each experiment. Do not ask the user to manually test unless permissions or hardware state make testing impossible.
+"""
+
+
+def bootstrap_ladder_section() -> str:
+    return """## Bootstrap Ladder
+
+In a fresh run, perform these steps in order. Each step is exactly one assistant turn and exactly one narrow tool call.
+
+1. Read exactly `/Users/kristian/.openclaw/research/speed/program.md`.
+2. Read exactly `/Users/kristian/.openclaw/research/speed/README-openclaw-speed.md`.
+3. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
+4. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+5. Record a TSV row only if the benchmark helper did not already record the result.
+
+Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only, not required for the first experiment.
+"""
+
+
+def narrow_tool_catalog_section() -> str:
+    return """## Narrow Tool Catalog
+
+Allowed narrow actions are:
+
+- `read` a single explicit file path from Scope, Bootstrap Ladder, or `sources/queue.md`.
+- `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
+- `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
+- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+- `exec` one exact log tail, such as `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
+
+Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`, recursive `rg` over home, `mdfind`, and any broad command intended to discover files. If you need a file, use the explicit paths in this program.
 """
 
 
@@ -444,7 +526,8 @@ Workspace: {root}
 First assistant action: read exactly this file and nothing else:
 `{root / 'program.md'}`
 
-After that, follow it autonomously in small steps.
+After that, follow the Bootstrap Ladder in `program.md` exactly. The next action after reading `program.md` is to read exactly:
+`{root / 'README-openclaw-speed.md'}`
 
 Hard constraints:
 - OpenClaw only. Do not touch opencode.
@@ -452,6 +535,7 @@ Hard constraints:
 - Continue the loop without asking me to manually continue.
 - Use one narrow tool call per assistant turn.
 - Never use broad local search commands.
+- Do not run setup commands during bootstrap.
 """
 
 
@@ -464,6 +548,10 @@ def setup_workspace(args: argparse.Namespace) -> int:
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
     write_if_missing(root / "program.md", program_md())
+    remove_section(root / "program.md", "Starting Point")
+    upsert_section(root / "program.md", "Research Method", research_method_section())
+    upsert_section(root / "program.md", "Bootstrap Ladder", bootstrap_ladder_section())
+    upsert_section(root / "program.md", "Narrow Tool Catalog", narrow_tool_catalog_section())
     upsert_section(root / "program.md", "Current Priority", current_priority_section())
     upsert_section(root / "program.md", "Frontier Speed Track", frontier_speed_track_section())
     ensure_section(root / "program.md", "## Tool Discipline", tool_discipline_section())

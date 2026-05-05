@@ -47,9 +47,14 @@ def main() -> int:
             assert "OpenClaw Speed Autoresearch" in prompt
             assert "First assistant action" in prompt
             assert "Use one narrow tool call" in prompt
+            assert "README-openclaw-speed.md" in prompt
             program = (root / "program.md").read_text(encoding="utf-8")
             assert "Do not touch opencode" in program
             assert "## Tool Discipline" in program
+            assert "## Bootstrap Ladder" in program
+            assert "## Narrow Tool Catalog" in program
+            assert "find /Users" in program
+            assert "## Starting Point" not in program
             assert "## Current Priority" in program
             assert "Rapid-MLX serving behavior for Gemma 4 31B JANG/JANQ" in program
             assert "## Frontier Speed Track" in program

@@ -354,7 +354,7 @@ case "${1:-}" in
     "$speed_research" add-source "$@"
     return $?
     ;;
-  speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight)
+  speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
     _openclaw_export_local_runtime_env
     _openclaw_export_safe_tui_env
     export OPENCLAW_RAPID_SPEED_PROFILE="${OPENCLAW_RAPID_SPEED_PROFILE:-balanced}"
@@ -396,12 +396,12 @@ case "${1:-}" in
     _openclaw_warm_model_prefix_once
     _openclaw_gateway_ready || /usr/sbin/lsof -nP -iTCP:"$gateway_port" -sTCP:LISTEN >/dev/null 2>&1 || openclaw_cleanup_gateway=1
     _openclaw_start_gateway_once || return $?
-    if [[ "$openclaw_mode" == "speed-research-auto" || "$openclaw_mode" == "research-speed-auto" || "$openclaw_mode" == "speed-research-overnight" || "$openclaw_mode" == "research-speed-overnight" ]]; then
+    if [[ "$openclaw_mode" == "speed-research-tui" || "$openclaw_mode" == "research-speed-tui" ]]; then
+      openclaw_args=("tui" "--session" "$speed_research_session" "--history-limit" "${OPENCLAW_SPEED_RESEARCH_HISTORY_LIMIT:-1}" "--timeout-ms" "${OPENCLAW_SPEED_RESEARCH_TIMEOUT_MS:-900000}" "--message" "$research_prompt")
+    else
       shift
       openclaw_custom_command="speed-research-autopilot"
       openclaw_args=("$@")
-    else
-      openclaw_args=("tui" "--session" "$speed_research_session" "--history-limit" "${OPENCLAW_SPEED_RESEARCH_HISTORY_LIMIT:-1}" "--timeout-ms" "${OPENCLAW_SPEED_RESEARCH_TIMEOUT_MS:-900000}" "--message" "$research_prompt")
     fi
     ;;
   tui|terminal)
