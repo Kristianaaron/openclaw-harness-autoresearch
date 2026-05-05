@@ -603,6 +603,7 @@ Before pushing, run a staged diff secret scan and confirm no `.env`, passwords, 
 
 
 def prompt_text(root: Path) -> str:
+    compact_workspace(root)
     return f"""OpenClaw Speed Autoresearch bootstrap.
 
 Workspace: {root}
@@ -611,7 +612,7 @@ First assistant action: run exactly this narrow benchmark command:
 `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`
 
 Then read exactly:
-`{root / 'results.tsv'}`
+`{root / 'SUMMARY.md'}`
 
 Do not read the full `program.md` unless a human explicitly asks. It is installed policy, not first-turn context.
 
@@ -657,6 +658,7 @@ def setup_workspace(args: argparse.Namespace) -> int:
         root / ".gitignore",
         "logs/\nbenchmarks/*.json\nexperiments/*.json\n*.tmp\n",
     )
+    compact_workspace(root)
     print(root)
     print(clone_status)
     return 0
@@ -773,6 +775,63 @@ def result_rows(root: Path) -> list[dict[str, str]]:
         if len(values) == len(headers):
             rows.append(dict(zip(headers, values)))
     return rows
+
+
+def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
+    ensure_research_state(root)
+    rows = result_rows(root)
+    recent = rows[-recent_rows:]
+    recent_path = root / "results-recent.tsv"
+    headers = RESULTS_HEADER.rstrip("\n").split("\t")
+    recent_text = RESULTS_HEADER
+    for row in recent:
+        recent_text += "\t".join(row.get(header, "") for header in headers) + "\n"
+    write_if_changed(recent_path, recent_text)
+
+    targets: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if row.get("status") == "keep":
+            targets[row.get("target", "unknown")] = row
+    ready_tasks = [task for task in read_jsonl(root / "tasks.jsonl") if task.get("status", "ready") in {"ready", "rework"}]
+    blocked_tasks = [task for task in read_jsonl(root / "tasks.jsonl") if task.get("status") == "blocked"]
+    summary_lines = [
+        "# OpenClaw Speed Research Summary",
+        "",
+        "This file is the compact entrypoint for autoresearch. Read this instead of the full results.tsv ledger.",
+        "",
+        "## Latest Metrics",
+        "",
+    ]
+    for target in sorted(targets):
+        row = targets[target]
+        bits = []
+        if row.get("ttft_s"):
+            bits.append(f"ttft_s={row['ttft_s']}")
+        if row.get("decode_tps"):
+            bits.append(f"decode_tps={row['decode_tps']}")
+        if row.get("wall_s"):
+            bits.append(f"wall_s={row['wall_s']}")
+        notes = row.get("notes", "")[:160]
+        summary_lines.append(f"- {target}: {' '.join(bits) or 'recorded'} {notes}".rstrip())
+    summary_lines.extend(["", "## Queue", ""])
+    summary_lines.append(f"- ready_tasks={len(ready_tasks)}")
+    summary_lines.append(f"- blocked_tasks={len(blocked_tasks)}")
+    for task in ready_tasks[:5]:
+        summary_lines.append(
+            f"- ready: {task.get('id', 'task')} type={task.get('task_type', 'benchmark')} metric={task.get('metric', 'unknown')}"
+        )
+    summary_lines.extend(
+        [
+            "",
+            "## Files",
+            "",
+            f"- recent results: {recent_path}",
+            f"- full ledger: {root / 'results.tsv'}",
+            f"- tasks: {root / 'tasks.jsonl'}",
+        ]
+    )
+    write_if_changed(root / "SUMMARY.md", "\n".join(summary_lines).rstrip() + "\n")
+    return {"ok": True, "recent_rows": len(recent), "ready_tasks": len(ready_tasks), "blocked_tasks": len(blocked_tasks)}
 
 
 def float_values(rows: list[dict[str, str]], target: str, key: str) -> list[float]:
@@ -958,6 +1017,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
 def synthesize(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
+    compact_workspace(root)
     rows = result_rows(root)
     ideas = synthesis_ideas(rows)
     generated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -1025,6 +1085,30 @@ def synthesize(args: argparse.Namespace) -> int:
     upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_note)
 
     candidate_tasks = [
+        {
+            "id": "post-compact-prompt-shape",
+            "status": "ready",
+            "priority": 79,
+            "lane": "current-stack",
+            "target": "prompt-context",
+            "hypothesis": "Compact SUMMARY.md/results-recent.tsv should keep volatile prompt state lower than full-ledger autoresearch.",
+            "metric": "volatile_ratio",
+            "benchmark_mode": "prompt-shape",
+            "guard_checks": ["context_within_limit", "semantic_preservation"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-shape",
+        },
+        {
+            "id": "post-compact-prompt-size",
+            "status": "ready",
+            "priority": 78,
+            "lane": "current-stack",
+            "target": "prompt-context",
+            "hypothesis": "Compact autoresearch state should keep estimated prompt tokens bounded across cycles.",
+            "metric": "estimated_prompt_tokens",
+            "benchmark_mode": "prompt-size",
+            "guard_checks": ["context_within_limit"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
+        },
         {
             "id": "decode-sample-baseline",
             "status": "ready",
@@ -1094,6 +1178,13 @@ def synthesize(args: argparse.Namespace) -> int:
     return 0
 
 
+def compact(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    result = compact_workspace(root, recent_rows=args.recent_rows)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def benchmark_prompt(mode: str) -> tuple[str, int]:
     if mode == "tool-roundtrip":
         return (
@@ -1114,7 +1205,8 @@ def benchmark_prompt(mode: str) -> tuple[str, int]:
 
 
 def prompt_size_probe(root: Path) -> dict[str, Any]:
-    files = ["program.md", "STRATEGY.md", "results.tsv", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
+    compact_workspace(root)
+    files = ["program.md", "STRATEGY.md", "SUMMARY.md", "results-recent.tsv", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
     measured: dict[str, int] = {}
     total_chars = 0
     for name in files:
@@ -1136,7 +1228,8 @@ def prompt_size_probe(root: Path) -> dict[str, Any]:
 
 
 def prompt_shape_probe(root: Path) -> dict[str, Any]:
-    files = ["program.md", "STRATEGY.md", "ideas.md", "tasks.jsonl", "findings.jsonl", "experiments.jsonl", "results.tsv"]
+    compact_workspace(root)
+    files = ["program.md", "STRATEGY.md", "SUMMARY.md", "results-recent.tsv", "ideas.md", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
     entries: list[dict[str, Any]] = []
     stable_tokens = 0
     volatile_tokens = 0
@@ -1366,6 +1459,10 @@ def main() -> int:
     synth = sub.add_parser("synthesize")
     synth.add_argument("--kind", choices=["frontier", "current-stack"], default="frontier")
     synth.set_defaults(func=synthesize)
+
+    compact_parser = sub.add_parser("compact")
+    compact_parser.add_argument("--recent-rows", type=int, default=24)
+    compact_parser.set_defaults(func=compact)
 
     args = parser.parse_args()
     return int(args.func(args))

@@ -456,8 +456,8 @@ def continuation_prompt(
     if last_issue:
         pressure += (
             f"\n\nLast cycle issue: {last_issue}. Recover with the next safe Bootstrap Ladder action. "
-            "Your next tool call must be one of: read `/Users/kristian/.openclaw/research/speed/README-openclaw-speed.md`, "
-            "read `/Users/kristian/.openclaw/research/speed/results.tsv`, run "
+            "Your next tool call must be one of: read `/Users/kristian/.openclaw/research/speed/SUMMARY.md`, "
+            "read `/Users/kristian/.openclaw/research/speed/results-recent.tsv`, run "
             "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`, or run "
             "`git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`."
         )
@@ -503,7 +503,7 @@ def continuation_prompt(
         "Best next actions are: run a specific benchmark mode such as "
         "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`, "
         "`--mode tool-roundtrip`, `--mode prompt-size`, `--mode prompt-shape`, `--mode decode-sample`, or `--mode prefill-reuse`; "
-        "read `/Users/kristian/.openclaw/research/speed/results.tsv`, read one named OpenClaw source file, "
+        "read `/Users/kristian/.openclaw/research/speed/SUMMARY.md`, read one named OpenClaw source file, "
         "or run `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
         "Do not run setup commands, `find`, recursive `ls`, recursive grep, or broad local search.\n\n"
         "If implementing, first read `/Users/kristian/.openclaw/research/speed/implementation-skill.md`. "
@@ -842,6 +842,14 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
     return True, ""
 
 
+def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
+    cmd = [args.research_helper_bin, "compact", "--recent-rows", str(args.compact_recent_rows)]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run OpenClaw speed autoresearch in autonomous cycles.")
     parser.add_argument("--openclaw-bin", default=os.environ.get("OPENCLAW_REAL_BIN", "/opt/homebrew/bin/openclaw"))
@@ -855,6 +863,7 @@ def main() -> int:
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
         "--max-implementation-tool-results-per-turn",
@@ -904,6 +913,7 @@ def main() -> int:
     blocked_cycles = 0
     synthesis_attempted = False
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
+    run_supervisor_compaction(args, log_file)
     for cycle in range(1, args.cycles + 1):
         if not args.reuse_session:
             current_session = f"{args.session}-cycle-{cycle:03d}"

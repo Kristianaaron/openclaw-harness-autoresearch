@@ -49,7 +49,10 @@ def main() -> int:
             assert "First assistant action" in prompt
             assert "benchmark --mode streaming-ttft" in prompt
             assert "Use one narrow tool call" in prompt
-            assert "results.tsv" in prompt
+            assert "SUMMARY.md" in prompt
+            assert "results.tsv" not in prompt
+            assert (root / "SUMMARY.md").exists()
+            assert (root / "results-recent.tsv").exists()
             program = (root / "program.md").read_text(encoding="utf-8")
             assert "Do not touch opencode" in program
             assert "## Tool Discipline" in program
@@ -97,6 +100,8 @@ def main() -> int:
             assert "Implementation Candidates" in ideas
             assert "implement-prompt-shape-compaction" in ideas
             tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert "post-compact-prompt-shape" in tasks
+            assert "post-compact-prompt-size" in tasks
             assert "decode-sample-baseline" in tasks
             assert "prompt-shape-report" in tasks
             assert "prompt-size-after-synthesis" in tasks
