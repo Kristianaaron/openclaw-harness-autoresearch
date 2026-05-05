@@ -48,6 +48,9 @@ def main() -> int:
     assert "prompt_batch.prompt_cache = _wrap_single_request_caches(caches)" in source
     assert "init_with_gemma4_stop_tokens" in source
     assert "openclaw_stop_token_ids" in source
+    assert "def mtp_forward" in source
+    assert "def make_mtp_cache" in source
+    assert 'return_hidden = kwargs.pop("return_hidden", False)' in source
 
     assert bridge._looks_repeated_text("OK\n{OKOKOKOKOKOKOKOK")
     assert bridge._clean_repeated_text("OK\n{OKOKOKOKOKOKOKOK") == "OK"

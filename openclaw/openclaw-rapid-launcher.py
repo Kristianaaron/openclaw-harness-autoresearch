@@ -210,6 +210,52 @@ def extend_if_supported(argv: list[str], *items: str) -> None:
         log(f"Rapid-MLX does not support {items[0]}; skipping")
 
 
+def read_model_config(model_path: str) -> dict:
+    path = Path(model_path).expanduser()
+    try:
+        value = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _positive_int(value: object) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def model_has_mtp_head(model_path: str) -> bool:
+    path = Path(model_path).expanduser()
+    config = read_model_config(model_path)
+    text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    declared_layers = any(
+        _positive_int(source.get(key))
+        for source in (config, text_config)
+        for key in ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers")
+    )
+    return declared_layers and (path / "model-mtp.safetensors").exists()
+
+
+def should_enable_mtp(model_path: str) -> tuple[bool, str]:
+    mode = os.environ.get("OPENCLAW_RAPID_ENABLE_MTP", "auto").strip().lower()
+    if mode in {"0", "false", "no", "off", "disabled", "disable"}:
+        return False, "disabled by OPENCLAW_RAPID_ENABLE_MTP"
+    supported = model_has_mtp_head(model_path)
+    if supported:
+        return True, "model declares MTP layers and model-mtp.safetensors is present"
+    reason = "model has no built-in MTP head files"
+    if mode in {"1", "true", "yes", "on", "require", "required"}:
+        raise RuntimeError(
+            "OPENCLAW_RAPID_ENABLE_MTP was explicitly requested, but "
+            f"{model_path} is not a built-in-MTP checkpoint ({reason}). "
+            "Official Gemma assistant/drafter checkpoints are separate models; "
+            "Rapid-MLX currently exposes --enable-mtp for built-in MTP heads."
+        )
+    return False, reason
+
+
 def ensure_jang_target() -> None:
     JANG_TARGET.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -386,6 +432,19 @@ def build_argv(args: argparse.Namespace, profile: LaunchProfile) -> list[str]:
         extend_if_supported(argv, "--mllm")
     if os.environ.get("OPENCLAW_RAPID_ENABLE_PLD", "0").lower() in {"1", "true", "yes", "on"}:
         argv.append("--enable-pld")
+    enable_mtp, mtp_reason = should_enable_mtp(args.model_path)
+    if enable_mtp:
+        extend_if_supported(argv, "--enable-mtp")
+        extend_if_supported(
+            argv,
+            "--mtp-num-draft-tokens",
+            os.environ.get("OPENCLAW_RAPID_MTP_NUM_DRAFT_TOKENS", "1"),
+        )
+        if os.environ.get("OPENCLAW_RAPID_MTP_OPTIMISTIC", "0").lower() in {"1", "true", "yes", "on"}:
+            extend_if_supported(argv, "--mtp-optimistic")
+        log(f"MTP enabled: {mtp_reason}")
+    else:
+        log(f"MTP not enabled: {mtp_reason}")
     if os.environ.get("OPENCLAW_RAPID_ENABLE_TOOL_LOGITS_BIAS", "0").lower() in {"1", "true", "yes", "on"}:
         extend_if_supported(argv, "--enable-tool-logits-bias")
     if os.environ.get("OPENCLAW_RAPID_NO_GC_CONTROL", "0").lower() in {"1", "true", "yes", "on"}:

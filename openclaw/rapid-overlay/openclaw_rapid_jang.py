@@ -42,6 +42,8 @@ class OpenClawGemma4TextWrapper:
         self.openclaw_stop_token_ids = []
 
     def __call__(self, input_ids, cache=None, **kwargs):
+        return_hidden = kwargs.pop("return_hidden", False)
+        n_confirmed = kwargs.pop("n_confirmed", None)
         embedding_output = self.vlm_model.get_input_embeddings(
             input_ids=input_ids,
             **kwargs,
@@ -51,16 +53,34 @@ class OpenClawGemma4TextWrapper:
             for key, value in embedding_output.to_dict().items()
             if key != "inputs_embeds" and value is not None
         }
+        if return_hidden:
+            language_kwargs["return_hidden"] = True
+        if n_confirmed is not None:
+            language_kwargs["n_confirmed"] = n_confirmed
         output = self.language_model(
             input_ids=None,
             cache=cache,
             inputs_embeds=embedding_output.inputs_embeds,
             **language_kwargs,
         )
+        if isinstance(output, tuple):
+            return output
+        if return_hidden and hasattr(output, "hidden_states"):
+            return output.logits, output.hidden_states
         return output.logits if hasattr(output, "logits") else output
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    @property
+    def mtp(self):
+        return getattr(self.language_model, "mtp", None)
+
+    def mtp_forward(self, *args, **kwargs):
+        return self.language_model.mtp_forward(*args, **kwargs)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
 
     @property
     def layers(self):
