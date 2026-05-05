@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -22,11 +21,44 @@ OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", HOME / ".openclaw")).expand
 WORKSPACE = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR", OPENCLAW_HOME / "research" / "speed")).expanduser()
 RESULTS = WORKSPACE / "results.tsv"
 IDEAS = WORKSPACE / "ideas.md"
+TASKS = WORKSPACE / "tasks.jsonl"
+BENCHMARKS = WORKSPACE / "benchmarks"
 LOG_DIR = WORKSPACE / "logs"
 PROGRAM = WORKSPACE / "program.md"
+DEFAULT_REPO = "/Users/kristian/Documents/openclaw-harness-autoresearch"
 RESULTS_HEADER = (
     "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
     "wall_s\tmemory_gb\tcommit\tnotes\n"
+)
+DEFAULT_TASKS = (
+    {
+        "id": "bootstrap-quick-benchmark",
+        "status": "ready",
+        "target": "quick-benchmark",
+        "hypothesis": "A bounded benchmark gives the supervisor a fresh latency baseline.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick",
+    },
+    {
+        "id": "rapid-launcher-settings",
+        "status": "ready",
+        "target": "openclaw/openclaw-rapid-launcher.py",
+        "hypothesis": "One Rapid-MLX runtime knob can improve perceived latency without reducing reliability.",
+        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-rapid-launcher.py",
+    },
+    {
+        "id": "proxy-tool-latency",
+        "status": "ready",
+        "target": "openclaw/openclaw-model-proxy.py",
+        "hypothesis": "Proxy tool-call shaping can reduce wasted prefill and prevent loop-driven stalls.",
+        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-model-proxy.py",
+    },
+    {
+        "id": "jang-bridge-stability",
+        "status": "ready",
+        "target": "openclaw/rapid-overlay/openclaw_rapid_jang.py",
+        "hypothesis": "The JANG bridge can preserve Gemma4 behavior while keeping Rapid-MLX on the fast path.",
+        "next_action": "read /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/rapid-overlay/openclaw_rapid_jang.py",
+    },
 )
 BLOCKED_PATTERNS = (
     "OpenClaw blocked a broad local tool command",
@@ -66,7 +98,7 @@ def clean_tsv(value: object) -> str:
 
 
 def current_commit() -> str:
-    repo = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))
+    repo = repo_path()
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--short=7", "HEAD"],
@@ -79,6 +111,142 @@ def current_commit() -> str:
         return result.stdout.strip() or "unknown"
     except Exception:
         return "unknown"
+
+
+def repo_path() -> Path:
+    return Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", DEFAULT_REPO))
+
+
+def repo_status_fingerprint() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path()), "status", "--porcelain"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def latest_mtime(path: Path) -> float:
+    try:
+        if path.is_file():
+            return path.stat().st_mtime
+        if not path.is_dir():
+            return 0.0
+        latest = 0.0
+        for child in path.iterdir():
+            try:
+                latest = max(latest, child.stat().st_mtime)
+            except OSError:
+                continue
+        return latest
+    except OSError:
+        return 0.0
+
+
+def durable_snapshot() -> dict[str, object]:
+    return {
+        "results_lines": results_line_count(),
+        "results_mtime": file_mtime(RESULTS),
+        "ideas_mtime": file_mtime(IDEAS),
+        "tasks_mtime": file_mtime(TASKS),
+        "benchmarks_mtime": latest_mtime(BENCHMARKS),
+        "repo_status": repo_status_fingerprint(),
+    }
+
+
+def durable_progress(before: dict[str, object], after: dict[str, object]) -> list[str]:
+    reasons: list[str] = []
+    if int(after["results_lines"]) > int(before["results_lines"]):
+        reasons.append("results row")
+    if float(after["results_mtime"]) > float(before["results_mtime"]):
+        reasons.append("results update")
+    if float(after["ideas_mtime"]) > float(before["ideas_mtime"]):
+        reasons.append("ideas update")
+    if float(after["tasks_mtime"]) > float(before["tasks_mtime"]):
+        reasons.append("task queue update")
+    if float(after["benchmarks_mtime"]) > float(before["benchmarks_mtime"]):
+        reasons.append("benchmark artifact")
+    if str(after["repo_status"]) != str(before["repo_status"]):
+        reasons.append("repo patch")
+    return reasons
+
+
+def ensure_task_queue() -> None:
+    TASKS.parent.mkdir(parents=True, exist_ok=True)
+    if TASKS.exists() and TASKS.stat().st_size > 0:
+        return
+    with TASKS.open("w", encoding="utf-8") as file:
+        for task in DEFAULT_TASKS:
+            file.write(json.dumps(task, sort_keys=True) + "\n")
+
+
+def next_task_summary(limit: int = 3) -> str:
+    try:
+        tasks = []
+        for line in TASKS.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            task = json.loads(line)
+            if task.get("status") in {"ready", "in_progress"}:
+                tasks.append(
+                    f"- {task.get('id', 'task')}: target={task.get('target', 'unknown')} "
+                    f"next={task.get('next_action', 'record evidence')}"
+                )
+            if len(tasks) >= limit:
+                break
+        return "\n".join(tasks)
+    except Exception:
+        return ""
+
+
+def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
+    issue = last_issue.lower()
+    if "memory" in issue or "metal" in issue or "crash" in issue or "fatal process exit" in issue:
+        return "diagnose"
+    if stalled_cycles <= 0:
+        return "normal"
+    if stalled_cycles == 1:
+        return "force-artifact"
+    if stalled_cycles == 2:
+        return "force-benchmark"
+    return "fresh-session"
+
+
+def recovery_instruction(stalled_cycles: int, last_issue: str) -> str:
+    mode = recovery_mode(stalled_cycles, last_issue)
+    if mode == "normal":
+        return ""
+    if mode == "force-artifact":
+        return (
+            "\n\nSupervisor recovery: the last cycle ended without a durable artifact. "
+            "This cycle has a hard contract: before ending, create exactly one durable artifact: "
+            "append a concise results.tsv row, append one grounded ideas.md note, update tasks.jsonl, "
+            "run the quick benchmark, or make one source patch plus its focused test result. "
+            "Use the smallest action that can satisfy that contract."
+        )
+    if mode == "force-benchmark":
+        return (
+            "\n\nSupervisor recovery: two recent cycles did not produce useful durable progress. "
+            "Your next tool call must be exactly "
+            "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick` "
+            "unless memory pressure blocks it. If blocked, append one blocked row to results.tsv and end."
+        )
+    if mode == "diagnose":
+        return (
+            "\n\nSupervisor recovery: the last issue was memory, Metal, crash, timeout, or process health related. "
+            "Do not start a heavy model action. Inspect one exact OpenClaw log tail or run one exact repo status/test "
+            "command, then record a blocked or keep row with the evidence."
+        )
+    return (
+        "\n\nSupervisor recovery: this is a fresh recovery session. Start with one narrow bootstrap action only: "
+        "read results.tsv, run the quick benchmark, or run repo status. Record a durable result before ending."
+    )
 
 
 def append_supervisor_result(cycle: int, session: str, status: str, issue: str) -> None:
@@ -202,6 +370,9 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
             "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`, or run "
             "`git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`."
         )
+    task_summary = next_task_summary()
+    if task_summary:
+        task_summary = f"\n\nCurrent machine-readable research queue:\n{task_summary}"
     return (
         "Continue OpenClaw Speed Autoresearch autonomously.\n\n"
         f"Workspace: {WORKSPACE}\n"
@@ -217,8 +388,12 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "If implementing, first read `/Users/kristian/.openclaw/research/speed/implementation-skill.md`. "
         "Do not touch opencode. Do not change the primary model. Use one narrow tool call per assistant turn. "
         "Do not ask me whether to continue. If a test or benchmark cannot run safely, record blocked evidence "
-        "and move to the next implementable item."
-        f"\n\nAutopilot cycle: {cycle}.{pressure}"
+        "and move to the next implementable item.\n\n"
+        "Cycle contract: each cycle must finish with one durable artifact: a results.tsv row, ideas.md note, "
+        "tasks.jsonl update, benchmark JSON, source patch, test result, or explicit blocked row. "
+        "No durable artifact means the supervisor will narrow the next cycle automatically."
+        f"{task_summary}"
+        f"\n\nAutopilot cycle: {cycle}.{pressure}{recovery_instruction(stalled_cycles, last_issue)}"
     )
 
 
@@ -368,12 +543,15 @@ def main() -> int:
     args = parser.parse_args()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_task_queue()
     log_file = LOG_DIR / f"autopilot-{args.session}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + args.max_hours * 3600
     stalled_cycles = 0
     last_issue = ""
     current_session = args.session
     recovery_epoch = 0
+    progress_cycles = 0
+    blocked_cycles = 0
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
     for cycle in range(1, args.cycles + 1):
         if time.monotonic() >= deadline:
@@ -382,6 +560,7 @@ def main() -> int:
         memory_ok, memory_issue = wait_for_memory(args)
         if not memory_ok:
             stalled_cycles += 1
+            blocked_cycles += 1
             last_issue = memory_issue
             append_supervisor_result(cycle, current_session, "blocked", memory_issue)
             log(
@@ -400,18 +579,23 @@ def main() -> int:
                 log(f"rotating to fresh recovery session={current_session}")
             time.sleep(args.sleep_seconds)
             continue
-        before_lines = results_line_count()
-        before_results_mtime = file_mtime(RESULTS)
-        before_ideas_mtime = file_mtime(IDEAS)
+        before = durable_snapshot()
         code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file)
-        after_lines = results_line_count()
-        progressed = after_lines > before_lines or file_mtime(RESULTS) > before_results_mtime or file_mtime(IDEAS) > before_ideas_mtime
+        after = durable_snapshot()
+        progress_reasons = durable_progress(before, after)
+        progressed = bool(progress_reasons)
+        if progressed:
+            progress_cycles += 1
         stalled_cycles = 0 if progressed else stalled_cycles + 1
         last_issue = "" if progressed else (issue or "no durable progress")
+        if not progressed:
+            blocked_cycles += 1
         log(
             f"cycle={cycle} exit={code} progressed={progressed} "
-            f"results_lines={before_lines}->{after_lines} stalled_cycles={stalled_cycles} "
-            f"issue={last_issue or 'none'}"
+            f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
+            f"results_lines={before['results_lines']}->{after['results_lines']} "
+            f"stalled_cycles={stalled_cycles} issue={last_issue or 'none'} "
+            f"health={progress_cycles}/{cycle} blocked={blocked_cycles}"
         )
         if code not in {0, 124}:
             log(f"agent turn returned nonzero exit={code}; continuing after a short pause")

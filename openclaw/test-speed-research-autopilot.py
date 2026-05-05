@@ -33,8 +33,15 @@ def main() -> int:
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
     assert "Your next tool call must be one of" in recovery_prompt
+    assert "Cycle contract" in recovery_prompt
+    assert "Supervisor recovery" in recovery_prompt
     safe_next_actions = recovery_prompt.split("Your next tool call must be one of", 1)[1].lower()
     assert "find" not in safe_next_actions
+    assert helper.recovery_mode(0, "") == "normal"
+    assert helper.recovery_mode(1, "no durable progress") == "force-artifact"
+    assert helper.recovery_mode(2, "no durable progress") == "force-benchmark"
+    assert helper.recovery_mode(3, "no durable progress") == "fresh-session"
+    assert helper.recovery_mode(1, "metal out of memory") == "diagnose"
 
     assert helper.summarize_issue("x OpenClaw blocked a broad local tool command y", "", 0) == (
         "OpenClaw blocked a broad local tool command"
@@ -61,7 +68,22 @@ def main() -> int:
     ) == 1
     with tempfile.TemporaryDirectory() as tmp:
         helper.RESULTS = Path(tmp) / "results.tsv"
+        helper.IDEAS = Path(tmp) / "ideas.md"
+        helper.TASKS = Path(tmp) / "tasks.jsonl"
+        helper.BENCHMARKS = Path(tmp) / "benchmarks"
         helper.OPENCLAW_HOME = Path(tmp) / "home"
+        helper.ensure_task_queue()
+        task_text = helper.TASKS.read_text(encoding="utf-8")
+        assert "bootstrap-quick-benchmark" in task_text
+        assert "rapid-launcher-settings" in helper.next_task_summary()
+        before = helper.durable_snapshot()
+        helper.IDEAS.write_text("# idea\n", encoding="utf-8")
+        helper.BENCHMARKS.mkdir()
+        (helper.BENCHMARKS / "one.json").write_text("{}", encoding="utf-8")
+        after = helper.durable_snapshot()
+        progress = helper.durable_progress(before, after)
+        assert "ideas update" in progress
+        assert "benchmark artifact" in progress
         session_dir = helper.OPENCLAW_HOME / "agents" / "main" / "sessions"
         session_dir.mkdir(parents=True)
         session_file = session_dir / "cycle-count.jsonl"
