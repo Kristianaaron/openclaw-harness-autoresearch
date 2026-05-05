@@ -54,6 +54,12 @@ def write_if_missing(path: Path, content: str) -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def write_if_changed(path: Path, content: str) -> None:
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return
+    path.write_text(content, encoding="utf-8")
+
+
 def ensure_section(path: Path, marker: str, section: str) -> None:
     if not path.exists():
         path.write_text(section, encoding="utf-8")
@@ -361,8 +367,61 @@ openclaw speed-research-auto
 openclaw speed-research-benchmark --quick
 ```
 
+Implementation is intentionally a separate gated phase. Before keeping production changes, read `implementation-skill.md` and follow its plan/test/deploy/record checklist.
+
 The research agent should improve OpenClaw speed and reliability without touching opencode.
     """
+
+
+def implementation_skill_md() -> str:
+    return """# OpenClaw Speed Implementation Skill
+
+Use this skill when a research finding is ready to become a source change. The goal is clean, minimal implementation, not speculative patching.
+
+## Entry Criteria
+
+Start implementation only when there is one accepted insight with evidence from `results.tsv`, a benchmark JSON file, a log excerpt, or a source note in `ideas.md`.
+
+Do not implement from a vague hunch. If evidence is missing, run one narrow experiment first.
+
+## Implementation Loop
+
+1. State the accepted insight in one sentence.
+2. Identify the exact file or model-profile knob to change.
+3. Define the expected behavior and the failure mode being prevented or improved.
+4. Make the smallest cohesive patch.
+5. Add or update the narrowest relevant test.
+6. Run focused tests before deployment.
+7. Deploy to `~/.openclaw` only after tests pass.
+8. Run a bounded benchmark or record why it is blocked.
+9. Record `keep`, `discard`, or `blocked` in `results.tsv`.
+10. Revert your own failed experiment if it does not improve speed, reliability, or maintainability.
+
+## Code Quality Rules
+
+- Prefer existing OpenClaw harness patterns over new abstractions.
+- Keep changes local to one responsibility: proxy guard, launcher guard, wrapper UX, research program, or profile configuration.
+- Do not layer duplicate guard logic when one shared helper can express the rule clearly.
+- Do not hide failures. Convert crashes, timeouts, and memory pressure into explicit logged states and result rows.
+- Do not strip native OpenClaw behavior to fake speed.
+- Do not touch opencode.
+- Do not change the primary model unless the user explicitly asks.
+
+## Review Checklist
+
+Before marking a change `keep`, verify:
+
+- The patch is smaller than the problem it solves.
+- The names explain the intent without long comments.
+- The failure path is visible in logs or terminal output.
+- The test would fail without the change.
+- The deployment path is explicit.
+- The benchmark or blocker is recorded.
+
+## Rollback
+
+If a change causes regressions, revert only the files changed by that experiment, record `discard` with the reason, and continue with the next smallest hypothesis.
+"""
 
 
 def tool_discipline_section() -> str:
@@ -505,16 +564,23 @@ Prefer perceived speed wins that help agentic work: faster first tool call, less
 def implementation_gate_section() -> str:
     return """## Implementation Gate
 
-Before keeping an idea, prove it can be implemented in this setup:
+Research and implementation are separate phases. Before keeping any source/config change, read `/Users/kristian/.openclaw/research/speed/implementation-skill.md` and follow it.
+
+Before implementing an idea, prove it belongs in this setup:
 
 1. Identify the specific source file or model profile knob.
-2. Make the smallest source/config change.
-3. Run focused tests.
-4. Deploy only if tests pass.
-5. Run a realistic benchmark.
-6. Record `keep`, `discard`, or `blocked` in `results.tsv` with the reason.
+2. Name the evidence from `results.tsv`, a benchmark JSON file, a log excerpt, or `ideas.md`.
+3. Write a one-sentence expected behavior.
+4. Make the smallest source/config change.
+5. Add or update the narrowest relevant test.
+6. Run focused tests.
+7. Deploy only if tests pass.
+8. Run a realistic benchmark or record why it is blocked.
+9. Record `keep`, `discard`, or `blocked` in `results.tsv` with the reason.
 
 If a change requires an upstream Rapid-MLX feature that is not present locally, record the gap clearly and move to the next implementable improvement.
+
+Do not bundle unrelated cleanup with speed experiments. Do not keep a patch that only rearranges code without measured speed, reliability, or maintainability value.
 """
 
 
@@ -558,7 +624,8 @@ def setup_workspace(args: argparse.Namespace) -> int:
     upsert_section(root / "program.md", "Realistic Experiment Backlog", realistic_experiment_backlog_section())
     upsert_section(root / "program.md", "Speed Targets", speed_targets_section())
     upsert_section(root / "program.md", "Implementation Gate", implementation_gate_section())
-    write_if_missing(root / "README-openclaw-speed.md", readme_md())
+    write_if_changed(root / "README-openclaw-speed.md", readme_md())
+    write_if_changed(root / "implementation-skill.md", implementation_skill_md())
     write_if_missing(root / "ideas.md", "# Speed Research Ideas\n\n")
     write_if_missing(
         root / "sources" / "queue.md",

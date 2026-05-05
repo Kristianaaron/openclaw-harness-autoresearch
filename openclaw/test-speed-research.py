@@ -31,6 +31,7 @@ def main() -> int:
             assert helper.setup_workspace(Namespace(repo_url="file:///no/such/repo")) == 0
             assert (root / "program.md").exists()
             assert (root / "README-openclaw-speed.md").exists()
+            assert (root / "implementation-skill.md").exists()
             assert (root / "results.tsv").read_text(encoding="utf-8").startswith("timestamp\trun_id\tstatus")
             assert (root / "sources" / "queue.md").exists()
             assert helper.add_source(
@@ -64,6 +65,11 @@ def main() -> int:
             assert "## Speed Targets" in program
             assert "Do not spend rounds on toy prompts" in program
             assert "## Implementation Gate" in program
+            assert "implementation-skill.md" in program
+            implementation = (root / "implementation-skill.md").read_text(encoding="utf-8")
+            assert "OpenClaw Speed Implementation Skill" in implementation
+            assert "Do not touch opencode" in implementation
+            assert "The patch is smaller than the problem it solves" in implementation
             assert (root / "experiments").is_dir()
             assert (root / "benchmarks").is_dir()
     return 0

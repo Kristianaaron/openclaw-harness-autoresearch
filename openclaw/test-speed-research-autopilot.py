@@ -26,6 +26,7 @@ def main() -> int:
     assert "Do not touch opencode" in prompt
     assert "openclaw-speed-research benchmark --quick" in prompt
     assert "Do not run setup commands" in prompt
+    assert "implementation-skill.md" in prompt
 
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
