@@ -18,6 +18,7 @@ from pathlib import Path
 from openclaw_speed_research_core import (
     RESULTS_HEADER,
     append_jsonl,
+    append_result,
     claim_task_evidence_window,
     complete_task_from_evidence,
     cycle_quality,
@@ -438,6 +439,85 @@ def synthesis_task() -> dict[str, object]:
         "metric": "ranked_ideas_and_seeded_tasks",
         "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
     }
+
+
+def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
+    suffix = f"cycle-{cycle:03d}-{int(time.time())}"
+    return [
+        {
+            "id": f"decode-repeatability-{suffix}",
+            "status": "ready",
+            "priority": 88,
+            "lane": "production-mtp",
+            "target": "decode-sample",
+            "hypothesis": "Each new research tranche starts by remeasuring real decode TPS on the live MTP setup.",
+            "metric": "decode_tps",
+            "benchmark_mode": "decode-sample",
+            "guard_checks": ["memory_ok", "no_reasoning_leak", "no_sse_timeout"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+        },
+        {
+            "id": f"mtp-acceptance-review-{suffix}",
+            "status": "ready",
+            "priority": 84,
+            "lane": "production-mtp",
+            "target": "openclaw-model-proxy.log",
+            "hypothesis": "Recent MTP acceptance logs should guide the next implementation candidate instead of repeating generic benchmarks.",
+            "metric": "mean_accept",
+            "guard_checks": ["one_narrow_tool", "no_loop"],
+            "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
+        },
+        {
+            "id": f"implementation-bridge-{suffix}",
+            "status": "ready",
+            "priority": 72,
+            "lane": "implementation-gate",
+            "task_type": "implementation",
+            "target": "openclaw/openclaw-speed-research.py",
+            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "When synthesis identifies a grounded decode/MTP improvement, convert exactly one insight into a minimal tested OpenClaw patch.",
+            "metric": "decode_tps_delta_or_guardrail",
+            "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
+            "acceptance": "Patch is minimal, focused tests pass, and results.tsv records keep/discard/blocked evidence.",
+            "rollback": "Revert only this implementation experiment if it fails tests or does not improve speed/reliability.",
+            "next_action": (
+                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
+                "Then read exactly /Users/kristian/.openclaw/research/speed/ideas.md. "
+                "Implement only the smallest currently evidenced OpenClaw decode/MTP improvement; do not touch opencode."
+            ),
+        },
+    ]
+
+
+def enqueue_recurring_decode_tasks(cycle: int, reason: str) -> int:
+    existing = read_jsonl(TASKS)
+    existing_ids = {str(task.get("id", "")) for task in existing}
+    additions = [task for task in recurring_decode_tasks(cycle) if str(task["id"]) not in existing_ids]
+    if not additions:
+        return 0
+    write_jsonl(TASKS, existing + additions)
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": timestamp,
+            "task_id": "supervisor-recurring-decode-refill",
+            "finding": "supervisor refilled the queue with a new decode/MTP research and implementation tranche",
+            "reason": reason,
+            "seeded_tasks": [task["id"] for task in additions],
+            "next": "continue_autopilot_loop",
+        },
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"recurring-refill-{cycle}",
+        status="keep",
+        target="autopilot-refill",
+        hypothesis="empty queues should bridge into another decode/MTP research and implementation cycle",
+        commit=current_commit(),
+        notes=f"seeded_tasks={len(additions)} reason={clean_tsv(reason)}",
+    )
+    return len(additions)
 
 
 def continuation_prompt(
@@ -900,6 +980,8 @@ def main() -> int:
         help="reuse one OpenClaw session instead of Ralph-style fresh sessions per cycle",
     )
     args = parser.parse_args()
+    if args.cycles <= 0:
+        args.cycles = 1_000_000
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ensure_task_queue()
@@ -911,7 +993,6 @@ def main() -> int:
     recovery_epoch = 0
     progress_cycles = 0
     blocked_cycles = 0
-    synthesis_attempted = False
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
     run_supervisor_compaction(args, log_file)
     for cycle in range(1, args.cycles + 1):
@@ -948,14 +1029,11 @@ def main() -> int:
         before = durable_snapshot()
         selected_task = select_next_task(WORKSPACE)
         if selected_task is None:
-            if synthesis_attempted:
-                log("autopilot task queue exhausted after synthesis; stopping without benchmark churn")
-                break
             ok, issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
-            synthesis_attempted = True
+            seeded = enqueue_recurring_decode_tasks(cycle, issue or "queue exhausted after synthesis")
             after = durable_snapshot()
             progress_reasons = durable_progress(before, after)
-            progressed = ok and bool(progress_reasons)
+            progressed = ok and (bool(progress_reasons) or seeded > 0)
             stalled_cycles = 0 if progressed else stalled_cycles + 1
             last_issue = "" if progressed else (issue or "supervisor synthesis made no durable progress")
             if progressed:
@@ -965,13 +1043,12 @@ def main() -> int:
                 append_supervisor_result(cycle, current_session, "blocked", last_issue)
             log(
                 f"cycle={cycle} supervisor_synthesis ok={ok} progressed={progressed} "
+                f"seeded_tasks={seeded} "
                 f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
                 f"issue={last_issue or 'none'}"
             )
             time.sleep(args.sleep_seconds)
             continue
-        else:
-            synthesis_attempted = False
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
         code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file, selected_task)

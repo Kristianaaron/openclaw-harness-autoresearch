@@ -109,6 +109,13 @@ def main() -> int:
         task_text = helper.TASKS.read_text(encoding="utf-8")
         assert "decode-mtp-baseline" in task_text
         assert "decode-sample" in helper.next_task_summary()
+        seeded = helper.enqueue_recurring_decode_tasks(42, "test empty queue")
+        assert seeded == 3
+        recurring_tasks = helper.TASKS.read_text(encoding="utf-8")
+        assert "decode-repeatability-cycle-042" in recurring_tasks
+        assert "mtp-acceptance-review-cycle-042" in recurring_tasks
+        assert "implementation-bridge-cycle-042" in recurring_tasks
+        assert "autopilot-refill" in helper.RESULTS.read_text(encoding="utf-8")
         selected = helper.select_next_task(helper.WORKSPACE)
         assert selected["id"] == "decode-mtp-baseline"
         with helper.RESULTS.open("a", encoding="utf-8") as file:
