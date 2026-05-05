@@ -84,6 +84,19 @@ def main() -> int:
             ) == 0
             benchmark_rows = (root / "results.tsv").read_text(encoding="utf-8")
             assert "prompt-size" in benchmark_rows
+            assert helper.synthesize(Namespace(kind="frontier")) == 0
+            ideas = (root / "ideas.md").read_text(encoding="utf-8")
+            assert "prefix-dag-stable-context" in ideas
+            assert "bandit-rapid-knob-search" in ideas
+            assert "speculative-or-pld-gate" in ideas
+            assert "mathematical handle" in ideas
+            tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert "decode-sample-baseline" in tasks
+            assert "prompt-size-after-synthesis" in tasks
+            assert "streaming-ttft-post-synthesis" in tasks
+            findings = (root / "findings.jsonl").read_text(encoding="utf-8")
+            assert "synthesize-speed-ideas" in findings
+            assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
     return 0
 
 

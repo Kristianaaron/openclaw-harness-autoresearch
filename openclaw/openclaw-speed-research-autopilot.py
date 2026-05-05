@@ -345,7 +345,22 @@ def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
         time.sleep(args.memory_wait_seconds)
 
 
-def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -> str:
+def synthesis_task() -> dict[str, object]:
+    return {
+        "id": "synthesize-speed-ideas",
+        "target": "ideas.md/STRATEGY.md/tasks.jsonl",
+        "hypothesis": "Completed baselines must produce ranked ideas and new measurable OpenClaw speed tasks.",
+        "metric": "ranked_ideas_and_seeded_tasks",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+    }
+
+
+def continuation_prompt(
+    cycle: int,
+    stalled_cycles: int,
+    last_issue: str = "",
+    selected_task: dict[str, object] | None = None,
+) -> str:
     pressure = ""
     if stalled_cycles >= 2:
         pressure = (
@@ -364,7 +379,8 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
     task_summary = next_task_summary()
     if task_summary:
         task_summary = f"\n\nCurrent machine-readable research queue:\n{task_summary}"
-    selected_task = select_next_task(WORKSPACE)
+    if selected_task is None:
+        selected_task = select_next_task(WORKSPACE)
     task_contract = ""
     if selected_task:
         task_contract = (
@@ -375,6 +391,12 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
             f"- metric: {selected_task.get('metric', 'unknown')}\n"
             f"- required next action: {selected_task.get('next_action', 'record evidence')}\n"
         )
+        if selected_task.get("id") == "synthesize-speed-ideas":
+            task_contract += (
+                "\nThe benchmark queue is exhausted. Your next tool call must be exactly "
+                "`/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier`. "
+                "Do not run another benchmark until synthesis has created new measurable tasks.\n"
+            )
     return (
         "Continue OpenClaw Speed Autoresearch autonomously.\n\n"
         f"Workspace: {WORKSPACE}\n"
@@ -518,8 +540,9 @@ def run_turn(
     stalled_cycles: int,
     last_issue: str,
     log_file: Path,
+    selected_task: dict[str, object] | None = None,
 ) -> tuple[int, str]:
-    prompt = continuation_prompt(cycle, stalled_cycles, last_issue)
+    prompt = continuation_prompt(cycle, stalled_cycles, last_issue, selected_task)
     cmd = [
         args.openclaw_bin,
         "agent",
@@ -642,14 +665,47 @@ def run_turn(
         return returncode, summarize_issue(tail, "", returncode)
 
 
+def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
+    """Create ranked ideas without spending a model turn.
+
+    Empty queues are a supervisor state, not a reasoning problem. Running this
+    deterministically prevents the agent from filling results.tsv with another
+    easy benchmark just to prove it is still alive.
+    """
+    cmd = [args.research_helper_bin, "synthesize", "--kind", "frontier"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\n===== cycle {cycle} session {session} supervisor synthesis =====\n")
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=file,
+                stderr=subprocess.STDOUT,
+                timeout=args.synthesis_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "supervisor synthesis timeout"
+    if result.returncode != 0:
+        return False, f"supervisor synthesis exit {result.returncode}"
+    return True, ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run OpenClaw speed autoresearch in autonomous cycles.")
     parser.add_argument("--openclaw-bin", default=os.environ.get("OPENCLAW_REAL_BIN", "/opt/homebrew/bin/openclaw"))
+    parser.add_argument(
+        "--research-helper-bin",
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_HELPER", "/Users/kristian/.openclaw/bin/openclaw-speed-research"),
+    )
     parser.add_argument("--session", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SESSION", "speed-research-auto"))
     parser.add_argument("--cycles", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_CYCLES", "48")))
     parser.add_argument("--max-hours", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_HOURS", "8")))
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
+    parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument("--tool-result-synthesis-grace-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TOOL_SYNTHESIS_GRACE", "20")))
     parser.add_argument("--session-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SESSION_START_TIMEOUT", "90")))
@@ -691,6 +747,7 @@ def main() -> int:
     recovery_epoch = 0
     progress_cycles = 0
     blocked_cycles = 0
+    synthesis_attempted = False
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
     for cycle in range(1, args.cycles + 1):
         if not args.reuse_session:
@@ -722,9 +779,34 @@ def main() -> int:
             continue
         before = durable_snapshot()
         selected_task = select_next_task(WORKSPACE)
+        if selected_task is None:
+            if synthesis_attempted:
+                log("autopilot task queue exhausted after synthesis; stopping without benchmark churn")
+                break
+            ok, issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
+            synthesis_attempted = True
+            after = durable_snapshot()
+            progress_reasons = durable_progress(before, after)
+            progressed = ok and bool(progress_reasons)
+            stalled_cycles = 0 if progressed else stalled_cycles + 1
+            last_issue = "" if progressed else (issue or "supervisor synthesis made no durable progress")
+            if progressed:
+                progress_cycles += 1
+            else:
+                blocked_cycles += 1
+                append_supervisor_result(cycle, current_session, "blocked", last_issue)
+            log(
+                f"cycle={cycle} supervisor_synthesis ok={ok} progressed={progressed} "
+                f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
+                f"issue={last_issue or 'none'}"
+            )
+            time.sleep(args.sleep_seconds)
+            continue
+        else:
+            synthesis_attempted = False
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
-        code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file)
+        code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file, selected_task)
         after = durable_snapshot()
         progress_reasons = durable_progress(before, after)
         quality = cycle_quality(WORKSPACE, before, after, progress_reasons, issue)

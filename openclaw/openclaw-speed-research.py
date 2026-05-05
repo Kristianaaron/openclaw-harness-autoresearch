@@ -21,7 +21,10 @@ from typing import Any
 from openclaw_speed_research_core import (
     RESULTS_HEADER,
     append_result,
+    append_jsonl,
     ensure_research_state,
+    read_jsonl,
+    write_jsonl,
 )
 
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
@@ -759,6 +762,204 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / 3.8))
 
 
+def result_rows(root: Path) -> list[dict[str, str]]:
+    results = root / "results.tsv"
+    if not results.exists():
+        return []
+    headers = RESULTS_HEADER.rstrip("\n").split("\t")
+    rows: list[dict[str, str]] = []
+    for line in results.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+        values = line.split("\t")
+        if len(values) == len(headers):
+            rows.append(dict(zip(headers, values)))
+    return rows
+
+
+def float_values(rows: list[dict[str, str]], target: str, key: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        if row.get("status") != "keep" or row.get("target") != target:
+            continue
+        try:
+            text = row.get(key, "").strip()
+            if text:
+                values.append(float(text))
+        except ValueError:
+            continue
+    return values
+
+
+def mean_value(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
+    path = root / "tasks.jsonl"
+    existing = read_jsonl(path)
+    existing_ids = {str(task.get("id", "")) for task in existing}
+    additions = [task for task in tasks if str(task.get("id", "")) not in existing_ids]
+    if additions:
+        write_jsonl(path, existing + additions)
+    return len(additions)
+
+
+def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    ttft = mean_value(float_values(rows, "streaming-ttft", "ttft_s"))
+    tool = mean_value(float_values(rows, "tool-roundtrip", "wall_s"))
+    prefill = mean_value(float_values(rows, "prefill-reuse", "wall_s"))
+    decode = mean_value(float_values(rows, "decode-sample", "decode_tps"))
+    return [
+        {
+            "id": "prefix-dag-stable-context",
+            "lane": "current-stack",
+            "expected": "Lower TTFT by maximizing reused system/tool/context prefixes before every model turn.",
+            "math": "Represent prompt segments as a trie/DAG and choose cached prefix p*=argmax_p |p| subject to hash(p) in cache.",
+            "prototype": "Add a prompt-shape report that separates stable prefix tokens from volatile user/tool-result tokens.",
+            "risk": "Incorrectly caching volatile tool output could cause stale context; use content hashes and explicit boundaries.",
+            "evidence": f"Observed streaming TTFT mean={ttft}s and prefill-reuse wall mean={prefill}s.",
+        },
+        {
+            "id": "bandit-rapid-knob-search",
+            "lane": "current-stack",
+            "expected": "Find better Rapid-MLX settings without hand-tuning or endless repeated benchmarks.",
+            "math": "Use UCB1 score_i = mean_i - lambda*crash_i + c*sqrt(log(N)/n_i) for each safe knob profile.",
+            "prototype": "Create a small profile matrix for prefill_step_size, cache_memory_mb, prefix_cache_size, and kv quantization, then run bounded A/B cycles.",
+            "risk": "Too many profiles can waste time or trigger memory pressure; cap trials and require memory gates.",
+            "evidence": "The previous run repeated streaming-ttft after tasks were exhausted, so structured search is needed.",
+        },
+        {
+            "id": "speculative-or-pld-gate",
+            "lane": "frontier",
+            "expected": "Improve perceived decode speed if a same-tokenizer draft/helper path passes acceptance tests.",
+            "math": "Expected speedup S approx 1 / (c_draft*k + (1-a^k)*c_verify/k), where a is draft acceptance rate.",
+            "prototype": "Add a compatibility probe that verifies tokenizer identity, acceptance rate, and no tool/reasoning regressions before enabling speculation or PLD.",
+            "risk": "Wrong tokenizer or bad acceptance can slow generation and destabilize tool JSON.",
+            "evidence": f"Current decode sample mean={decode if decode is not None else 'not yet measured'}; frontier target is 50-70 tok/s.",
+        },
+        {
+            "id": "deterministic-agent-bookkeeping",
+            "lane": "current-stack",
+            "expected": "Reduce model turns by moving known-safe bookkeeping and result recording out of the LLM loop.",
+            "math": "Wall time per cycle T = T_model + T_tool + T_bookkeeping; make T_bookkeeping -> O(1) deterministic code.",
+            "prototype": "Teach autopilot to record synthesis, task advancement, and blocked rows directly rather than asking the model to narrate them.",
+            "risk": "Over-automation can hide reasoning; every deterministic action must log evidence.",
+            "evidence": "The model produced NO_REPLY for many benchmark cycles while deterministic helpers already wrote the durable rows.",
+        },
+    ]
+
+
+def synthesize(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    rows = result_rows(root)
+    ideas = synthesis_ideas(rows)
+    generated_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    idea_lines = [
+        "# Speed Research Ideas",
+        "",
+        f"## Autopilot Synthesis {generated_at}",
+        "",
+        "The benchmark queue was exhausted, so the loop switched from measurement to synthesis instead of repeating generic benchmarks.",
+        "",
+    ]
+    for index, idea in enumerate(ideas, start=1):
+        idea_lines.extend(
+            [
+                f"### {index}. {idea['id']}",
+                "",
+                f"- lane: {idea['lane']}",
+                f"- expected impact: {idea['expected']}",
+                f"- mathematical handle: {idea['math']}",
+                f"- smallest prototype: {idea['prototype']}",
+                f"- reliability risk: {idea['risk']}",
+                f"- evidence: {idea['evidence']}",
+                "",
+            ]
+        )
+    ideas_path = root / "ideas.md"
+    ideas_path.write_text("\n".join(idea_lines).rstrip() + "\n", encoding="utf-8")
+
+    strategy_note = "\n".join(
+        [
+            "## Current Synthesis",
+            "",
+            f"- generated_at: {generated_at}",
+            "- measurement loop is healthy, but exhausted queues must switch to ideas, ranked hypotheses, and implementation candidates.",
+            "- top current-stack idea: prefix DAG / stable-context cache locality.",
+            "- top search idea: UCB-style Rapid-MLX knob search with memory/crash penalties.",
+            "- top frontier idea: speculative or PLD gate only after tokenizer and acceptance tests pass.",
+            "",
+        ]
+    )
+    upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_note)
+
+    seeded = upsert_tasks(
+        root,
+        [
+            {
+                "id": "decode-sample-baseline",
+                "status": "ready",
+                "priority": 66,
+                "lane": "current-stack",
+                "target": "decode-sample",
+                "hypothesis": "Decode sample speed is required before judging 20 tok/s and 50-70 tok/s targets.",
+                "metric": "decode_tps",
+                "benchmark_mode": "decode-sample",
+                "guard_checks": ["no_reasoning_leak", "memory_ok"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+            },
+            {
+                "id": "prompt-size-after-synthesis",
+                "status": "ready",
+                "priority": 64,
+                "lane": "current-stack",
+                "target": "prompt-context",
+                "hypothesis": "Prompt/context size should stay bounded after synthesis and task growth.",
+                "metric": "estimated_prompt_tokens",
+                "benchmark_mode": "prompt-size",
+                "guard_checks": ["context_within_limit"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
+            },
+            {
+                "id": "streaming-ttft-post-synthesis",
+                "status": "ready",
+                "priority": 62,
+                "lane": "current-stack",
+                "target": "openclaw-model-proxy",
+                "hypothesis": "TTFT should remain stable after synthesis and queue expansion.",
+                "metric": "ttft_s",
+                "benchmark_mode": "streaming-ttft",
+                "guard_checks": ["no_sse_timeout", "memory_ok"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft",
+            },
+        ],
+    )
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": generated_at,
+            "task_id": "synthesize-speed-ideas",
+            "finding": "benchmark queue exhausted; synthesized ranked speed ideas and seeded measurable follow-up tasks",
+            "ideas": [idea["id"] for idea in ideas],
+            "seeded_tasks": seeded,
+            "kind": args.kind,
+        },
+    )
+    append_result(
+        root,
+        run_id=f"synthesis-{int(time.time())}",
+        status="keep",
+        target="synthesis",
+        hypothesis="exhausted benchmark queues must generate ranked speed ideas and next tasks",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind}",
+    )
+    print(json.dumps({"ok": True, "ideas": len(ideas), "seeded_tasks": seeded, "ideas_path": str(ideas_path)}, indent=2))
+    return 0
+
+
 def benchmark_prompt(mode: str) -> tuple[str, int]:
     if mode == "tool-roundtrip":
         return (
@@ -958,6 +1159,10 @@ def main() -> int:
     record.add_argument("--memory-gb", default="")
     record.add_argument("--notes", default="")
     record.set_defaults(func=append_baseline)
+
+    synth = sub.add_parser("synthesize")
+    synth.add_argument("--kind", choices=["frontier", "current-stack"], default="frontier")
+    synth.set_defaults(func=synthesize)
 
     args = parser.parse_args()
     return int(args.func(args))

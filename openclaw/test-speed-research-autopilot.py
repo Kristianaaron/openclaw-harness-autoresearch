@@ -32,6 +32,10 @@ def main() -> int:
     assert "implementation-skill.md" in prompt
     assert "Do not repeat quick-health benchmarks" in prompt
     assert "do not append another" in prompt
+    synthesis_prompt = helper.continuation_prompt(10, 0, "", helper.synthesis_task())
+    assert "benchmark queue is exhausted" in synthesis_prompt
+    assert "synthesize --kind frontier" in synthesis_prompt
+    assert "Do not run another benchmark until synthesis" in synthesis_prompt
 
     recovery_prompt = helper.continuation_prompt(3, 2, "OpenClaw blocked a broad local tool command")
     assert "Last cycle issue" in recovery_prompt
@@ -197,6 +201,20 @@ def main() -> int:
         assert text.startswith("timestamp\trun_id\tstatus")
         assert "autopilot-cycle-7" in text
         assert "session=nightly issue=memory gate still hot retry" in text
+        synth_helper = Path(tmp) / "synthesize-helper.py"
+        synth_marker = Path(tmp) / "synth-marker.txt"
+        synth_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(synth_marker)!r}).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        synth_helper.chmod(0o700)
+        synth_args = Namespace(research_helper_bin=str(synth_helper), synthesis_timeout_seconds=5)
+        ok, issue = helper.run_supervisor_synthesis(synth_args, 8, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert issue == ""
+        assert synth_marker.read_text(encoding="utf-8") == "synthesize --kind frontier"
     return 0
 
 
