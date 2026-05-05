@@ -373,6 +373,11 @@ case "${1:-}" in
     return $?
     ;;
   speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
+    if _openclaw_has_arg_prefix "--help" "${openclaw_args[@]}" || _openclaw_has_arg_prefix "-h" "${openclaw_args[@]}"; then
+      shift
+      OPENCLAW_REAL_BIN="$real_openclaw" "$speed_research_autopilot" "$@"
+      return $?
+    fi
     _openclaw_export_local_runtime_env
     _openclaw_export_safe_tui_env
     export OPENCLAW_RAPID_SPEED_PROFILE="${OPENCLAW_RAPID_SPEED_PROFILE:-balanced}"
