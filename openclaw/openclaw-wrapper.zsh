@@ -193,27 +193,41 @@ _openclaw_start_model_once() {
   }
   local i
   local wait_limit="${OPENCLAW_MODEL_START_WAIT_SECONDS:-180}"
+  local stdout_log stderr_log upstream_port
+  stdout_log="$(_openclaw_model_field server.stdout)"
+  stderr_log="$(_openclaw_model_field server.stderr)"
+  upstream_port="$(_openclaw_model_field server.upstreamPort 2>/dev/null || true)"
   local i=1
   while [[ "$i" -le "$wait_limit" ]]; do
     if _openclaw_model_ready; then
+      echo "OpenClaw model server ready after ${i}s."
       return 0
     fi
     if [[ "$i" -gt 3 ]] && ! /bin/ps -axo command | /usr/bin/grep -E -q '[o]penclaw-model-profile exec-server|[o]penclaw-model-proxy.py'; then
       echo "OpenClaw model server exited before becoming ready."
-      local stdout_log stderr_log
-      stdout_log="$(_openclaw_model_field server.stdout)"
-      stderr_log="$(_openclaw_model_field server.stderr)"
       [[ -n "$stdout_log" ]] && echo "Logs: $stdout_log"
       [[ -n "$stderr_log" && "$stderr_log" != "$stdout_log" ]] && echo "Errors: $stderr_log"
       return 1
+    fi
+    if [[ "$i" -eq 5 || $((i % 10)) -eq 0 ]]; then
+      local upstream_state proxy_state
+      upstream_state="unknown"
+      proxy_state="waiting"
+      if [[ -n "$upstream_port" ]] && /usr/sbin/lsof -nP -iTCP:"$upstream_port" -sTCP:LISTEN >/dev/null 2>&1; then
+        upstream_state="listening:${upstream_port}"
+      elif [[ -n "$upstream_port" ]]; then
+        upstream_state="starting:${upstream_port}"
+      fi
+      if /usr/sbin/lsof -nP -iTCP:"$(_openclaw_model_field server.port)" -sTCP:LISTEN >/dev/null 2>&1; then
+        proxy_state="listening"
+      fi
+      echo "OpenClaw model startup still in progress (${i}s/${wait_limit}s): upstream=${upstream_state}, proxy=${proxy_state}"
+      [[ -n "$stdout_log" ]] && echo "Logs: $stdout_log"
     fi
     sleep 1
     i=$((i + 1))
   done
   echo "OpenClaw model server did not become ready within ${wait_limit}s."
-  local stdout_log stderr_log
-  stdout_log="$(_openclaw_model_field server.stdout)"
-  stderr_log="$(_openclaw_model_field server.stderr)"
   [[ -n "$stdout_log" ]] && echo "Logs: $stdout_log"
   [[ -n "$stderr_log" && "$stderr_log" != "$stdout_log" ]] && echo "Errors: $stderr_log"
   return 1
