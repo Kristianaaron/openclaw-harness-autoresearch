@@ -20,73 +20,121 @@ RESULTS_HEADER = (
 
 DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
-        "id": "baseline-streaming-ttft",
+        "id": "decode-mtp-baseline",
         "status": "ready",
         "priority": 100,
-        "lane": "current-stack",
-        "target": "openclaw-model-proxy",
-        "hypothesis": "Streaming TTFT and first useful status are the best first speed bottleneck signals.",
-        "metric": "ttft_s",
-        "benchmark_mode": "streaming-ttft",
-        "guard_checks": ["no_sse_timeout", "no_reasoning_leak", "memory_ok"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft",
+        "lane": "mtp-decode",
+        "target": "openclaw/openclaw-jang-vlm-server.py",
+        "hypothesis": "The current Gemma 4 JANQ + official 4-bit assistant drafter path needs a fresh decode TPS baseline before any tuning.",
+        "metric": "decode_tps",
+        "benchmark_mode": "decode-sample",
+        "guard_checks": ["memory_ok", "no_reasoning_leak", "no_sse_timeout"],
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
     },
     {
-        "id": "tool-roundtrip-overhead",
+        "id": "mtp-acceptance-log-review",
         "status": "ready",
         "priority": 90,
-        "lane": "current-stack",
-        "target": "tool-call-path",
-        "hypothesis": "Tool-call round trips expose prompt/tool schema overhead better than tiny health probes.",
-        "metric": "tool_roundtrip_s",
-        "benchmark_mode": "tool-roundtrip",
+        "lane": "mtp-decode",
+        "target": "openclaw-model-proxy.log",
+        "hypothesis": "MTP acceptance and round counts explain whether the drafter is accelerating or adding overhead.",
+        "metric": "mean_accept",
         "guard_checks": ["one_narrow_tool", "no_loop", "context_within_limit"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode tool-roundtrip",
+        "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
     },
     {
-        "id": "prompt-size-pressure",
+        "id": "no-drafter-control",
         "status": "ready",
         "priority": 85,
-        "lane": "current-stack",
-        "target": "prompt-context",
-        "hypothesis": "Reducing stable prompt/tool context is likely to improve prefill and avoid preflight blocks.",
-        "metric": "estimated_prompt_tokens",
-        "benchmark_mode": "prompt-size",
-        "guard_checks": ["semantic_preservation", "no_tool_regression"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
+        "lane": "mtp-decode",
+        "target": "OPENCLAW_JANG_DRAFT_MODEL",
+        "hypothesis": "A no-drafter control is required to prove the assistant drafter improves wall-clock decode TPS on normal prompts.",
+        "metric": "speedup_factor",
+        "benchmark_mode": "decode-sample",
+        "guard_checks": ["memory_ok", "restore_live_profile", "no_model_change"],
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
     },
     {
-        "id": "rapid-jang-prefill",
+        "id": "drafter-block-sweep-plan",
         "status": "ready",
         "priority": 80,
-        "lane": "current-stack",
-        "target": "openclaw/openclaw-rapid-launcher.py",
-        "hypothesis": "One Rapid-MLX prefill/cache knob can reduce first-token latency without memory regression.",
-        "metric": "prefill_or_wall_s",
-        "benchmark_mode": "prefill-reuse",
-        "guard_checks": ["tests_pass", "memory_ok", "no_crash"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prefill-reuse",
+        "lane": "mtp-decode",
+        "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+        "hypothesis": "MTP block size controls the acceptance/overhead tradeoff and should be swept on the same prompt set.",
+        "metric": "decode_tps",
+        "benchmark_mode": "decode-sample",
+        "guard_checks": ["memory_ok", "restore_live_profile", "same_prompt_set"],
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
     },
     {
-        "id": "jang-bridge-loop-guard",
+        "id": "drafter-calibration-review",
         "status": "ready",
         "priority": 70,
-        "lane": "current-stack",
-        "target": "openclaw/rapid-overlay/openclaw_rapid_jang.py",
-        "hypothesis": "Gemma4 JANG loop behavior must stay guarded while Rapid-MLX owns the fast serving path.",
-        "metric": "loop_or_reasoning_leak_count",
-        "benchmark_mode": "tool-roundtrip",
-        "guard_checks": ["no_thought_loop", "no_malformed_tool_json", "tests_pass"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode tool-roundtrip",
+        "lane": "drafter-alignment",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "hypothesis": "JANQ-specific calibration should only be promoted if it improves decode TPS over the official 4-bit drafter.",
+        "metric": "acceptance_delta",
+        "guard_checks": ["tests_pass", "memory_ok", "no_model_change"],
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
     },
 )
 
 TASK_MIGRATIONS: dict[str, dict[str, Any]] = {
+    "baseline-streaming-ttft": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode-mtp-baseline for current MTP decode research",
+    },
+    "tool-roundtrip-overhead": {
+        "status": "blocked",
+        "blocked_reason": "superseded by MTP acceptance/decode tasks",
+    },
+    "prompt-size-pressure": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode-first MTP research",
+    },
     "rapid-jang-prefill": {
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prefill-reuse",
+        "status": "blocked",
+        "blocked_reason": "prefill is secondary to current decode TPS objective",
     },
     "jang-bridge-loop-guard": {
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode tool-roundtrip",
+        "status": "blocked",
+        "blocked_reason": "loop guards remain important but are not the current decode metric task",
+    },
+    "post-compact-prompt-shape": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode/MTP acceptance research",
+    },
+    "post-compact-prompt-size": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode/MTP acceptance research",
+    },
+    "prompt-shape-report": {
+        "status": "blocked",
+        "blocked_reason": "superseded by MTP acceptance report",
+    },
+    "prompt-size-after-synthesis": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode/MTP acceptance research",
+    },
+    "streaming-ttft-post-synthesis": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode/MTP acceptance research",
+    },
+    "implement-prompt-shape-compaction": {
+        "status": "blocked",
+        "blocked_reason": "superseded by decode/MTP implementation candidates",
+    },
+    "implement-rapid-profile-bandit-plan": {
+        "status": "blocked",
+        "blocked_reason": "superseded by drafter sweep plan",
+    },
+    "implement-speculative-pld-compat-probe": {
+        "status": "blocked",
+        "blocked_reason": "superseded by live MTP drafter and JANQ calibration gate",
+    },
+    "gemma4-mtp-drafter-compatibility": {
+        "status": "blocked",
+        "blocked_reason": "superseded by live Gemma 4 assistant drafter baseline and decode/MTP tasks",
     },
 }
 
@@ -219,21 +267,23 @@ def normalize_results_ledger(path: Path) -> None:
 def strategy_template() -> str:
     return """# OpenClaw Speed Strategy
 
-Objective: optimize raw speed for the current Gemma 4 31B JANG OpenClaw setup while treating crashes, loops, memory pressure, and tool failures as hard guards.
+Objective: improve real decode tokens/sec for the current Gemma 4 31B JANG/JANQ OpenClaw setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards.
 
 ## Current Best Understanding
 
-- No accepted speed improvement yet in this strategy file.
+- Live baseline is the official quantized Gemma 4 assistant drafter at block size 2.
+- Recent bounded decode measurements are about 14-15 tok/s, versus roughly 12.5 tok/s without a drafter.
+- Earlier heuristic MTP scheduling, 3-bit drafter experiments, and pre-projection-only calibration did not beat the official 4-bit drafter.
 
 ## Top Hypotheses
 
-1. Measure streaming TTFT and first useful status before changing knobs.
-2. Measure tool-call round trip because it represents real agent UX better than tiny health prompts.
-3. Reduce prompt/context overhead only if semantic and tool behavior guards hold.
+1. Decode TPS will improve only if MTP acceptance rises enough to beat drafter overhead on normal prompts.
+2. The best next experiments are no-drafter control, block-size sweep, drafter quantization/calibration, and log-based `mean_accept` analysis.
+3. Rapid-MLX or MLX/VLM loop changes matter only if they reduce verification/drafter overhead without changing the selected target model.
 
 ## Rejected Or Exhausted
 
-- Repeating quick-health benchmarks without a changed hypothesis is noise, not research progress.
+- Repeating TTFT, tool-roundtrip, or prompt-size benchmarks without a decode/MTP hypothesis is noise for this phase.
 """
 
 

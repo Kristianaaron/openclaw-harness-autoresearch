@@ -47,7 +47,7 @@ def main() -> int:
             prompt = helper.prompt_text(root)
             assert "OpenClaw Speed Autoresearch" in prompt
             assert "First assistant action" in prompt
-            assert "benchmark --mode streaming-ttft" in prompt
+            assert "benchmark --mode decode-sample" in prompt
             assert "Use one narrow tool call" in prompt
             assert "SUMMARY.md" in prompt
             assert "results.tsv" not in prompt
@@ -61,13 +61,17 @@ def main() -> int:
             assert "find /Users" in program
             assert "## Starting Point" not in program
             assert "## Current Priority" in program
-            assert "Rapid-MLX serving behavior for Gemma 4 31B JANG/JANQ" in program
+            assert "real OpenClaw decode tokens/sec" in program
+            assert "openclaw-mtp-drafter-calibrate.py" in program
+            assert "MTP acceptance" in program
             assert "## Frontier Speed Track" in program
             assert "50-70 tok/s" in program
-            assert "Lane A: current-stack work" in program
+            assert "Lane B: drafter alignment" in program
             assert "## Realistic Experiment Backlog" in program
+            assert "No-drafter control" in program
+            assert "Drafter block sweep" in program
             assert "## Speed Targets" in program
-            assert "Do not spend rounds on toy prompts" in program
+            assert "Current live baseline" in program
             assert "## Implementation Gate" in program
             assert "implementation-skill.md" in program
             implementation = (root / "implementation-skill.md").read_text(encoding="utf-8")
@@ -93,22 +97,22 @@ def main() -> int:
             assert "prompt-shape" in benchmark_rows
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
-            assert "prefix-dag-stable-context" in ideas
-            assert "bandit-rapid-knob-search" in ideas
-            assert "speculative-or-pld-gate" in ideas
+            assert "mtp-acceptance-bottleneck" in ideas
+            assert "drafter-block-and-quant-sweep" in ideas
+            assert "janq-drafter-alignment" in ideas
             assert "mathematical handle" in ideas
             assert "Implementation Candidates" in ideas
-            assert "implement-prompt-shape-compaction" in ideas
+            assert "implement-mtp-acceptance-report" in ideas
             tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "post-compact-prompt-shape" in tasks
-            assert "post-compact-prompt-size" in tasks
+            assert "decode-mtp-baseline" in tasks
+            assert "mtp-acceptance-log-review" in tasks
+            assert "post-mtp-acceptance-report" in tasks
             assert "decode-sample-baseline" in tasks
-            assert "prompt-shape-report" in tasks
-            assert "prompt-size-after-synthesis" in tasks
-            assert "streaming-ttft-post-synthesis" in tasks
-            assert "implement-prompt-shape-compaction" in tasks
-            assert "implement-rapid-profile-bandit-plan" in tasks
-            assert "implement-speculative-pld-compat-probe" in tasks
+            assert "decode-sample-repeatability" in tasks
+            assert "mtp-acceptance-report" in tasks
+            assert "implement-mtp-acceptance-report" in tasks
+            assert "implement-drafter-sweep-plan" in tasks
+            assert "implement-janq-drafter-calibration-gate" in tasks
             assert '"task_type": "implementation"' in tasks
             assert "First tool call: read exactly" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")

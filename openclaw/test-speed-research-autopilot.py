@@ -26,25 +26,25 @@ def main() -> int:
     prompt = helper.continuation_prompt(1, 0)
     assert "do not read it this turn" in prompt
     assert "Do not touch opencode" in prompt
-    assert "benchmark --mode streaming-ttft" in prompt
-    assert "--mode tool-roundtrip" in prompt
-    assert "--mode prompt-shape" in prompt
+    assert "benchmark --mode decode-sample" in prompt
+    assert "MTP acceptance" in prompt
+    assert "openclaw-model-proxy.log" in prompt
     assert "Do not run setup commands" in prompt
     assert "implementation-skill.md" in prompt
-    assert "Do not repeat quick-health benchmarks" in prompt
+    assert "Do not repeat quick-health, TTFT, prompt-size, or tool-roundtrip benchmarks" in prompt
     assert "do not append another" in prompt
     synthesis_prompt = helper.continuation_prompt(10, 0, "", helper.synthesis_task())
     assert "benchmark queue is exhausted" in synthesis_prompt
     assert "synthesize --kind frontier" in synthesis_prompt
     assert "Do not run another benchmark until synthesis" in synthesis_prompt
     implementation_task = {
-        "id": "implement-prompt-shape-compaction",
+        "id": "implement-mtp-acceptance-report",
         "task_type": "implementation",
         "target": "openclaw/openclaw-speed-research.py",
-        "metric": "estimated_prompt_tokens",
-        "hypothesis": "compact volatile prompt state",
+        "metric": "mean_accept",
+        "hypothesis": "record MTP acceptance evidence for decode tuning",
         "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-        "acceptance": "tests pass and context stays bounded",
+        "acceptance": "tests pass and decode artifacts include acceptance evidence",
         "rollback": "revert only this experiment",
         "next_action": "make one source patch",
     }
@@ -107,62 +107,40 @@ def main() -> int:
         helper.OPENCLAW_HOME = Path(tmp) / "home"
         helper.ensure_task_queue()
         task_text = helper.TASKS.read_text(encoding="utf-8")
-        assert "baseline-streaming-ttft" in task_text
-        assert "streaming-ttft" in helper.next_task_summary()
+        assert "decode-mtp-baseline" in task_text
+        assert "decode-sample" in helper.next_task_summary()
         selected = helper.select_next_task(helper.WORKSPACE)
-        assert selected["id"] == "baseline-streaming-ttft"
+        assert selected["id"] == "decode-mtp-baseline"
         with helper.RESULTS.open("a", encoding="utf-8") as file:
-            for index, ttft in enumerate(("0.900", "0.880"), start=1):
+            for index, decode_tps in enumerate(("14.100", "14.600"), start=1):
                 file.write(
-                    f"2026-05-05T00:00:0{index}+0000\tbenchmark-{index}\tkeep\tstreaming-ttft\t"
-                    f"bounded OpenClaw streaming-ttft probe\t{ttft}\t\t\t{ttft}\t1.5\tabc123\tmodel=local\n"
+                    f"2026-05-05T00:00:0{index}+0000\tbenchmark-{index}\tkeep\tdecode-sample\t"
+                    f"bounded OpenClaw decode-sample probe\t\t\t{decode_tps}\t6.9\t1.5\tabc123\tmodel=local\n"
                 )
         assert helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123") is None
         with helper.RESULTS.open("a", encoding="utf-8") as file:
             file.write(
-                "2026-05-05T00:00:03+0000\tbenchmark-3\tkeep\tstreaming-ttft\t"
-                "bounded OpenClaw streaming-ttft probe\t0.890\t\t\t0.890\t1.5\tabc123\tmodel=local\n"
+                "2026-05-05T00:00:03+0000\tbenchmark-3\tkeep\tdecode-sample\t"
+                "bounded OpenClaw decode-sample probe\t\t\t15.000\t6.6\t1.5\tabc123\tmodel=local\n"
             )
         advancement = helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123")
         assert advancement is not None
-        assert advancement["task_id"] == "baseline-streaming-ttft"
+        assert advancement["task_id"] == "decode-mtp-baseline"
         assert advancement["sample_count"] == 3
-        assert advancement["mean_ttft_s"] == 0.89
-        assert helper.select_next_task(helper.WORKSPACE)["id"] == "tool-roundtrip-overhead"
+        assert advancement["mean_decode_tps"] == 14.567
+        assert helper.select_next_task(helper.WORKSPACE)["id"] == "mtp-acceptance-log-review"
         selected_tool = helper.select_next_task(helper.WORKSPACE)
-        start_line = helper.results_line_count()
         before_claim = helper.durable_snapshot()
-        selected_tool = helper.claim_task_evidence_window(helper.WORKSPACE, selected_tool, start_line)
-        assert selected_tool["evidence_start_line"] == start_line
+        selected_tool = helper.claim_task_evidence_window(helper.WORKSPACE, selected_tool, helper.results_line_count())
+        assert "evidence_start_line" not in selected_tool
         after_claim = helper.durable_snapshot()
         claim_progress = helper.durable_progress(before_claim, after_claim)
-        assert "task queue update" in claim_progress
+        assert "task queue update" not in claim_progress
         quality = helper.cycle_quality(helper.WORKSPACE, after_claim, after_claim, [], "")
         assert quality["status"] == "blocked"
-        with helper.RESULTS.open("a", encoding="utf-8") as file:
-            for index in range(1, 3):
-                file.write(
-                    f"2026-05-05T00:01:0{index}+0000\ttool-{index}\tkeep\ttool-roundtrip\t"
-                    "bounded OpenClaw tool-roundtrip probe\t\t\t\t1.5\t1.5\tabc123\tmodel=local\n"
-                )
         assert helper.complete_task_from_evidence(helper.WORKSPACE, selected_tool, min_samples=3, commit="abc123") is None
-        with helper.RESULTS.open("a", encoding="utf-8") as file:
-            file.write(
-                "2026-05-05T00:01:03+0000\ttool-3\tkeep\ttool-roundtrip\t"
-                "bounded OpenClaw tool-roundtrip probe\t\t\t\t1.6\t1.5\tabc123\tmodel=local\n"
-            )
-        tool_advancement = helper.complete_task_from_evidence(
-            helper.WORKSPACE,
-            selected_tool,
-            min_samples=3,
-            commit="abc123",
-        )
-        assert tool_advancement is not None
-        assert tool_advancement["task_id"] == "tool-roundtrip-overhead"
-        assert tool_advancement["sample_count"] == 3
-        assert helper.select_next_task(helper.WORKSPACE)["id"] == "prompt-size-pressure"
         recovery_after_advance = helper.continuation_prompt(9, 2, "no durable progress")
-        assert "benchmark --mode prompt-size" in recovery_after_advance
+        assert "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log" in recovery_after_advance
         assert "baseline-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
         assert "supervisor advanced" in helper.FINDINGS.read_text(encoding="utf-8")
         assert "Accepted Baselines" in helper.STRATEGY.read_text(encoding="utf-8")

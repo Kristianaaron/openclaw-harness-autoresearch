@@ -174,7 +174,7 @@ def clone_or_update_reference(root: Path, repo_url: str = DEFAULT_REPO_URL) -> s
 def program_md() -> str:
     return """# OpenClaw Speed Autoresearch
 
-This workspace adapts the `karpathy/autoresearch` method to OpenClaw runtime speed and reliability research. The goal is not to train a model. The goal is to improve OpenClaw's perceived speed, prefill behavior, decode behavior, memory stability, tool-call reliability, and loop resistance while preserving the native OpenClaw experience.
+This workspace adapts the `karpathy/autoresearch` method to OpenClaw runtime speed and reliability research. The current overnight objective is to improve real decode tokens/sec for Gemma 4 31B JANG/JANQ with the Gemma 4 MTP assistant drafter path. The goal is not to train a model or change the user's target model. Reliability, memory stability, tool-call behavior, and loop resistance remain hard guards while decode TPS is optimized.
 
 ## Scope
 
@@ -182,12 +182,11 @@ You are working on OpenClaw only. Do not touch opencode. Do not change the user'
 
 In-scope files are the OpenClaw harness files in the setup repository, especially:
 
-- `openclaw/openclaw-wrapper.zsh`
 - `openclaw/openclaw-model-proxy.py`
-- `openclaw/openclaw-rapid-launcher.py`
-- `openclaw/openclaw-prefix-warmer.py`
-- `openclaw/openclaw-local-health`
-- `openclaw/rapid-overlay/openclaw_rapid_jang.py`
+- `openclaw/openclaw-jang-vlm-server.py`
+- `openclaw/openclaw-jang-vlm-launcher.py`
+- `openclaw/openclaw-mtp-drafter-calibrate.py`
+- `openclaw/model-profiles.example.json`
 - OpenClaw tests under `openclaw/test-*.py`
 
 Live OpenClaw state is under `~/.openclaw`. Treat it as deployment/runtime state, not the source of truth. Do not edit opencode files or opencode state.
@@ -213,15 +212,15 @@ Do not ask the user to continue after each experiment. Do not ask the user to ma
 
 Focus on improvements that make this exact OpenClaw setup faster and more reliable:
 
-- Rapid-MLX serving behavior for Gemma 4 31B JANG/JANQ.
-- JANG bridge behavior in `openclaw/rapid-overlay/openclaw_rapid_jang.py`.
-- OpenClaw model proxy behavior in `openclaw/openclaw-model-proxy.py`.
-- Rapid launcher/profile settings in `openclaw/openclaw-rapid-launcher.py` and `openclaw/openclaw-wrapper.zsh`.
-- Prefix/prompt reuse, context compaction, tool-call shaping, and realistic TTFT.
+- MTP decode behavior for Gemma 4 31B JANG/JANQ.
+- Drafter acceptance and overhead for the official Gemma 4 assistant drafter.
+- Drafter block size, quantization, calibration, and deterministic sampling settings.
+- OpenClaw model proxy behavior only where buffering/status changes affect measured decode.
+- Rapid-MLX or MLX/VLM implementation ideas only when they can plausibly reduce decode-loop overhead.
 
 Think broadly, but every useful idea must become one of: a source patch, a benchmark result, a rejected experiment with evidence, or a source note for later.
 
-Do not spend rounds on toy prompts such as repeated single words except as a one-time health check. Do not optimize for synthetic decode-only numbers if the change does not improve OpenClaw agent UX.
+Do not spend rounds on toy prompts such as repeated single words except as a one-time health check. Do not optimize for synthetic repeated-token numbers; use comparable normal-text/code prompts and record the prompt class.
 
 ## Frontier Speed Track
 
@@ -333,7 +332,7 @@ The wrapper and autopilot own workspace bootstrap. Do not spend a model turn rea
 
 In a fresh agent run, perform one of these narrow actions:
 
-1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`.
+1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`.
 2. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
 3. Run exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 
@@ -346,7 +345,7 @@ Allowed narrow actions are:
 - `read` a single explicit file path from Scope or `sources/queue.md`.
 - `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 - `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
-- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`.
+- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`.
 - `exec` one exact log tail, such as `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
 
 Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`, recursive `rg` over home, `mdfind`, and any broad command intended to discover files. If you need a file, use the explicit paths in this program.
@@ -366,7 +365,7 @@ Useful commands:
 openclaw speed-research-setup
 openclaw speed-research-prompt
 openclaw speed-research-auto
-openclaw speed-research-benchmark --mode streaming-ttft
+openclaw speed-research-benchmark --mode decode-sample
 ```
 
 Implementation is intentionally a separate gated phase. Before keeping production changes, read `implementation-skill.md` and follow its plan/test/deploy/record checklist.
@@ -476,7 +475,7 @@ The wrapper and autopilot own workspace bootstrap. Do not spend a model turn rea
 
 In a fresh agent run, perform one of these narrow actions:
 
-1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`.
 2. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
 3. Run exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 
@@ -492,7 +491,7 @@ Allowed narrow actions are:
 - `read` a single explicit file path from Scope or `sources/queue.md`.
 - `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 - `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
-- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+- `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`.
 - `exec` one exact log tail, such as `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`.
 
 Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`, recursive `rg` over home, `mdfind`, and any broad command intended to discover files. If you need a file, use the explicit paths in this program.
@@ -502,57 +501,78 @@ Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`,
 def current_priority_section() -> str:
     return """## Current Priority
 
-Focus on improvements that make this exact OpenClaw setup faster and more reliable:
+Focus the overnight run on one metric: **real OpenClaw decode tokens/sec for Gemma 4 31B JANG/JANQ with the Gemma 4 MTP assistant drafter path**.
 
-- Rapid-MLX serving behavior for Gemma 4 31B JANG/JANQ.
-- JANG bridge behavior in `openclaw/rapid-overlay/openclaw_rapid_jang.py`.
-- OpenClaw model proxy behavior in `openclaw/openclaw-model-proxy.py`.
-- Rapid launcher/profile settings in `openclaw/openclaw-rapid-launcher.py` and `openclaw/openclaw-wrapper.zsh`.
-- Prefix/prompt reuse, context compaction, tool-call shaping, and realistic TTFT.
+The active production baseline is:
 
-Think broadly, but every useful idea must become one of: a source patch, a benchmark result, a rejected experiment with evidence, or a source note for later.
+- Target model: `mlx/Gemma-4-31B-JANG_4M-CRACK`.
+- Serving path: `openclaw/openclaw-jang-vlm-server.py` behind `openclaw/openclaw-model-proxy.py`.
+- Drafter path: quantized Gemma 4 assistant under `{openclawDir}/models/gemma-4-31B-it-assistant-mlx-4bit`.
+- Known measured baseline: about 14-15 decode tok/s on bounded decode prompts, with MTP `mean_accept` often below 1 on longer normal text.
+- Goal: improve measured decode TPS first; TTFT and prefill are secondary unless they block fair decode measurement.
 
-Do not spend rounds on toy prompts such as repeated single words except as a one-time health check. Do not optimize for synthetic decode-only numbers if the change does not improve OpenClaw agent UX.
+Primary research questions:
+
+- Why is MTP acceptance low for this JANQ target, and can acceptance be raised without changing the target model?
+- Can drafter quantization, block size, calibration, sampling/logit settings, cache handling, or the MLX MTP loop improve wall-clock decode TPS?
+- Can Rapid-MLX or upstream MLX/VLM implementation details reduce drafter overhead while preserving OpenClaw behavior?
+
+In-scope source files and knobs:
+
+- `openclaw/openclaw-jang-vlm-server.py`
+- `openclaw/openclaw-jang-vlm-launcher.py`
+- `openclaw/openclaw-mtp-drafter-calibrate.py`
+- `openclaw/model-profiles.example.json`
+- `openclaw/openclaw-model-proxy.py` only when proxy streaming or shaping affects measured decode
+- Live profile env vars for `OPENCLAW_JANG_DRAFT_MODEL`, `OPENCLAW_JANG_DRAFT_BLOCK_SIZE`, drafter quantization, temperature, top-p, and repetition penalty
+
+Think broadly, but every useful idea must become one of: a decode benchmark result, MTP acceptance measurement, drafter calibration/quantization experiment, rejected experiment with evidence, or a small source patch with tests.
+
+Do not spend rounds on generic prefill, prompt-shape, or tool UX unless decode benchmarking is blocked. Do not optimize for synthetic repeated-token prompts; use deterministic normal-text, code, shell-list, and agent-summary prompts.
 """
 
 
 def frontier_speed_track_section() -> str:
     return """## Frontier Speed Track
 
-After the current OpenClaw/Rapid/JANG knobs have been measured and locally optimized, deliberately explore higher-upside paths toward 50-70 tok/s. This track is allowed to think beyond the current constraints, but it must stay grounded in implementable OpenClaw architecture.
+Deliberately explore higher-upside paths toward 30+ tok/s decode first, then 50-70 tok/s if evidence supports it. This track must stay grounded in implementable OpenClaw architecture and must not change the selected target model.
 
-Use two lanes:
+Use three lanes:
 
-- Lane A: current-stack work. Keep improving the existing Gemma 4 31B JANG Rapid-MLX backend without changing the model.
-- Lane B: frontier proposals. Research and prototype architecture that could plausibly unlock a step-change in speed while preserving OpenClaw UX and model behavior.
+- Lane A: production MTP path. Improve the current JANG/VLM server plus quantized Gemma assistant drafter path.
+- Lane B: drafter alignment. Research and prototype ways to make the assistant drafter better match JANQ target logits/hidden states.
+- Lane C: runtime overhead. Research Rapid-MLX, MLX-VLM, and MLX decode-loop changes that reduce MTP verification/drafter overhead.
 
 Frontier proposal areas include:
 
-- Rapid-MLX scheduler, prefix cache, paged/cache reuse, chunked prefill, speculative decode, PLD, draft-token strategies, and future Rapid upstream features.
-- JANG/JANQ loader or kernel changes that reduce full-prompt handoff cost.
-- Prompt architecture changes that move stable tool/system context into reusable prefixes or compact runtime state.
-- Agent orchestration changes that avoid model turns for deterministic bookkeeping, result recording, or known-safe shell probes.
-- Draft-model or same-tokenizer assist paths if they preserve the user's selected primary model and pass acceptance tests.
-- Native MLX/Metal bottlenecks, memory layout, KV quantization, cache residency, and decode batching choices.
+- JANQ-specific drafter calibration beyond `pre_projection.weight`: adapters, post-projection tuning, selective layer tuning, distillation targets, acceptance-weighted losses, and multi-position trace datasets.
+- Drafter quantization recipes: q-bits, q-group-size, mixed-bit predicates, BF16 vs 4-bit vs 3-bit tradeoffs, and whether quantization changes acceptance or only overhead.
+- MTP scheduler policy: fixed block size, acceptance-aware block sizing, prompt-class-specific block size, and early stop on acceptance collapse.
+- MLX/VLM MTP implementation: eval boundaries, cache rollback cost, shared-KV slicing, prompt-cache reuse, target/drafter stream synchronization, and opportunities to upstream a cleaner faster loop.
+- Rapid-MLX compatibility: whether separate assistant drafters can be supported natively rather than only built-in MTP heads.
+- Benchmark design: separating decode wall time from prefill, extracting `mtp_rounds` and `mean_accept` from logs, and comparing against no-drafter baseline.
 
-For every frontier idea, record a note with: expected speed impact, feasibility, risk to reliability, files or upstream projects involved, smallest prototype, and whether it is local-only, upstream-dependent, or requires a separate draft/helper model. Do not implement speculative ideas blindly. Promote only the ideas with a plausible path to a tested OpenClaw patch.
+For every frontier idea, record: expected decode TPS impact, expected acceptance impact, feasibility, reliability risk, files/upstream projects involved, smallest prototype, and rollback path. Promote only ideas with a plausible path to a tested OpenClaw patch.
 """
 
 
 def realistic_experiment_backlog_section() -> str:
     return """## Realistic Experiment Backlog
 
-Prioritize these experiment types over generic LLM speed prompts:
+Prioritize decode/MTP experiments over generic LLM speed prompts:
 
-- OpenClaw bootstrap turn: first tool call latency when asked to read `program.md`.
-- Tool-call round trip: read one explicit OpenClaw source file, summarize it, then write one result row.
-- Prompt-size impact: compare shaped prompt tokens and TTFT before/after context compaction or history limits.
-- Rapid-MLX backend settings: test one setting at a time, such as prefill step size, batch size, KV cache quantization, prefix cache policy, stream interval, or max tool tokens.
-- JANG/JANQ bridge behavior: inspect whether the bridge prevents repeated tokens, reasoning leakage, and expensive unnecessary full-prompt paths.
-- Perceived latency: verify heartbeat/status behavior during long prefill and time to first useful TUI status.
-- Memory safety: record Metal active/peak memory, RSS, and whether compressor/swap rises.
+- Decode baseline: run bounded normal-text decode prompts and record decode TPS, wall time, `mtp_rounds`, `mean_accept`, drafter path, block size, temperature, repetition penalty, and commit.
+- No-drafter control: temporarily disable `OPENCLAW_JANG_DRAFT_MODEL`, benchmark the same prompts, restore MTP, and record the real speedup factor.
+- Drafter block sweep: test block sizes 2, 3, 4, and 6 on the same deterministic prompt set. Keep only settings that improve aggregate decode TPS.
+- Drafter quantization sweep: compare BF16, 4-bit, 3-bit, q-group-size, and mixed-bit candidates if memory allows. Reject quantization that lowers decode TPS or acceptance.
+- JANQ calibration: use `openclaw/openclaw-mtp-drafter-calibrate.py` to test small calibration ideas. Promote only if benchmarked decode TPS beats the current official 4-bit drafter.
+- Acceptance diagnostics: parse logs for `mtp_rounds` and `mean_accept`; identify prompts/classes with acceptance collapse and record why.
+- MTP loop overhead: inspect `mlx_vlm.generate._mtp_rounds` behavior and compare with OpenClaw server usage. Look for avoidable eval/cache/rollback overhead.
+- Deterministic decode settings: test temperature, top-p, repetition penalty, and logit processors for acceptance and loop safety. Keep deterministic settings unless quality/reliability regresses.
+- Proxy streaming control: verify OpenClaw proxy is not hiding decode gains by buffering content. Measure time to first visible token separately from decode TPS.
+- Memory safety during decode: record Metal/RSS/compressor before and after drafter experiments; discard anything that increases crash risk.
 
-Each experiment must name the exact file or runtime knob under test and the exact command used to measure it.
+Each experiment must name the exact file or runtime knob under test, the exact benchmark command, the prompt set, and the keep/discard decision.
 """
 
 
@@ -561,12 +581,83 @@ def speed_targets_section() -> str:
 
 Treat these as directional targets, not promises:
 
-- Immediate usability target: first useful status in under 5s and follow-up agent turns under 15s when prefix/cache is warm.
-- Current-stack stretch target: realistic OpenClaw decode above 20 tok/s and much lower repeated prefill.
-- Frontier target: investigate paths that could reach 50-70 tok/s perceived or measured decode on suitable workloads.
+- Current live baseline: about 14-15 decode tok/s with the official quantized 4-bit assistant drafter at block size 2.
+- Immediate target: stable measured decode above 18 tok/s without lower-quality output, reasoning loops, or extra memory pressure.
+- Current-stack stretch target: realistic OpenClaw decode above 20 tok/s on normal deterministic prompts.
+- Frontier target: investigate paths that could reach 30+ tok/s, then 50-70 tok/s if drafter acceptance and runtime overhead evidence supports it.
 
-Prefer perceived speed wins that help agentic work: faster first tool call, less repeated prefill, better streaming status, fewer unnecessary model turns, and fewer wasted tokens.
+Primary metric is decode TPS from comparable normal-text/code prompts. Secondary metrics are MTP mean acceptance, MTP rounds, wall time, first visible token, and memory pressure.
 """
+
+
+def strategy_decode_focus_section() -> str:
+    return """## Decode MTP Focus
+
+Primary metric for the current overnight run: real OpenClaw decode tokens/sec for `mlx/Gemma-4-31B-JANG_4M-CRACK` with the Gemma 4 assistant drafter path.
+
+Current baseline:
+
+- Official quantized Gemma 4 assistant drafter, block size 2.
+- Recent bounded decode measurements: about 14-15 tok/s.
+- No-drafter control seen earlier: about 12.5 tok/s.
+- Heuristic MTP scheduling, 3-bit drafter, and pre-projection-only calibration did not beat the official q4 drafter.
+
+Research order:
+
+1. Measure decode-sample repeatability.
+2. Extract MTP `mean_accept` and `mtp_rounds` from recent logs.
+3. Compare no-drafter control against live q4 drafter.
+4. Sweep drafter block size and quantization only with fixed prompts and rollback.
+5. Promote JANQ drafter calibration only if wall-clock decode TPS improves.
+
+TTFT, prefill, prompt-shape, and tool-roundtrip are secondary unless they block fair decode measurement.
+"""
+
+
+def strategy_current_best_section() -> str:
+    return """## Current Best Understanding
+
+- Live baseline is the official quantized Gemma 4 assistant drafter at block size 2.
+- Recent bounded decode measurements are about 14-15 tok/s, versus roughly 12.5 tok/s without a drafter.
+- Earlier heuristic MTP scheduling, 3-bit drafter experiments, and pre-projection-only calibration did not beat the official 4-bit drafter.
+"""
+
+
+def strategy_top_hypotheses_section() -> str:
+    return """## Top Hypotheses
+
+1. Decode TPS will improve only if MTP acceptance rises enough to beat drafter overhead on normal prompts.
+2. The best next experiments are no-drafter control, block-size sweep, drafter quantization/calibration, and log-based `mean_accept` analysis.
+3. Rapid-MLX or MLX/VLM loop changes matter only if they reduce verification/drafter overhead without changing the selected target model.
+"""
+
+
+def strategy_rejected_section() -> str:
+    return """## Rejected Or Exhausted
+
+- Repeating TTFT, tool-roundtrip, or prompt-size benchmarks without a decode/MTP hypothesis is noise for this phase.
+- Earlier blocked prompt-shape/profile-bandit/speculative-compat tasks are superseded by the live MTP drafter baseline and decode/MTP task queue.
+"""
+
+
+def strategy_current_synthesis_section() -> str:
+    return """## Current Synthesis
+
+- Current research phase is decode/MTP optimization, not generic speed archaeology.
+- Top production idea: explain and improve MTP `mean_accept` for the live q4 assistant drafter.
+- Top experiment idea: paired no-drafter, block-size, and quantization comparisons on the same prompt set.
+- Top frontier idea: JANQ-specific drafter alignment or MLX/VLM loop changes only if wall-clock decode TPS improves.
+"""
+
+
+def refresh_strategy_objective(path: Path) -> None:
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    old = "Objective: optimize raw speed for the current Gemma 4 31B JANG OpenClaw setup while treating crashes, loops, memory pressure, and tool failures as hard guards."
+    new = "Objective: improve real decode tokens/sec for the current Gemma 4 31B JANG/JANQ OpenClaw setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards."
+    if old in text:
+        path.write_text(text.replace(old, new), encoding="utf-8")
 
 
 def implementation_gate_section() -> str:
@@ -609,7 +700,7 @@ def prompt_text(root: Path) -> str:
 Workspace: {root}
 
 First assistant action: run exactly this narrow benchmark command:
-`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`
+`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`
 
 Then read exactly:
 `{root / 'SUMMARY.md'}`
@@ -632,7 +723,7 @@ def setup_workspace(args: argparse.Namespace) -> int:
     ensure_research_state(root)
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
-    write_if_missing(root / "program.md", program_md())
+    write_if_changed(root / "program.md", program_md())
     remove_section(root / "program.md", "Starting Point")
     upsert_section(root / "program.md", "Research Method", research_method_section())
     upsert_section(root / "program.md", "Bootstrap Ladder", bootstrap_ladder_section())
@@ -643,6 +734,12 @@ def setup_workspace(args: argparse.Namespace) -> int:
     upsert_section(root / "program.md", "Realistic Experiment Backlog", realistic_experiment_backlog_section())
     upsert_section(root / "program.md", "Speed Targets", speed_targets_section())
     upsert_section(root / "program.md", "Implementation Gate", implementation_gate_section())
+    refresh_strategy_objective(root / "STRATEGY.md")
+    upsert_section(root / "STRATEGY.md", "Current Best Understanding", strategy_current_best_section())
+    upsert_section(root / "STRATEGY.md", "Top Hypotheses", strategy_top_hypotheses_section())
+    upsert_section(root / "STRATEGY.md", "Rejected Or Exhausted", strategy_rejected_section())
+    upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_current_synthesis_section())
+    upsert_section(root / "STRATEGY.md", "Decode MTP Focus", strategy_decode_focus_section())
     write_if_changed(root / "README-openclaw-speed.md", readme_md())
     write_if_changed(root / "implementation-skill.md", implementation_skill_md())
     write_if_missing(root / "ideas.md", "# Speed Research Ideas\n\n")
@@ -881,57 +978,49 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
 
 
 def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    ttft = mean_value(float_values(rows, "streaming-ttft", "ttft_s"))
-    tool = mean_value(float_values(rows, "tool-roundtrip", "wall_s"))
-    prefill = mean_value(float_values(rows, "prefill-reuse", "wall_s"))
     decode = mean_value(float_values(rows, "decode-sample", "decode_tps"))
     return [
         {
-            "id": "prefix-dag-stable-context",
-            "lane": "current-stack",
-            "expected": "Lower TTFT by maximizing reused system/tool/context prefixes before every model turn.",
-            "math": "Represent prompt segments as a trie/DAG and choose cached prefix p*=argmax_p |p| subject to hash(p) in cache.",
-            "prototype": "Add a prompt-shape report that separates stable prefix tokens from volatile user/tool-result tokens.",
-            "risk": "Incorrectly caching volatile tool output could cause stale context; use content hashes and explicit boundaries.",
-            "evidence": f"Observed streaming TTFT mean={ttft}s and prefill-reuse wall mean={prefill}s.",
+            "id": "mtp-acceptance-bottleneck",
+            "lane": "production-mtp",
+            "expected": "Raise real decode TPS by identifying whether low `mean_accept` or drafter overhead is the limiting factor.",
+            "math": "Speculative speedup S ~= T_target_only / (T_draft + T_verify); acceptance must be high enough that avoided target steps exceed drafter cost.",
+            "prototype": "Parse recent proxy/server logs for `mtp_rounds`, `mean_accept`, block size, drafter path, and decode tok/s, then compare against no-drafter control.",
+            "risk": "Log-only conclusions can be misleading; promote only ideas that survive a paired decode benchmark.",
+            "evidence": f"Current decode sample mean={decode if decode is not None else 'not yet measured'} tok/s; live target is >18 tok/s first.",
         },
         {
-            "id": "bandit-rapid-knob-search",
-            "lane": "current-stack",
-            "expected": "Find better Rapid-MLX settings without hand-tuning or endless repeated benchmarks.",
-            "math": "Use UCB1 score_i = mean_i - lambda*crash_i + c*sqrt(log(N)/n_i) for each safe knob profile.",
-            "prototype": "Create a small profile matrix for prefill_step_size, cache_memory_mb, prefix_cache_size, and kv quantization, then run bounded A/B cycles.",
-            "risk": "Too many profiles can waste time or trigger memory pressure; cap trials and require memory gates.",
-            "evidence": "The previous run repeated streaming-ttft after tasks were exhausted, so structured search is needed.",
+            "id": "drafter-block-and-quant-sweep",
+            "lane": "production-mtp",
+            "expected": "Find the fastest safe assistant drafter configuration without changing the JANQ target model.",
+            "math": "Choose argmax_config decode_tps(config) subject to memory_ok, no_loop, no_reasoning_leak, and quality_guard.",
+            "prototype": "Run a paired sweep for block size and drafter quantization, restoring the live profile after each bounded benchmark.",
+            "risk": "A faster synthetic prompt can regress normal text or code; use a fixed mixed prompt set.",
+            "evidence": "The current live q4 drafter at block size 2 improved decode modestly; prior 3-bit and heuristic schedule attempts were slower.",
         },
         {
-            "id": "speculative-or-pld-gate",
-            "lane": "frontier",
-            "expected": "Improve perceived decode speed if a same-tokenizer draft/helper path passes acceptance tests.",
-            "math": "Expected speedup S approx 1 / (c_draft*k + (1-a^k)*c_verify/k), where a is draft acceptance rate.",
-            "prototype": "Add a compatibility probe that verifies tokenizer identity, acceptance rate, and no tool/reasoning regressions before enabling speculation or PLD.",
-            "risk": "Wrong tokenizer or bad acceptance can slow generation and destabilize tool JSON.",
-            "evidence": f"Current decode sample mean={decode if decode is not None else 'not yet measured'}; frontier target is 50-70 tok/s.",
+            "id": "janq-drafter-alignment",
+            "lane": "drafter-alignment",
+            "expected": "Improve acceptance by making the assistant drafter better match the unlocked JANQ target behavior.",
+            "math": "Minimize KL(target_logits || drafter_logits) on rolling JANQ traces, weighted by positions where draft rejection currently occurs.",
+            "prototype": "Use `openclaw-mtp-drafter-calibrate.py` to test one narrow calibration target at a time, then benchmark against the official q4 drafter.",
+            "risk": "Calibration can overfit traces or slow the drafter; discard unless wall-clock decode TPS improves.",
+            "evidence": "Pre-projection-only calibration did not beat official q4, so future calibration must target acceptance gaps with stronger evidence.",
         },
         {
-            "id": "deterministic-agent-bookkeeping",
-            "lane": "current-stack",
-            "expected": "Reduce model turns by moving known-safe bookkeeping and result recording out of the LLM loop.",
-            "math": "Wall time per cycle T = T_model + T_tool + T_bookkeeping; make T_bookkeeping -> O(1) deterministic code.",
-            "prototype": "Teach autopilot to record synthesis, task advancement, and blocked rows directly rather than asking the model to narrate them.",
-            "risk": "Over-automation can hide reasoning; every deterministic action must log evidence.",
-            "evidence": "The model produced NO_REPLY for many benchmark cycles while deterministic helpers already wrote the durable rows.",
+            "id": "mlx-vlm-mtp-loop-overhead",
+            "lane": "runtime-overhead",
+            "expected": "Recover speed if the current MLX/VLM MTP loop spends too much time on verification, cache rollback, or synchronization.",
+            "math": "Per-token cost C = C_target_verify/k + C_draft + C_cache_rollback + C_python_loop; reduce the largest measured term.",
+            "prototype": "Inspect one exact MTP loop source/log at a time and propose a minimal upstreamable or local patch only if timing evidence supports it.",
+            "risk": "Runtime loop changes can destabilize streaming, tool parsing, or memory; require tests and easy rollback.",
+            "evidence": "The desired 30+ tok/s requires either much higher acceptance or lower MTP overhead than the current live path.",
         },
     ]
 
 
 def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     decode = mean_value(float_values(rows, "decode-sample", "decode_tps"))
-    prompt_tokens = ""
-    for row in reversed(rows):
-        if row.get("status") == "keep" and row.get("target") == "prompt-size":
-            prompt_tokens = row.get("notes", "")
-            break
     speed_gap = (
         f"Current measured decode is {decode} tok/s, below the practical 20 tok/s floor and far below the 50-70 tok/s frontier target."
         if decode is not None
@@ -939,31 +1028,30 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
     )
     return [
         {
-            "id": "prompt-shape-report",
+            "id": "mtp-acceptance-report",
             "status": "ready",
             "priority": 76,
-            "lane": "current-stack",
-            "target": "prompt-context",
-            "hypothesis": "Prompt/context bloat must be split into stable cacheable context and volatile ledger growth before trimming anything.",
-            "metric": "stable_tokens_vs_volatile_tokens",
-            "benchmark_mode": "prompt-shape",
-            "guard_checks": ["context_within_limit", "semantic_preservation"],
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-shape",
+            "lane": "production-mtp",
+            "target": "openclaw-model-proxy.log",
+            "hypothesis": "Decode tuning needs a compact report of MTP rounds, mean acceptance, block size, and drafter path from recent runs.",
+            "metric": "mean_accept",
+            "guard_checks": ["one_narrow_tool", "no_loop"],
+            "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
         },
         {
-            "id": "implement-prompt-shape-compaction",
+            "id": "implement-mtp-acceptance-report",
             "status": "ready",
             "priority": 74,
-            "lane": "current-stack",
+            "lane": "production-mtp",
             "task_type": "implementation",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "Autoresearch should compact or summarize volatile prompt ledger inputs once prompt-shape shows the largest contributors.",
-            "metric": "estimated_prompt_tokens",
-            "guard_checks": ["tests_pass", "context_within_limit", "semantic_preservation", "no_opencode_changes"],
-            "acceptance": "Focused tests pass and prompt-size or prompt-shape rows show bounded or reduced volatile context.",
-            "rollback": "Revert only the prompt-shape/compaction patch and record discard if semantic context is lost.",
-            "evidence": prompt_tokens or "prompt-size rows exist in results.tsv",
+            "hypothesis": "A benchmark-side MTP acceptance report will make decode research deterministic instead of relying on ad hoc log reading.",
+            "metric": "mean_accept",
+            "guard_checks": ["tests_pass", "no_opencode_changes", "no_live_profile_change"],
+            "acceptance": "Focused tests pass and decode benchmark artifacts include MTP acceptance fields when logs expose them.",
+            "rollback": "Revert only the acceptance-report patch and record discard if artifacts become noisy or misleading.",
+            "evidence": speed_gap,
             "next_action": (
                 "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
                 "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
@@ -972,43 +1060,43 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             ),
         },
         {
-            "id": "implement-rapid-profile-bandit-plan",
+            "id": "implement-drafter-sweep-plan",
             "status": "ready",
             "priority": 72,
-            "lane": "current-stack",
+            "lane": "production-mtp",
             "task_type": "implementation",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "A bounded UCB-style Rapid-MLX profile manifest can replace manual knob guessing without risking memory crashes.",
-            "metric": "profile_score",
-            "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change"],
-            "acceptance": "A dry-run profile matrix is generated with crash/memory penalties before any live profile is promoted.",
-            "rollback": "Remove the profile planner if it creates ambiguous or unsafe profile recommendations.",
+            "hypothesis": "A bounded drafter block/quantization sweep plan can search decode speed safely without manual overnight babysitting.",
+            "metric": "decode_tps",
+            "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile"],
+            "acceptance": "A dry-run sweep manifest is generated with fixed prompt set, rollback, and memory gates before any live setting is promoted.",
+            "rollback": "Remove the sweep planner if it creates ambiguous or unsafe profile recommendations.",
             "evidence": speed_gap,
             "next_action": (
                 "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
                 "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
-                "Implement a dry-run Rapid profile scoring/planning helper only; do not change live model settings."
+                "Implement a dry-run MTP drafter sweep planner only; do not change live model settings."
             ),
         },
         {
-            "id": "implement-speculative-pld-compat-probe",
+            "id": "implement-janq-drafter-calibration-gate",
             "status": "ready",
             "priority": 68,
-            "lane": "frontier",
+            "lane": "drafter-alignment",
             "task_type": "implementation",
-            "target": "openclaw/openclaw-speed-research.py",
-            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "Speculative decoding or PLD must be blocked unless tokenizer identity, acceptance rate, and tool/reasoning safety are proven.",
-            "metric": "compatibility_gate_pass",
-            "guard_checks": ["same_tokenizer", "no_tool_json_regression", "no_reasoning_leak", "no_model_change"],
-            "acceptance": "The helper can record pass/fail evidence without enabling speculation automatically.",
-            "rollback": "Remove the compatibility probe if it cannot distinguish safe from unsafe draft/helper paths.",
+            "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "JANQ drafter calibration must be gated by decode TPS and acceptance improvements, not loss-only improvements.",
+            "metric": "decode_tps_delta",
+            "guard_checks": ["same_tokenizer", "no_reasoning_leak", "no_model_change", "tests_pass"],
+            "acceptance": "The calibrator records pass/fail evidence against the official q4 drafter and refuses promotion unless wall-clock decode TPS improves.",
+            "rollback": "Remove the gate if it blocks valid calibration or cannot compare against baseline safely.",
             "evidence": speed_gap,
             "next_action": (
                 "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
-                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
-                "Add a dry-run compatibility probe only; do not enable speculative decoding automatically."
+                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py. "
+                "Add a promotion gate only; do not change the live drafter automatically."
             ),
         },
     ]
@@ -1075,10 +1163,10 @@ def synthesize(args: argparse.Namespace) -> int:
             "## Current Synthesis",
             "",
             f"- generated_at: {generated_at}",
-            "- measurement loop is healthy, but exhausted queues must switch to ideas, ranked hypotheses, and implementation candidates.",
-            "- top current-stack idea: prefix DAG / stable-context cache locality.",
-            "- top search idea: UCB-style Rapid-MLX knob search with memory/crash penalties.",
-            "- top frontier idea: speculative or PLD gate only after tokenizer and acceptance tests pass.",
+            "- measurement loop is healthy, but exhausted queues must switch to decode/MTP ideas, ranked hypotheses, and implementation candidates.",
+            "- top production idea: MTP acceptance bottleneck report.",
+            "- top sweep idea: drafter block/quantization comparison with fixed prompt set and rollback.",
+            "- top frontier idea: JANQ-specific drafter alignment only if wall-clock decode TPS improves.",
             "",
         ]
     )
@@ -1086,64 +1174,39 @@ def synthesize(args: argparse.Namespace) -> int:
 
     candidate_tasks = [
         {
-            "id": "post-compact-prompt-shape",
+            "id": "post-mtp-acceptance-report",
             "status": "ready",
             "priority": 79,
-            "lane": "current-stack",
-            "target": "prompt-context",
-            "hypothesis": "Compact SUMMARY.md/results-recent.tsv should keep volatile prompt state lower than full-ledger autoresearch.",
-            "metric": "volatile_ratio",
-            "benchmark_mode": "prompt-shape",
-            "guard_checks": ["context_within_limit", "semantic_preservation"],
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-shape",
-        },
-        {
-            "id": "post-compact-prompt-size",
-            "status": "ready",
-            "priority": 78,
-            "lane": "current-stack",
-            "target": "prompt-context",
-            "hypothesis": "Compact autoresearch state should keep estimated prompt tokens bounded across cycles.",
-            "metric": "estimated_prompt_tokens",
-            "benchmark_mode": "prompt-size",
-            "guard_checks": ["context_within_limit"],
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
+            "lane": "production-mtp",
+            "target": "openclaw-model-proxy.log",
+            "hypothesis": "Every decode-speed change needs recent MTP acceptance evidence before implementation.",
+            "metric": "mean_accept",
+            "guard_checks": ["one_narrow_tool", "no_loop"],
+            "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
         },
         {
             "id": "decode-sample-baseline",
             "status": "ready",
-            "priority": 66,
-            "lane": "current-stack",
+            "priority": 78,
+            "lane": "production-mtp",
             "target": "decode-sample",
-            "hypothesis": "Decode sample speed is required before judging 20 tok/s and 50-70 tok/s targets.",
+            "hypothesis": "Decode sample speed is required before judging 18, 20, 30, or 50-70 tok/s targets.",
             "metric": "decode_tps",
             "benchmark_mode": "decode-sample",
             "guard_checks": ["no_reasoning_leak", "memory_ok"],
             "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
         },
         {
-            "id": "prompt-size-after-synthesis",
+            "id": "decode-sample-repeatability",
             "status": "ready",
-            "priority": 64,
-            "lane": "current-stack",
-            "target": "prompt-context",
-            "hypothesis": "Prompt/context size should stay bounded after synthesis and task growth.",
-            "metric": "estimated_prompt_tokens",
-            "benchmark_mode": "prompt-size",
-            "guard_checks": ["context_within_limit"],
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-size",
-        },
-        {
-            "id": "streaming-ttft-post-synthesis",
-            "status": "ready",
-            "priority": 62,
-            "lane": "current-stack",
-            "target": "openclaw-model-proxy",
-            "hypothesis": "TTFT should remain stable after synthesis and queue expansion.",
-            "metric": "ttft_s",
-            "benchmark_mode": "streaming-ttft",
-            "guard_checks": ["no_sse_timeout", "memory_ok"],
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft",
+            "priority": 66,
+            "lane": "production-mtp",
+            "target": "decode-sample",
+            "hypothesis": "Decode TPS must be repeatable across comparable normal prompts before promoting any drafter change.",
+            "metric": "decode_tps",
+            "benchmark_mode": "decode-sample",
+            "guard_checks": ["no_reasoning_leak", "memory_ok"],
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
         },
         *implementation_tasks,
     ]

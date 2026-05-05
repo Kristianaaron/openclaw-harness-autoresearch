@@ -230,7 +230,7 @@ def recovery_instruction(
             )
         action = str((selected_task or {}).get("next_action", "")).strip()
         if "openclaw-speed-research benchmark --mode" not in action:
-            action = "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft"
+            action = "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample"
         return (
             "\n\nSupervisor recovery: two recent cycles did not produce useful durable progress. "
             "Your next tool call must be exactly "
@@ -450,7 +450,7 @@ def continuation_prompt(
     if stalled_cycles >= 2:
         pressure = (
             "\n\nPrevious cycles did not record enough durable progress. In this turn, choose the smallest "
-            "realistic OpenClaw/Rapid-MLX/Gemma4 JANG backend speed experiment and record either a result "
+            "realistic OpenClaw/Gemma4 JANG MTP decode-speed experiment and record either a result "
             "row in results.tsv or a frontier idea in ideas.md before ending."
         )
     if last_issue:
@@ -497,12 +497,12 @@ def continuation_prompt(
         f"Workspace: {WORKSPACE}\n"
         f"Program: {PROGRAM}\n\n"
         "Use program.md as the installed policy, but do not read it this turn. Do one bounded unit of useful work. "
-        "Prefer realistic backend work over toy prompts: "
-        "Rapid-MLX settings, JANG/JANQ bridge behavior, prefix/cache/prompt shaping, tool-call TTFT, "
-        "Metal/KV/cache memory, or grounded frontier proposals toward 50-70 tok/s.\n\n"
+        "Prefer realistic decode work over toy prompts: "
+        "MTP acceptance, drafter block size, drafter quantization, JANQ calibration, MLX/VLM MTP loop overhead, "
+        "Metal/KV/cache memory, or grounded frontier proposals toward 30+ and then 50-70 tok/s.\n\n"
         "Best next actions are: run a specific benchmark mode such as "
-        "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft`, "
-        "`--mode tool-roundtrip`, `--mode prompt-size`, `--mode prompt-shape`, `--mode decode-sample`, or `--mode prefill-reuse`; "
+        "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`, "
+        "read recent MTP logs with `tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log`, "
         "read `/Users/kristian/.openclaw/research/speed/SUMMARY.md`, read one named OpenClaw source file, "
         "or run `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
         "Do not run setup commands, `find`, recursive `ls`, recursive grep, or broad local search.\n\n"
@@ -516,7 +516,7 @@ def continuation_prompt(
         "Benchmark commands already write results.tsv and benchmark JSON; after running one, do not append another "
         "results row by hand. Use a later cycle for synthesis or task updates. "
         "Task completion is supervisor-owned: do not manually mark tasks done. "
-        "Do not repeat quick-health benchmarks unless comparing variance or validating a changed hypothesis. "
+        "Do not repeat quick-health, TTFT, prompt-size, or tool-roundtrip benchmarks unless they directly support a decode/MTP hypothesis. "
         "No quality artifact means the supervisor will narrow the next cycle automatically."
         f"{task_summary}"
         f"{task_contract}"
