@@ -11,6 +11,7 @@ reasoning separation, tool-call normalization, and repeated-output suppression.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import queue
@@ -109,6 +110,133 @@ def load_model(model_path: str) -> None:
             "loaded Gemma drafter "
             f"kind={draft_kind} block={block} in {time.monotonic() - draft_start:.2f}s: {draft_path}"
         )
+        install_mtp_heuristic_patch()
+
+
+def install_mtp_heuristic_patch() -> None:
+    schedule = os.environ.get("OPENCLAW_JANG_MTP_SCHEDULE", "heuristic").strip().lower()
+    if schedule not in {"heuristic", "adaptive"}:
+        return
+    try:
+        generate_module = importlib.import_module("mlx_vlm.generate")
+    except Exception as error:
+        log(f"MTP heuristic patch skipped: {error}")
+        return
+    if getattr(generate_module, "_openclaw_mtp_heuristic_patch", False):
+        return
+    mx = generate_module.mx
+    generation_stream = generate_module.generation_stream
+    speculative_walk = generate_module._speculative_walk
+
+    def adaptive_mtp_rounds(
+        model: Any,
+        draft_model: Any,
+        prompt_cache: list[Any],
+        hidden: Any,
+        shared_kv_states: dict[str, Any],
+        *,
+        first_bonus: int,
+        max_tokens: int,
+        sampler: Any,
+        draft_block_size: int | None = None,
+        token_dtype: Any = None,
+    ) -> Any:
+        lm = model.language_model if hasattr(model, "language_model") else model
+        if not hasattr(lm, "rollback_speculative_cache"):
+            raise RuntimeError(
+                f"{type(lm).__name__} does not implement rollback_speculative_cache. "
+                "MTP speculative decoding currently only supports gemma4."
+            )
+
+        configured = draft_block_size if draft_block_size is not None else int(draft_model.config.block_size)
+        block_total = max(2, configured)
+        min_block = max(2, env_int("OPENCLAW_JANG_MTP_MIN_BLOCK_SIZE", 2))
+        max_block = max(min_block, env_int("OPENCLAW_JANG_MTP_MAX_BLOCK_SIZE", 16))
+        increase = max(1, env_int("OPENCLAW_JANG_MTP_ACCEPT_INCREASE", 2))
+        decrease = max(1, env_int("OPENCLAW_JANG_MTP_REJECT_DECREASE", 1))
+        token_dtype = token_dtype if token_dtype is not None else mx.int32
+        draft_model.reset(model)
+
+        if hidden.shape[1] > 1:
+            hidden = hidden[:, -1:, :]
+
+        kv_offset = int(prompt_cache[0].offset)
+        draft_model.set_shared_kv(shared_kv_states, kv_offset)
+
+        b = first_bonus
+        emitted = 1
+
+        while emitted < max_tokens:
+            bs = min(block_total, max_tokens - emitted + 1)
+            if bs <= 1:
+                break
+
+            draft_tokens = draft_model.draft_block(
+                b, hidden, None, bs, sampler, token_dtype
+            )
+            mx.async_eval(draft_tokens)
+
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+                )
+                verify_out = lm(
+                    verify_input,
+                    cache=prompt_cache,
+                    return_hidden=True,
+                    return_shared_kv=True,
+                )
+                hidden_full = verify_out.hidden_states[-1]
+                target_tokens = sampler(verify_out.logits)
+            mx.async_eval(target_tokens, hidden_full)
+
+            accepted, new_tokens = speculative_walk(
+                draft_tokens, target_tokens, max_tokens - emitted
+            )
+            draft_model.accept_lens.append(accepted)
+
+            for tok in new_tokens:
+                yield tok, None
+                emitted += 1
+                if emitted >= max_tokens:
+                    return
+
+            hidden = hidden_full[:, accepted : accepted + 1, :]
+            b = new_tokens[-1] if new_tokens else b
+
+            if accepted < bs - 1:
+                with mx.stream(generation_stream):
+                    lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
+
+            all_drafts_accepted = accepted >= bs - 1
+            if all_drafts_accepted:
+                block_total = min(max_block, block_total + increase)
+            else:
+                block_total = max(min_block, block_total - decrease)
+
+            rejected = bs - (accepted + 1)
+            next_shared_kv = {}
+            for key, kv in verify_out.shared_kv_states.items():
+                k_cache, v_cache = kv
+                valid = k_cache.shape[-2] - rejected
+                if valid <= 0 or valid >= k_cache.shape[-2]:
+                    next_shared_kv[key] = (
+                        (k_cache, v_cache)
+                        if valid >= k_cache.shape[-2]
+                        else (k_cache[..., :1, :], v_cache[..., :1, :])
+                    )
+                else:
+                    next_shared_kv[key] = (k_cache[..., :valid, :], v_cache[..., :valid, :])
+            kv_offset = int(prompt_cache[0].offset)
+            draft_model.set_shared_kv(next_shared_kv, kv_offset)
+
+            if emitted % 256 == 0:
+                mx.clear_cache()
+
+    generate_module._openclaw_original_mtp_rounds = getattr(generate_module, "_mtp_rounds", None)
+    generate_module._mtp_rounds = adaptive_mtp_rounds
+    generate_module._openclaw_mtp_heuristic_patch = True
+    log("enabled OpenClaw heuristic MTP schedule")
 
 
 def model_worker(model_path: str) -> None:
@@ -233,14 +361,22 @@ def build_prompt(payload: dict[str, Any]) -> str:
 def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     max_tokens = int(payload.get("max_tokens") or env_int("OPENCLAW_JANG_MAX_TOKENS", 4096))
     max_tokens = max(1, min(max_tokens, env_int("OPENCLAW_JANG_HARD_MAX_TOKENS", 4096)))
+    default_temperature = env_float(
+        "OPENCLAW_JANG_DEFAULT_TEMPERATURE",
+        0.0 if DRAFT_MODEL is not None else 0.3,
+    )
+    default_repetition_penalty = env_float(
+        "OPENCLAW_JANG_REPETITION_PENALTY",
+        1.0 if DRAFT_MODEL is not None else 1.05,
+    )
     kwargs: dict[str, Any] = {
         "max_tokens": max_tokens,
-        "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else 0.3),
+        "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else default_temperature),
         "top_p": float(payload.get("top_p") if payload.get("top_p") is not None else 0.9),
         "repetition_penalty": float(
             payload.get("repetition_penalty")
             if payload.get("repetition_penalty") is not None
-            else env_float("OPENCLAW_JANG_REPETITION_PENALTY", 1.05)
+            else default_repetition_penalty
         ),
     }
     for name in ("top_k", "min_p"):
@@ -409,6 +545,8 @@ def speculative_stats_since(start_index: int) -> str:
     if DRAFT_MODEL is None:
         return ""
     accept_lens = getattr(DRAFT_MODEL, "accept_lens", None) or []
+    if start_index > len(accept_lens):
+        start_index = 0
     recent = accept_lens[start_index:]
     if not recent:
         return ""

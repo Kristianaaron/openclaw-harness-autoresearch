@@ -101,6 +101,44 @@ def ensure_mtp_runtime() -> None:
         raise RuntimeError("mlx-vlm MTP runtime installed but Gemma4 assistant import still fails")
 
 
+def ensure_quantized_mtp_draft_model() -> None:
+    draft_model = os.environ.get("OPENCLAW_JANG_DRAFT_MODEL")
+    source_model = os.environ.get("OPENCLAW_JANG_DRAFT_SOURCE_MODEL")
+    if not draft_model or not source_model:
+        return
+    draft_path = Path(draft_model).expanduser()
+    if (draft_path / "model.safetensors").exists() and (draft_path / "config.json").exists():
+        return
+    draft_path.mkdir(parents=True, exist_ok=True)
+    q_bits = os.environ.get("OPENCLAW_JANG_DRAFT_Q_BITS", "4")
+    q_group_size = os.environ.get("OPENCLAW_JANG_DRAFT_Q_GROUP_SIZE", "64")
+    log(
+        "building quantized Gemma MTP drafter "
+        f"source={source_model} target={draft_path} q_bits={q_bits}"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(JANG_TARGET)
+    subprocess.check_call(
+        [
+            rapid_python(),
+            "-m",
+            "mlx_vlm.convert",
+            "--hf-path",
+            source_model,
+            "--mlx-path",
+            str(draft_path),
+            "-q",
+            "--q-bits",
+            q_bits,
+            "--q-group-size",
+            q_group_size,
+        ],
+        env=env,
+    )
+    if not (draft_path / "model.safetensors").exists():
+        raise RuntimeError(f"quantized Gemma MTP drafter was not created at {draft_path}")
+
+
 def health_ready(host: str, port: int) -> bool:
     try:
         with urllib.request.urlopen(f"http://{host}:{port}/v1/models", timeout=2) as response:
@@ -154,6 +192,7 @@ def main() -> int:
     args = parse_args()
     ensure_jang_target()
     ensure_mtp_runtime()
+    ensure_quantized_mtp_draft_model()
     argv = [
         rapid_python(),
         str(OPENCLAW_DIR / "servers/openclaw-jang-vlm-server.py"),
