@@ -52,6 +52,7 @@ def main() -> int:
     assert helper.memory_gate_reason(args, resident_snap, ready=False).startswith("free=1396MB<3072MB")
     swap_hot = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 3000}
     assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=3000MB>=2048MB")
+    assert 512 < 1396 < 2048, "regression fixture should cover resident-model low-free memory"
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1
