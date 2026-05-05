@@ -16,6 +16,7 @@ from pathlib import Path
 
 from openclaw_speed_research_core import (
     RESULTS_HEADER,
+    complete_task_from_evidence,
     cycle_quality,
     ensure_research_state,
     record_rejection,
@@ -187,7 +188,11 @@ def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
     return "fresh-session"
 
 
-def recovery_instruction(stalled_cycles: int, last_issue: str) -> str:
+def recovery_instruction(
+    stalled_cycles: int,
+    last_issue: str,
+    selected_task: dict[str, object] | None = None,
+) -> str:
     mode = recovery_mode(stalled_cycles, last_issue)
     if mode == "normal":
         return ""
@@ -200,10 +205,13 @@ def recovery_instruction(stalled_cycles: int, last_issue: str) -> str:
             "Use the smallest action that can satisfy that contract."
         )
     if mode == "force-benchmark":
+        action = str((selected_task or {}).get("next_action", "")).strip()
+        if "openclaw-speed-research benchmark --mode" not in action:
+            action = "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft"
         return (
             "\n\nSupervisor recovery: two recent cycles did not produce useful durable progress. "
             "Your next tool call must be exactly "
-            "`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode streaming-ttft` "
+            f"`{action}` "
             "unless memory pressure blocks it. If blocked, append one blocked row to results.tsv and end."
         )
     if mode == "diagnose":
@@ -376,11 +384,12 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "source patch, test result, rejection entry, or explicit blocked row. "
         "Benchmark commands already write results.tsv and benchmark JSON; after running one, do not append another "
         "results row by hand. Use a later cycle for synthesis or task updates. "
+        "Task completion is supervisor-owned: do not manually mark tasks done. "
         "Do not repeat quick-health benchmarks unless comparing variance or validating a changed hypothesis. "
         "No quality artifact means the supervisor will narrow the next cycle automatically."
         f"{task_summary}"
         f"{task_contract}"
-        f"\n\nAutopilot cycle: {cycle}.{pressure}{recovery_instruction(stalled_cycles, last_issue)}"
+        f"\n\nAutopilot cycle: {cycle}.{pressure}{recovery_instruction(stalled_cycles, last_issue, selected_task)}"
     )
 
 
@@ -508,6 +517,7 @@ def main() -> int:
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
+    parser.add_argument("--task-min-samples", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_TASK_MIN_SAMPLES", "3")))
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
     parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "1024")))
@@ -574,11 +584,20 @@ def main() -> int:
             time.sleep(args.sleep_seconds)
             continue
         before = durable_snapshot()
+        selected_task = select_next_task(WORKSPACE)
         code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file)
         after = durable_snapshot()
         progress_reasons = durable_progress(before, after)
         quality = cycle_quality(WORKSPACE, before, after, progress_reasons, issue)
         progressed = int(quality["score"]) >= 2
+        advancement = None
+        if progressed:
+            advancement = complete_task_from_evidence(
+                WORKSPACE,
+                selected_task,
+                min_samples=args.task_min_samples,
+                commit=current_commit(),
+            )
         if progressed:
             progress_cycles += 1
         stalled_cycles = 0 if progressed else stalled_cycles + 1
@@ -592,6 +611,11 @@ def main() -> int:
             f"stalled_cycles={stalled_cycles} issue={last_issue or 'none'} "
             f"quality={quality['status']}:{quality['score']} health={progress_cycles}/{cycle} blocked={blocked_cycles}"
         )
+        if advancement:
+            log(
+                f"cycle={cycle} advanced task={advancement['task_id']} "
+                f"samples={advancement['sample_count']} mode={advancement['benchmark_mode']}"
+            )
         if code not in {0, 124}:
             log(f"agent turn returned nonzero exit={code}; continuing after a short pause")
         if not progressed:

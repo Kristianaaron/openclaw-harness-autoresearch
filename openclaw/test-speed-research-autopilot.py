@@ -84,6 +84,31 @@ def main() -> int:
         task_text = helper.TASKS.read_text(encoding="utf-8")
         assert "baseline-streaming-ttft" in task_text
         assert "streaming-ttft" in helper.next_task_summary()
+        selected = helper.select_next_task(helper.WORKSPACE)
+        assert selected["id"] == "baseline-streaming-ttft"
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            for index, ttft in enumerate(("0.900", "0.880"), start=1):
+                file.write(
+                    f"2026-05-05T00:00:0{index}+0000\tbenchmark-{index}\tkeep\tstreaming-ttft\t"
+                    f"bounded OpenClaw streaming-ttft probe\t{ttft}\t\t\t{ttft}\t1.5\tabc123\tmodel=local\n"
+                )
+        assert helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123") is None
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            file.write(
+                "2026-05-05T00:00:03+0000\tbenchmark-3\tkeep\tstreaming-ttft\t"
+                "bounded OpenClaw streaming-ttft probe\t0.890\t\t\t0.890\t1.5\tabc123\tmodel=local\n"
+            )
+        advancement = helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123")
+        assert advancement is not None
+        assert advancement["task_id"] == "baseline-streaming-ttft"
+        assert advancement["sample_count"] == 3
+        assert advancement["mean_ttft_s"] == 0.89
+        assert helper.select_next_task(helper.WORKSPACE)["id"] == "tool-roundtrip-overhead"
+        recovery_after_advance = helper.continuation_prompt(9, 2, "no durable progress")
+        assert "benchmark --mode tool-roundtrip" in recovery_after_advance
+        assert "baseline-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
+        assert "supervisor advanced" in helper.FINDINGS.read_text(encoding="utf-8")
+        assert "Accepted Baselines" in helper.STRATEGY.read_text(encoding="utf-8")
         before = helper.durable_snapshot()
         helper.IDEAS.write_text("# idea\n", encoding="utf-8")
         helper.BENCHMARKS.mkdir(exist_ok=True)

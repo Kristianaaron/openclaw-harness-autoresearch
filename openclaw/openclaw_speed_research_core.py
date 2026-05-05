@@ -255,6 +255,20 @@ def append_result(
         file.write("\t".join(clean_tsv(item) for item in row) + "\n")
 
 
+def all_result_rows(root: Path) -> list[dict[str, str]]:
+    results = root / "results.tsv"
+    if not results.exists():
+        return []
+    headers = RESULTS_HEADER.rstrip("\n").split("\t")
+    rows: list[dict[str, str]] = []
+    for line in results.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+        values = line.split("\t")
+        if len(values) != len(headers):
+            continue
+        rows.append({headers[index]: values[index] for index in range(len(headers))})
+    return rows
+
+
 def result_rows_since(root: Path, before_line_count: int) -> list[dict[str, str]]:
     results = root / "results.tsv"
     if not results.exists():
@@ -272,6 +286,22 @@ def result_rows_since(root: Path, before_line_count: int) -> list[dict[str, str]
     return rows
 
 
+def parse_float(value: object) -> float | None:
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
 def malformed_result_rows_since(root: Path, before_line_count: int) -> int:
     results = root / "results.tsv"
     if not results.exists():
@@ -281,6 +311,112 @@ def malformed_result_rows_since(root: Path, before_line_count: int) -> int:
         return 0
     expected = len(RESULTS_HEADER.rstrip("\n").split("\t"))
     return sum(1 for line in lines[max(before_line_count, 1) :] if len(line.split("\t")) != expected)
+
+
+def task_evidence_rows(root: Path, task: dict[str, Any]) -> list[dict[str, str]]:
+    mode = str(task.get("benchmark_mode", ""))
+    if not mode:
+        return []
+    return [row for row in all_result_rows(root) if row.get("status") == "keep" and row.get("target") == mode]
+
+
+def append_strategy_note(root: Path, note: str) -> None:
+    path = root / "STRATEGY.md"
+    if not path.exists():
+        path.write_text(strategy_template(), encoding="utf-8")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    section = "## Accepted Baselines\n"
+    if section not in text:
+        text = text.rstrip() + "\n\n" + section + "\n"
+    if note not in text:
+        text = text.rstrip() + "\n\n" + note + "\n"
+        path.write_text(text, encoding="utf-8")
+
+
+def complete_task_from_evidence(
+    root: Path,
+    task: dict[str, Any] | None,
+    *,
+    min_samples: int = 3,
+    commit: str = "unknown",
+) -> dict[str, Any] | None:
+    """Advance benchmark tasks once the supervisor has enough evidence.
+
+    The model should propose ideas; the outer loop owns state transitions. That
+    keeps overnight runs from repeating a completed benchmark forever.
+    """
+    if not task or task.get("status", "ready") not in {"ready", "rework"}:
+        return None
+    next_action = str(task.get("next_action", ""))
+    if "openclaw-speed-research benchmark --mode" not in next_action:
+        return None
+    rows = task_evidence_rows(root, task)
+    if len(rows) < min_samples:
+        return None
+    tasks = read_jsonl(root / "tasks.jsonl")
+    updated = False
+    completed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    ttft_values = [value for row in rows if (value := parse_float(row.get("ttft_s"))) is not None]
+    wall_values = [value for row in rows if (value := parse_float(row.get("wall_s"))) is not None]
+    decode_values = [value for row in rows if (value := parse_float(row.get("decode_tps"))) is not None]
+    summary = {
+        "timestamp": completed_at,
+        "task_id": str(task.get("id", "unknown")),
+        "status": "baseline-recorded",
+        "benchmark_mode": str(task.get("benchmark_mode", "")),
+        "sample_count": len(rows),
+        "mean_ttft_s": mean(ttft_values),
+        "mean_wall_s": mean(wall_values),
+        "mean_decode_tps": mean(decode_values),
+        "commit": commit,
+    }
+    for item in tasks:
+        if item.get("id") != task.get("id"):
+            continue
+        if item.get("status") == "done":
+            return None
+        item["status"] = "done"
+        item["completed_at"] = completed_at
+        item["sample_count"] = len(rows)
+        if summary["mean_ttft_s"] is not None:
+            item["mean_ttft_s"] = summary["mean_ttft_s"]
+        if summary["mean_wall_s"] is not None:
+            item["mean_wall_s"] = summary["mean_wall_s"]
+        if summary["mean_decode_tps"] is not None:
+            item["mean_decode_tps"] = summary["mean_decode_tps"]
+        updated = True
+        break
+    if not updated:
+        return None
+    write_jsonl(root / "tasks.jsonl", tasks)
+    append_jsonl(root / "experiments.jsonl", summary)
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": completed_at,
+            "task_id": summary["task_id"],
+            "finding": (
+                f"{summary['benchmark_mode']} baseline reached {summary['sample_count']} samples; "
+                "supervisor advanced to the next queued task."
+            ),
+            "evidence": summary,
+            "next": "select_next_ready_task",
+        },
+    )
+    metric_bits = []
+    if summary["mean_ttft_s"] is not None:
+        metric_bits.append(f"mean_ttft_s={summary['mean_ttft_s']}")
+    if summary["mean_wall_s"] is not None:
+        metric_bits.append(f"mean_wall_s={summary['mean_wall_s']}")
+    if summary["mean_decode_tps"] is not None:
+        metric_bits.append(f"mean_decode_tps={summary['mean_decode_tps']}")
+    metric_text = " ".join(metric_bits) or "metric=recorded"
+    append_strategy_note(
+        root,
+        f"- `{summary['task_id']}`: {summary['sample_count']} samples for "
+        f"`{summary['benchmark_mode']}`; {metric_text}.",
+    )
+    return summary
 
 
 def select_next_task(root: Path) -> dict[str, Any] | None:
