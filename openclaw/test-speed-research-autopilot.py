@@ -91,6 +91,29 @@ def main() -> int:
     assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=9000MB>=8192MB")
     low_free_resident = {"free_mb": 99, "compressor_mb": 2088, "swap_used_mb": 1559}
     assert helper.memory_gate_reason(args, low_free_resident, ready=True) == ""
+    active_args = Namespace(
+        active_min_free_mb=128,
+        active_max_compressor_mb=6144,
+        active_max_swap_mb=8192,
+        max_compressor_mb=8192,
+        max_swap_mb=8192,
+    )
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 5000, "compressor_mb": 7000, "swap_used_mb": 0},
+    ).startswith("compressor=7000MB")
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 9000},
+    ).startswith("swap=9000MB")
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 77, "compressor_mb": 1000, "swap_used_mb": 0},
+    ).startswith("free=77MB")
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 1000, "compressor_mb": 1000, "swap_used_mb": 0},
+    ) == ""
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1

@@ -431,6 +431,28 @@ def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
         time.sleep(args.memory_wait_seconds)
 
 
+def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int]) -> str:
+    """Abort an in-flight agent turn before macOS/Metal reaches crash territory."""
+    compressor_limit = args.active_max_compressor_mb or args.max_compressor_mb
+    swap_limit = args.active_max_swap_mb or args.max_swap_mb
+    if snap["compressor_mb"] >= compressor_limit:
+        return (
+            f"compressor={snap['compressor_mb']}MB>={compressor_limit}MB "
+            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB"
+        )
+    if snap["swap_used_mb"] >= swap_limit:
+        return (
+            f"swap={snap['swap_used_mb']}MB>={swap_limit}MB "
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB"
+        )
+    if snap["free_mb"] and snap["free_mb"] < args.active_min_free_mb:
+        return (
+            f"free={snap['free_mb']}MB<{args.active_min_free_mb}MB "
+            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
+        )
+    return ""
+
+
 def synthesis_task() -> dict[str, object]:
     return {
         "id": "synthesize-speed-ideas",
@@ -760,6 +782,7 @@ def run_turn(
             next_heartbeat = started + 30
             next_tool_check = started + 1
             next_failure_check = started + 2
+            next_memory_check = started + max(1.0, args.active_memory_check_seconds)
             capped_by_tool_results = False
             while process.poll() is None:
                 now = time.monotonic()
@@ -805,6 +828,14 @@ def run_turn(
                         stop_process_tree(process)
                         return 124, failure
                     next_failure_check = now + 2
+                if args.active_memory_check_seconds > 0 and now >= next_memory_check:
+                    memory_issue = active_memory_circuit_reason(args, memory_snapshot())
+                    if memory_issue:
+                        file.write(f"\nMEMORY CIRCUIT BREAKER after {now - started:.1f}s: {memory_issue}\n")
+                        file.flush()
+                        stop_process_tree(process, terminate_grace_seconds=2)
+                        return 124, f"memory circuit breaker: {memory_issue}"
+                    next_memory_check = now + args.active_memory_check_seconds
                 if tool_result_cap > 0 and now >= next_tool_check:
                     tool_results = max(0, session_tool_result_count(session) - starting_tool_results)
                     if tool_results > 0 and first_new_tool_at == 0.0:
@@ -961,6 +992,10 @@ def main() -> int:
     parser.add_argument("--ready-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_READY_MIN_FREE_MB", "0")))
     parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "8192")))
     parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "8192")))
+    parser.add_argument("--active-memory-check-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MEMORY_CHECK_SECONDS", "5")))
+    parser.add_argument("--active-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MIN_FREE_MB", "128")))
+    parser.add_argument("--active-max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_COMPRESSOR_MB", "6144")))
+    parser.add_argument("--active-max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_SWAP_MB", "8192")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
         "--max-memory-wait-seconds",
