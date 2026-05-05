@@ -95,6 +95,8 @@ def main() -> int:
         active_min_free_mb=128,
         active_max_compressor_mb=6144,
         active_max_swap_mb=8192,
+        active_low_free_pressure_compressor_mb=4096,
+        active_low_free_pressure_swap_mb=2048,
         max_compressor_mb=8192,
         max_swap_mb=8192,
     )
@@ -109,6 +111,10 @@ def main() -> int:
     assert helper.active_memory_circuit_reason(
         active_args,
         {"free_mb": 77, "compressor_mb": 1000, "swap_used_mb": 0},
+    ) == ""
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 77, "compressor_mb": 5000, "swap_used_mb": 0},
     ).startswith("free=77MB")
     assert helper.active_memory_circuit_reason(
         active_args,

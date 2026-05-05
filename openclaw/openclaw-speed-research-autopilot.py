@@ -445,7 +445,14 @@ def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int])
             f"swap={snap['swap_used_mb']}MB>={swap_limit}MB "
             f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB"
         )
-    if snap["free_mb"] and snap["free_mb"] < args.active_min_free_mb:
+    if (
+        snap["free_mb"]
+        and snap["free_mb"] < args.active_min_free_mb
+        and (
+            snap["compressor_mb"] >= args.active_low_free_pressure_compressor_mb
+            or snap["swap_used_mb"] >= args.active_low_free_pressure_swap_mb
+        )
+    ):
         return (
             f"free={snap['free_mb']}MB<{args.active_min_free_mb}MB "
             f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
@@ -996,6 +1003,8 @@ def main() -> int:
     parser.add_argument("--active-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MIN_FREE_MB", "128")))
     parser.add_argument("--active-max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_COMPRESSOR_MB", "6144")))
     parser.add_argument("--active-max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_SWAP_MB", "8192")))
+    parser.add_argument("--active-low-free-pressure-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_LOW_FREE_PRESSURE_COMPRESSOR_MB", "4096")))
+    parser.add_argument("--active-low-free-pressure-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_LOW_FREE_PRESSURE_SWAP_MB", "2048")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
         "--max-memory-wait-seconds",
