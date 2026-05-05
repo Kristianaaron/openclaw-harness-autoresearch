@@ -396,6 +396,7 @@ case "${1:-}" in
     export OPENCLAW_MODEL_MIN_SAFE_FREE_MB="${OPENCLAW_MODEL_MIN_SAFE_FREE_MB:-0}"
     export OPENCLAW_MODEL_MAX_SAFE_COMPRESSOR_MB="${OPENCLAW_MODEL_MAX_SAFE_COMPRESSOR_MB:-8192}"
     export OPENCLAW_MODEL_MAX_SAFE_SWAP_MB="${OPENCLAW_MODEL_MAX_SAFE_SWAP_MB:-8192}"
+    export OPENCLAW_MODEL_START_WAIT_SECONDS="${OPENCLAW_MODEL_START_WAIT_SECONDS:-420}"
     _openclaw_append_default_thinking
     mkdir -p "$log_dir"
     "$speed_research" setup >/dev/null || return $?
