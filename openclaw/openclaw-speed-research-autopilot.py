@@ -34,7 +34,9 @@ BLOCKED_PATTERNS = (
     "memory pressure is too high",
     "memory circuit breaker",
     "fatal process exit",
-    "Metal",
+    "metal command buffer",
+    "metal out of memory",
+    "metal gpu",
     "SSE read timed out",
     "timed out",
 )
@@ -204,18 +206,15 @@ def continuation_prompt(cycle: int, stalled_cycles: int, last_issue: str = "") -
         "Continue OpenClaw Speed Autoresearch autonomously.\n\n"
         f"Workspace: {WORKSPACE}\n"
         f"Program: {PROGRAM}\n\n"
-        "Follow program.md exactly, including Bootstrap Ladder, Narrow Tool Catalog, Current Priority, Realistic Experiment Backlog, "
-        "Implementation Gate, Frontier Speed Track, and Speed Targets.\n\n"
-        "Do one bounded unit of useful work this turn. Prefer realistic backend work over toy prompts: "
+        "Use program.md as the installed policy, but do not read it this turn. Do one bounded unit of useful work. "
+        "Prefer realistic backend work over toy prompts: "
         "Rapid-MLX settings, JANG/JANQ bridge behavior, prefix/cache/prompt shaping, tool-call TTFT, "
         "Metal/KV/cache memory, or grounded frontier proposals toward 50-70 tok/s.\n\n"
-        "If this turn moves from research into source/config implementation, first read "
-        "`/Users/kristian/.openclaw/research/speed/implementation-skill.md` and follow its "
-        "minimal patch, focused test, deploy, benchmark, and results-recording checklist.\n\n"
-        "Allowed narrow bootstrap actions are: read program.md, read README-openclaw-speed.md, read results.tsv, "
-        "run `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`, or run "
-        "`git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
+        "Best next actions are: run `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`, "
+        "read `/Users/kristian/.openclaw/research/speed/results.tsv`, read one named OpenClaw source file, "
+        "or run `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`. "
         "Do not run setup commands, `find`, recursive `ls`, recursive grep, or broad local search.\n\n"
+        "If implementing, first read `/Users/kristian/.openclaw/research/speed/implementation-skill.md`. "
         "Do not touch opencode. Do not change the primary model. Use one narrow tool call per assistant turn. "
         "Do not ask me whether to continue. If a test or benchmark cannot run safely, record blocked evidence "
         "and move to the next implementable item."
@@ -241,6 +240,14 @@ def as_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def session_tool_result_count(session: str) -> int:
+    session_file = OPENCLAW_HOME / "agents" / "main" / "sessions" / f"{session}.jsonl"
+    try:
+        return sum(1 for line in session_file.read_text(encoding="utf-8", errors="replace").splitlines() if '"role":"toolResult"' in line)
+    except OSError:
+        return 0
 
 
 def run_turn(
@@ -272,30 +279,61 @@ def run_turn(
     started = time.monotonic()
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
-        file.write("$ " + " ".join(cmd[:-6] + ["--message", "<prompt>", *cmd[-4:]]) + "\n")
+        file.write("$ " + " ".join(cmd[:5] + ["<prompt>", *cmd[6:]]) + "\n")
         file.flush()
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
                 env=env,
                 text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=args.turn_timeout_seconds + args.turn_timeout_grace_seconds,
+                stdout=file,
+                stderr=subprocess.STDOUT,
             )
-        except subprocess.TimeoutExpired as error:
-            file.write(f"TIMEOUT after {time.monotonic() - started:.1f}s\n")
-            stdout = as_text(error.stdout)
-            stderr = as_text(error.stderr)
-            file.write(stdout[-4000:])
-            file.write(stderr[-4000:])
-            return 124, summarize_issue(stdout, stderr, 124)
-        file.write(result.stdout[-12000:])
-        if result.stderr:
-            file.write("\n--- stderr ---\n")
-            file.write(result.stderr[-12000:])
-        file.write(f"\n===== cycle {cycle} exit {result.returncode} elapsed {time.monotonic() - started:.1f}s =====\n")
-        return result.returncode, summarize_issue(result.stdout, result.stderr, result.returncode)
+            deadline = started + args.turn_timeout_seconds + args.turn_timeout_grace_seconds
+            next_heartbeat = started + 30
+            next_tool_check = started + 5
+            capped_by_tool_results = False
+            while process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    file.write(f"\nTIMEOUT after {now - started:.1f}s\n")
+                    file.flush()
+                    process.kill()
+                    process.wait(timeout=5)
+                    tail = log_file.read_text(encoding="utf-8", errors="replace")[-8000:]
+                    return 124, summarize_issue(tail, "", 124)
+                if now >= next_heartbeat:
+                    log(
+                        f"cycle={cycle} session={session} still running "
+                        f"elapsed={now - started:.0f}s timeout={args.turn_timeout_seconds}s"
+                    )
+                    next_heartbeat = now + 30
+                if args.max_tool_results_per_turn > 0 and now >= next_tool_check:
+                    tool_results = session_tool_result_count(session)
+                    if tool_results >= args.max_tool_results_per_turn:
+                        file.write(
+                            f"\nTOOL RESULT CAP after {tool_results} tool results "
+                            f"and {now - started:.1f}s\n"
+                        )
+                        file.flush()
+                        capped_by_tool_results = True
+                        process.terminate()
+                        try:
+                            process.wait(timeout=8)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        break
+                    next_tool_check = now + 5
+                time.sleep(1)
+        finally:
+            file.flush()
+        returncode = process.returncode if process.returncode is not None else 0
+        if capped_by_tool_results and returncode != 0:
+            returncode = 0
+        file.write(f"\n===== cycle {cycle} exit {returncode} elapsed {time.monotonic() - started:.1f}s =====\n")
+        tail = log_file.read_text(encoding="utf-8", errors="replace")[-12000:]
+        return returncode, summarize_issue(tail, "", returncode)
 
 
 def main() -> int:
@@ -306,12 +344,13 @@ def main() -> int:
     parser.add_argument("--max-hours", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_HOURS", "8")))
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
+    parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "2")))
     parser.add_argument("--sleep-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_SLEEP", "8")))
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
-    parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "3072")))
-    parser.add_argument("--ready-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_READY_MIN_FREE_MB", "512")))
-    parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "4096")))
-    parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "2048")))
+    parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "1024")))
+    parser.add_argument("--ready-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_READY_MIN_FREE_MB", "0")))
+    parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "8192")))
+    parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "8192")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
         "--max-memory-wait-seconds",

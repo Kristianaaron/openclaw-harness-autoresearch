@@ -24,7 +24,7 @@ def load_helper():
 def main() -> int:
     helper = load_helper()
     prompt = helper.continuation_prompt(1, 0)
-    assert "Bootstrap Ladder" in prompt
+    assert "do not read it this turn" in prompt
     assert "Do not touch opencode" in prompt
     assert "openclaw-speed-research benchmark --quick" in prompt
     assert "Do not run setup commands" in prompt
@@ -44,15 +44,18 @@ def main() -> int:
     assert helper.summarize_issue("", "", 124) == "turn timeout"
     assert helper.summarize_issue("", "", 7) == "agent exit 7"
     assert helper.summarize_issue("all good", "", 0) == ""
+    assert helper.summarize_issue("Warming up Metal shaders", "", 0) == ""
+    assert helper.summarize_issue("Metal out of memory while compiling", "", 0) == "metal out of memory"
     assert helper.as_text(b"hello") == "hello"
     assert helper.as_text(None) == ""
-    args = Namespace(min_free_mb=3072, ready_min_free_mb=512, max_compressor_mb=4096, max_swap_mb=2048)
+    args = Namespace(min_free_mb=1024, ready_min_free_mb=0, max_compressor_mb=8192, max_swap_mb=8192)
     resident_snap = {"free_mb": 1396, "compressor_mb": 2088, "swap_used_mb": 1559}
     assert helper.memory_gate_reason(args, resident_snap, ready=True) == ""
-    assert helper.memory_gate_reason(args, resident_snap, ready=False).startswith("free=1396MB<3072MB")
-    swap_hot = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 3000}
-    assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=3000MB>=2048MB")
-    assert 512 < 1396 < 2048, "regression fixture should cover resident-model low-free memory"
+    assert helper.memory_gate_reason(args, {"free_mb": 512, "compressor_mb": 0, "swap_used_mb": 0}, ready=False).startswith("free=512MB<1024MB")
+    swap_hot = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 9000}
+    assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=9000MB>=8192MB")
+    low_free_resident = {"free_mb": 99, "compressor_mb": 2088, "swap_used_mb": 1559}
+    assert helper.memory_gate_reason(args, low_free_resident, ready=True) == ""
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1

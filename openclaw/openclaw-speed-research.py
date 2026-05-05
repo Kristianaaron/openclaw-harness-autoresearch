@@ -327,21 +327,21 @@ Statuses:
 
 ## Bootstrap Ladder
 
-In a fresh run, perform these steps in order. Each step is exactly one assistant turn and exactly one narrow tool call.
+The wrapper and autopilot own workspace bootstrap. Do not spend a model turn reading this full `program.md` unless a human explicitly asks for it.
 
-1. Read exactly `/Users/kristian/.openclaw/research/speed/program.md`.
-2. Read exactly `/Users/kristian/.openclaw/research/speed/README-openclaw-speed.md`.
-3. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
-4. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
-5. Record a TSV row only if the benchmark helper did not already record the result.
+In a fresh agent run, perform one of these narrow actions:
 
-Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only, not required for the first experiment.
+1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+2. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
+3. Run exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
+
+After that, choose the smallest realistic OpenClaw speed/reliability experiment and record the result. Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only.
 
 ## Narrow Tool Catalog
 
 Allowed narrow actions are:
 
-- `read` a single explicit file path from Scope, Bootstrap Ladder, or `sources/queue.md`.
+- `read` a single explicit file path from Scope or `sources/queue.md`.
 - `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 - `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
 - `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
@@ -464,15 +464,15 @@ Do not ask the user to continue after each experiment. Do not ask the user to ma
 def bootstrap_ladder_section() -> str:
     return """## Bootstrap Ladder
 
-In a fresh run, perform these steps in order. Each step is exactly one assistant turn and exactly one narrow tool call.
+The wrapper and autopilot own workspace bootstrap. Do not spend a model turn reading this full `program.md` unless a human explicitly asks for it.
 
-1. Read exactly `/Users/kristian/.openclaw/research/speed/program.md`.
-2. Read exactly `/Users/kristian/.openclaw/research/speed/README-openclaw-speed.md`.
-3. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
-4. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
-5. Record a TSV row only if the benchmark helper did not already record the result.
+In a fresh agent run, perform one of these narrow actions:
 
-Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only, not required for the first experiment.
+1. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
+2. Read exactly `/Users/kristian/.openclaw/research/speed/results.tsv`.
+3. Run exactly `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
+
+After that, choose the smallest realistic OpenClaw speed/reliability experiment and record the result. Do not run setup commands during bootstrap. The workspace already exists. Do not use `find`, recursive `ls`, recursive grep, or broad local search. Do not read `reference/autoresearch/program.md` during bootstrap; it is method reference only.
 """
 
 
@@ -481,7 +481,7 @@ def narrow_tool_catalog_section() -> str:
 
 Allowed narrow actions are:
 
-- `read` a single explicit file path from Scope, Bootstrap Ladder, or `sources/queue.md`.
+- `read` a single explicit file path from Scope or `sources/queue.md`.
 - `exec` one exact command against the OpenClaw source repo, such as `git -C /Users/kristian/Documents/openclaw-harness-autoresearch status --short --branch`.
 - `exec` one exact test file, such as `python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py`.
 - `exec` one exact benchmark helper, such as `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`.
@@ -589,11 +589,13 @@ def prompt_text(root: Path) -> str:
 
 Workspace: {root}
 
-First assistant action: read exactly this file and nothing else:
-`{root / 'program.md'}`
+First assistant action: run exactly this narrow benchmark command:
+`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick`
 
-After that, follow the Bootstrap Ladder in `program.md` exactly. The next action after reading `program.md` is to read exactly:
-`{root / 'README-openclaw-speed.md'}`
+Then read exactly:
+`{root / 'results.tsv'}`
+
+Do not read the full `program.md` unless a human explicitly asks. It is installed policy, not first-turn context.
 
 Hard constraints:
 - OpenClaw only. Do not touch opencode.
@@ -711,6 +713,24 @@ def benchmark(args: argparse.Namespace) -> int:
     }
     out = root / "benchmarks" / f"benchmark-{result['timestamp']}.json"
     out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    results = root / "results.tsv"
+    write_if_missing(results, RESULTS_HEADER)
+    row = [
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        f"benchmark-{result['timestamp']}",
+        "keep",
+        "quick-benchmark" if args.quick else "benchmark",
+        "bounded OpenClaw model latency probe",
+        "",
+        "",
+        "",
+        result["wall_s"],
+        "",
+        current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        f"model={model} preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}",
+    ]
+    with results.open("a", encoding="utf-8") as file:
+        file.write("\t".join(str(item).replace("\t", " ").replace("\n", " ") for item in row) + "\n")
     print(json.dumps(result, indent=2))
     return 0
 
