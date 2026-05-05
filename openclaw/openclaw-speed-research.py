@@ -798,11 +798,27 @@ def mean_value(values: list[float]) -> float | None:
 def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     path = root / "tasks.jsonl"
     existing = read_jsonl(path)
-    existing_ids = {str(task.get("id", "")) for task in existing}
-    additions = [task for task in tasks if str(task.get("id", "")) not in existing_ids]
-    if additions:
-        write_jsonl(path, existing + additions)
-    return len(additions)
+    existing_by_id = {str(task.get("id", "")): index for index, task in enumerate(existing)}
+    additions = 0
+    changed = False
+    for task in tasks:
+        task_id = str(task.get("id", ""))
+        if task_id not in existing_by_id:
+            existing.append(task)
+            additions += 1
+            changed = True
+            continue
+        index = existing_by_id[task_id]
+        current = existing[index]
+        if current.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        merged = {**current, **task, "status": current.get("status", task.get("status", "ready"))}
+        if merged != current:
+            existing[index] = merged
+            changed = True
+    if changed:
+        write_jsonl(path, existing)
+    return additions
 
 
 def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -890,8 +906,10 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "rollback": "Revert only the prompt-shape/compaction patch and record discard if semantic context is lost.",
             "evidence": prompt_tokens or "prompt-size rows exist in results.tsv",
             "next_action": (
-                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then make the smallest "
-                "OpenClaw-only prompt compaction/reporting patch and run python3 openclaw/test-speed-research.py."
+                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
+                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
+                "Patch only openclaw/openclaw-speed-research.py and openclaw/test-speed-research.py, then run exactly "
+                "python3 openclaw/test-speed-research.py."
             ),
         },
         {
@@ -909,8 +927,9 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "rollback": "Remove the profile planner if it creates ambiguous or unsafe profile recommendations.",
             "evidence": speed_gap,
             "next_action": (
-                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then implement a dry-run "
-                "Rapid profile scoring/planning helper; do not change live model settings in the same patch."
+                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
+                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
+                "Implement a dry-run Rapid profile scoring/planning helper only; do not change live model settings."
             ),
         },
         {
@@ -928,8 +947,9 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "rollback": "Remove the compatibility probe if it cannot distinguish safe from unsafe draft/helper paths.",
             "evidence": speed_gap,
             "next_action": (
-                "Read /Users/kristian/.openclaw/research/speed/implementation-skill.md, then add a dry-run "
-                "compatibility probe only; do not enable speculative decoding automatically."
+                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
+                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
+                "Add a dry-run compatibility probe only; do not enable speculative decoding automatically."
             ),
         },
     ]

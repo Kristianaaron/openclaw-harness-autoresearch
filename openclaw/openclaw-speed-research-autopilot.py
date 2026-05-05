@@ -271,6 +271,58 @@ def append_supervisor_result(cycle: int, session: str, status: str, issue: str) 
         file.write("\t".join(clean_tsv(item) for item in row) + "\n")
 
 
+def recent_task_rejections(task_id: str, reason: str, limit: int = 3) -> int:
+    if not task_id:
+        return 0
+    rows = read_jsonl(REJECTIONS)
+    count = 0
+    for row in reversed(rows):
+        if row.get("task_id") != task_id:
+            continue
+        if reason and row.get("reason") != reason:
+            continue
+        count += 1
+        if count >= limit:
+            return count
+    return count
+
+
+def block_task_after_repeated_guard(task: dict[str, object] | None, reason: str, *, threshold: int = 3) -> bool:
+    if not task or task.get("task_type") != "implementation":
+        return False
+    if reason != "OpenClaw blocked a broad local tool command":
+        return False
+    task_id = str(task.get("id", ""))
+    if recent_task_rejections(task_id, reason, limit=threshold) < threshold:
+        return False
+    tasks = read_jsonl(TASKS)
+    changed = False
+    blocked_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for item in tasks:
+        if item.get("id") != task_id:
+            continue
+        item["status"] = "blocked"
+        item["blocked_at"] = blocked_at
+        item["blocked_reason"] = reason
+        item["next"] = "supervisor moved on after repeated guard blocks; refine task into narrower exact file/tool steps"
+        changed = True
+        break
+    if not changed:
+        return False
+    write_jsonl(TASKS, tasks)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": blocked_at,
+            "task_id": task_id,
+            "finding": "implementation task blocked repeatedly by broad-command guard; supervisor marked it blocked and moved on",
+            "reason": reason,
+            "next": "select_next_ready_task",
+        },
+    )
+    return True
+
+
 def memory_snapshot() -> dict[str, int]:
     snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
     try:
@@ -934,12 +986,19 @@ def main() -> int:
             record_rejection(
                 WORKSPACE,
                 cycle=cycle,
-                task_id=str((select_next_task(WORKSPACE) or {}).get("id", "unknown")),
+                task_id=str((selected_task or select_next_task(WORKSPACE) or {}).get("id", "unknown")),
                 reason=str(quality["reason"]),
                 evidence=",".join(progress_reasons) if progress_reasons else last_issue,
             )
             append_supervisor_result(cycle, current_session, "blocked", last_issue)
             log(f"cycle={cycle} recorded supervisor blocked row for issue={last_issue}")
+            if block_task_after_repeated_guard(selected_task, last_issue):
+                log(
+                    f"cycle={cycle} blocked implementation task={selected_task.get('id', 'unknown')} "
+                    "after repeated broad-command guard hits; moving to next task"
+                )
+                stalled_cycles = 0
+                last_issue = ""
         if (
             args.rotate_session_after_stalls > 0
             and stalled_cycles >= args.rotate_session_after_stalls

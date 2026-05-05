@@ -105,6 +105,7 @@ def main() -> int:
             assert "implement-rapid-profile-bandit-plan" in tasks
             assert "implement-speculative-pld-compat-probe" in tasks
             assert '"task_type": "implementation"' in tasks
+            assert "First tool call: read exactly" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
             assert "synthesize-speed-ideas" in findings
             assert "implementation_candidates" in findings

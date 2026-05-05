@@ -217,6 +217,29 @@ def main() -> int:
         assert text.startswith("timestamp\trun_id\tstatus")
         assert "autopilot-cycle-7" in text
         assert "session=nightly issue=memory gate still hot retry" in text
+        repeated_task = {
+            "id": "blocked-impl",
+            "status": "ready",
+            "task_type": "implementation",
+            "target": "openclaw/example.py",
+        }
+        helper.write_jsonl(helper.TASKS, [repeated_task])
+        for cycle in range(1, 4):
+            helper.record_rejection(
+                helper.WORKSPACE,
+                cycle=cycle,
+                task_id="blocked-impl",
+                reason="OpenClaw blocked a broad local tool command",
+                evidence="blocked",
+            )
+        assert helper.block_task_after_repeated_guard(
+            repeated_task,
+            "OpenClaw blocked a broad local tool command",
+            threshold=3,
+        )
+        blocked_text = helper.TASKS.read_text(encoding="utf-8")
+        assert '"status": "blocked"' in blocked_text
+        assert "implementation task blocked" in helper.FINDINGS.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
