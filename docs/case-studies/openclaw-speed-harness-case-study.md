@@ -85,6 +85,31 @@ Interpretation: speed is stable enough to benchmark, but the MTP path still
 looks inefficient. Moderate acceptance with high MTP round counts suggests
 drafting overhead may be eating a meaningful part of the theoretical speedup.
 
+## Completed Autoresearch Run - 2026-05-06
+
+The overnight/autonomous run completed all 80 requested cycles after the gateway
+recovery hardening.
+
+- result rows after start: 80 `keep`, 10 `blocked`;
+- decode benchmark samples: 30;
+- mean decode speed: `14.499 tok/s`;
+- min/max decode speed: `14.160-14.677 tok/s`;
+- final 5 decode samples: `14.585`, `14.659`, `14.280`, `14.586`,
+  `14.583 tok/s`;
+- final MTP review: `mean_accept=0.56`, `mean_mtp_rounds=128.0`;
+- gateway embedded fallback loop did not recur.
+
+Quality judgment: the run was healthy as a supervisor/benchmark loop and useful
+as measurement evidence. It was not yet strong enough as an implementation loop:
+every implementation bridge task blocked with `no durable artifact`, and the
+drafter block-size work produced repeatable sweep plans rather than executing a
+paired sweep.
+
+Next engineering step: make the drafter block-size sweep supervisor-owned and
+executable, with paired measurements for block sizes 1, 2, 3, and 4, plus a
+no-drafter control if the backend can expose one safely. Do not rely on the LLM
+to turn the sweep plan into benchmark execution.
+
 ## Open Questions
 
 - Can the supervisor execute the full drafter block-size sweep rather than only

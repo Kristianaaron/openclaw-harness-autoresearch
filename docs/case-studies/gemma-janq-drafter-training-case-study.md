@@ -65,6 +65,29 @@ not yet fit tightly enough to deliver the desired larger speedup. The next
 training work should focus on increasing acceptance per verification round, not
 just enabling a bigger drafter.
 
+## Completed Autoresearch Run - 2026-05-06
+
+The completed 80-cycle autoresearch run produced stable drafter-path evidence:
+
+- 30 normal decode benchmark samples;
+- mean decode speed: `14.499 tok/s`;
+- min/max decode speed: `14.160-14.677 tok/s`;
+- final MTP review: `mean_accept=0.56`, `mean_mtp_rounds=128.0`,
+  `mean_tok_s=11.386`;
+- repeated focused tests passed during the run;
+- no gateway fallback loop was observed in the final run.
+
+The bottleneck is now more specific: the current drafter path is stable but not
+accepting enough tokens per verification round to reach the desired 30+ tok/s
+range. The autoresearch loop repeatedly identified `mtp-acceptance-bottleneck`,
+`drafter-block-and-quant-sweep`, and `mlx-vlm-mtp-loop-overhead` as top-ranked
+ideas, but it did not implement them.
+
+Next training step: execute the drafter sweep deterministically instead of
+generating another plan. The promotion gate should compare each variant against
+the current live default and reject every change unless wall-clock decode speed,
+acceptance, stream safety, tool safety, and reasoning-loop guards all pass.
+
 ## Training Loop Design
 
 The drafter training/calibration loop should be staged:
