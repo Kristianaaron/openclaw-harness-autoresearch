@@ -18,6 +18,7 @@ runtime_deps_guard="$HOME/.openclaw/bin/openclaw-runtime-deps-guard"
 prefix_warmer="$HOME/.openclaw/bin/openclaw-prefix-warmer"
 speed_research="$HOME/.openclaw/bin/openclaw-speed-research"
 drafter_fit="$HOME/.openclaw/bin/openclaw-drafter-fit"
+mtp_calibrator="$HOME/.openclaw/bin/openclaw-mtp-drafter-calibrate"
 
 ok=0
 
@@ -92,6 +93,7 @@ check "runtime deps guard" /bin/test -x "$runtime_deps_guard"
 check "prefix warmer" /bin/test -x "$prefix_warmer"
 check "speed research helper" /bin/test -x "$speed_research"
 check "drafter fit helper" /bin/test -x "$drafter_fit"
+check "MTP drafter calibrator" /bin/test -x "$mtp_calibrator"
 check "generic model LaunchAgent" /usr/bin/plutil -lint "$HOME/Library/LaunchAgents/local.openclaw-model-server.plist"
 check "stale jang server removed" /bin/test ! -e "$HOME/.openclaw/servers/jang_server.py"
 check_bundle_syntax "tui submit syntax" "tui-*.js" "tui-cli-*.js" "tui-backend-*.js"

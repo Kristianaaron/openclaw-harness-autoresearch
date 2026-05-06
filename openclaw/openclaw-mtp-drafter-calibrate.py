@@ -13,6 +13,7 @@ import argparse
 import json
 import random
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,74 @@ DEFAULT_PROMPTS = [
 
 def log(message: str) -> None:
     print(f"[openclaw-mtp-calibrate] {message}", flush=True)
+
+
+def memory_snapshot() -> dict[str, int]:
+    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
+    try:
+        vm_stat = subprocess.check_output(["/usr/bin/vm_stat"], text=True, stderr=subprocess.DEVNULL)
+        page_size = 16384
+        free_pages = speculative_pages = compressor_pages = 0
+        for line in vm_stat.splitlines():
+            if "page size of" in line:
+                digits = "".join(ch for ch in line if ch.isdigit())
+                if digits:
+                    page_size = int(digits)
+            elif line.startswith("Pages free:"):
+                free_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+            elif line.startswith("Pages speculative:"):
+                speculative_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+            elif line.startswith("Pages occupied by compressor:"):
+                compressor_pages = int(line.split(":", 1)[1].strip().rstrip("."))
+        snapshot["free_mb"] = int((free_pages + speculative_pages) * page_size / 1048576)
+        snapshot["compressor_mb"] = int(compressor_pages * page_size / 1048576)
+    except Exception:
+        pass
+    try:
+        swap = subprocess.check_output(["/usr/sbin/sysctl", "-n", "vm.swapusage"], text=True, stderr=subprocess.DEVNULL)
+        # Format: total = 2048.00M  used = 481.31M  free = ...
+        parts = swap.replace("M", "").split()
+        if "used" in parts:
+            used_index = parts.index("used")
+            if used_index + 2 < len(parts):
+                snapshot["swap_used_mb"] = int(float(parts[used_index + 2]))
+    except Exception:
+        pass
+    return snapshot
+
+
+def memory_block_reason(args: argparse.Namespace, *, phase: str) -> str:
+    snap = memory_snapshot()
+    if snap["free_mb"] and snap["free_mb"] < args.min_free_mb:
+        return f"{phase}: free={snap['free_mb']}MB<{args.min_free_mb}MB"
+    if snap["compressor_mb"] >= args.max_compressor_mb:
+        return f"{phase}: compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB"
+    if snap["swap_used_mb"] >= args.max_swap_mb:
+        return f"{phase}: swap={snap['swap_used_mb']}MB>={args.max_swap_mb}MB"
+    return ""
+
+
+def require_memory_safe(args: argparse.Namespace, *, phase: str) -> None:
+    reason = memory_block_reason(args, phase=phase)
+    if reason:
+        raise RuntimeError(f"calibration memory gate blocked: {reason}")
+
+
+def configure_mlx_limits(args: argparse.Namespace) -> None:
+    try:
+        if mx.metal.is_available():
+            info = mx.device_info()
+            recommended = info.get("max_recommended_working_set_size", info.get("memory_size", 0))
+            if recommended:
+                mx.set_memory_limit(int(recommended * args.gpu_memory_utilization))
+            mx.set_cache_limit(int(args.mlx_cache_gb * 1024**3))
+            log(
+                "MLX limits configured "
+                f"gpu_memory_utilization={args.gpu_memory_utilization:.2f} "
+                f"cache={args.mlx_cache_gb:.1f}GB"
+            )
+    except Exception as error:
+        log(f"MLX limit configuration skipped: {error}")
 
 
 def copy_metadata(source: Path, destination: Path) -> None:
@@ -200,8 +269,11 @@ def train(args: argparse.Namespace) -> int:
     random.seed(args.seed)
     source = Path(args.drafter_path).expanduser()
     output = Path(args.output_path).expanduser()
+    require_memory_safe(args, phase="preflight")
+    configure_mlx_limits(args)
     log("loading JANQ target and BF16 drafter")
     model, processor, drafter = load_target_and_drafter(args.target_path, args.drafter_path)
+    require_memory_safe(args, phase="after-load")
 
     drafter.freeze()
     drafter.pre_projection.unfreeze()
@@ -226,8 +298,11 @@ def train(args: argparse.Namespace) -> int:
         f"train_prompts={len(train_prompts)} eval_prompts={len(eval_prompts)} "
         f"positions_per_prompt={args.positions_per_prompt}"
     )
+    require_memory_safe(args, phase="before-trace-build")
     train_traces = build_traces(model, processor, train_prompts, args.positions_per_prompt)
+    require_memory_safe(args, phase="after-train-traces")
     eval_traces = build_traces(model, processor, eval_prompts, args.positions_per_prompt)
+    require_memory_safe(args, phase="after-eval-traces")
     baseline = acceptance(drafter, eval_traces)
     log(f"baseline first-draft acceptance={baseline:.3f}")
 
@@ -242,6 +317,8 @@ def train(args: argparse.Namespace) -> int:
     best_params = drafter.parameters()
     start = time.monotonic()
     for step in range(1, args.steps + 1):
+        if step == 1 or step % max(1, args.memory_check_every) == 0:
+            require_memory_safe(args, phase=f"train-step-{step}")
         trace = train_traces[(step - 1) % len(train_traces)]
         loss, grads = loss_and_grad(drafter, trace)
         optimizer.update(drafter, grads)
@@ -276,7 +353,21 @@ def train(args: argparse.Namespace) -> int:
     return 0
 
 
-def parse_args() -> argparse.Namespace:
+def write_blocked(output_path: str, reason: str) -> None:
+    try:
+        output = Path(output_path).expanduser()
+        output.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "status": "blocked",
+            "reason": reason,
+            "timestamp": int(time.time()),
+        }
+        (output / "openclaw-calibration-blocked.json").write_text(json.dumps(payload, indent=2) + "\n")
+    except Exception as error:
+        log(f"could not write blocked calibration artifact: {error}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune a Gemma MTP drafter against OpenClaw JANQ traces.")
     parser.add_argument("--target-path", required=True)
     parser.add_argument("--drafter-path", required=True)
@@ -289,11 +380,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=6)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=7)
-    return parser.parse_args()
+    parser.add_argument("--min-free-mb", type=int, default=12288)
+    parser.add_argument("--max-compressor-mb", type=int, default=4096)
+    parser.add_argument("--max-swap-mb", type=int, default=1024)
+    parser.add_argument("--memory-check-every", type=int, default=2)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
+    parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
+    return parser.parse_args(argv)
+
+
+def run_with_args(args: argparse.Namespace) -> int:
+    try:
+        return train(args)
+    except RuntimeError as error:
+        reason = str(error)
+        log(reason)
+        write_blocked(args.output_path, reason)
+        return 2
+    except MemoryError:
+        reason = "calibration aborted before memory exhaustion could crash Metal/Python"
+        log(reason)
+        write_blocked(args.output_path, reason)
+        return 2
+    except Exception as error:
+        reason = f"calibration failed safely: {type(error).__name__}: {error}"
+        log(reason)
+        write_blocked(args.output_path, reason)
+        return 2
+
+
+def main_with_args_for_test(argv: list[str]) -> int:
+    return run_with_args(parse_args(argv))
 
 
 def main() -> int:
-    return train(parse_args())
+    return run_with_args(parse_args())
 
 
 if __name__ == "__main__":
