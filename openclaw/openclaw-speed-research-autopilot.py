@@ -413,6 +413,15 @@ def is_supervisor_focused_test_task(task: dict[str, object] | None) -> bool:
     return task.get("supervisor_action") == "focused-test"
 
 
+def is_supervisor_gepa_policy_canary_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "gepa-policy-canary"
+        or "openclaw-speed-research gepa-policy-canary" in str(task.get("next_action", ""))
+    )
+
+
 def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -1897,6 +1906,48 @@ def run_supervisor_focused_test_task(
     return result.returncode, "" if result.returncode == 0 else notes
 
 
+def run_supervisor_gepa_policy_canary_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [
+        args.research_helper_bin,
+        "gepa-policy-canary",
+        "--task-id",
+        str(task.get("id", "")),
+    ]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor GEPA policy canary "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=args.gepa_canary_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR GEPA POLICY CANARY TIMEOUT\n")
+            return 124, "supervisor GEPA policy canary timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor GEPA policy canary exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    return 0, ""
+
+
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
     if is_gateway_issue(text) and "recovered" not in text.lower():
@@ -2015,6 +2066,22 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
             str(args.review_min_samples_per_block),
         ]
     )
+    commands.append(
+        [
+            args.research_helper_bin,
+            "gepa-escalation",
+            "--recent-rows",
+            str(args.review_recent_rows),
+            "--min-blocked",
+            str(args.gepa_min_blocked),
+            "--min-rework",
+            str(args.gepa_min_rework),
+            "--min-trajectory",
+            str(args.gepa_min_trajectory),
+            "--min-low-quality",
+            str(args.gepa_min_low_quality),
+        ]
+    )
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} supervisor quality review =====\n")
         for cmd in commands:
@@ -2096,6 +2163,11 @@ def main() -> int:
     parser.add_argument("--review-min-sweeps", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SWEEPS", "3")))
     parser.add_argument("--review-min-samples-per-block", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SAMPLES_PER_BLOCK", "3")))
     parser.add_argument("--review-target-tps", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TARGET_TPS", "30")))
+    parser.add_argument("--gepa-min-blocked", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_BLOCKED", "3")))
+    parser.add_argument("--gepa-min-rework", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_REWORK", "2")))
+    parser.add_argument("--gepa-min-trajectory", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_TRAJECTORY", "2")))
+    parser.add_argument("--gepa-min-low-quality", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_LOW_QUALITY", "2")))
+    parser.add_argument("--gepa-canary-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_CANARY_TIMEOUT", "30")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
@@ -2227,6 +2299,8 @@ def main() -> int:
             code, issue = run_supervisor_patch_execute_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_focused_test_task(selected_task):
             code, issue = run_supervisor_focused_test_task(cycle, current_session, selected_task, log_file)
+        elif is_supervisor_gepa_policy_canary_task(selected_task):
+            code, issue = run_supervisor_gepa_policy_canary_task(args, cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):
             code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
         elif is_supervisor_benchmark_task(selected_task):

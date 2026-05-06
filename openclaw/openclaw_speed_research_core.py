@@ -20,6 +20,13 @@ RESULTS_HEADER = (
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
 BENCHMARK_MANIFEST_VERSION = 1
+GEPA_POLICY_TARGETS = (
+    "program.md",
+    "STRATEGY.md",
+    "insight-rubric.json",
+    "implementation-skill.md",
+    "tasks.jsonl",
+)
 DEFAULT_BENCHMARK_MANIFEST: dict[str, Any] = {
     "version": BENCHMARK_MANIFEST_VERSION,
     "locked": True,
@@ -325,7 +332,14 @@ def ensure_research_state(root: Path) -> None:
         normalize_results_ledger(root / "results.tsv")
     if not (root / "STRATEGY.md").exists():
         (root / "STRATEGY.md").write_text(strategy_template(), encoding="utf-8")
-    for name in ("findings.jsonl", "experiments.jsonl", "rejections.jsonl", "journal.jsonl", "trajectory-corpus.jsonl"):
+    for name in (
+        "findings.jsonl",
+        "experiments.jsonl",
+        "rejections.jsonl",
+        "journal.jsonl",
+        "trajectory-corpus.jsonl",
+        "gepa-candidates.jsonl",
+    ):
         path = root / name
         if not path.exists():
             path.write_text("", encoding="utf-8")
@@ -750,6 +764,247 @@ def mark_lane_exhausted(root: Path, *, lane: str, reason: str, evidence: dict[st
         },
     )
     return True
+
+
+def slugify(value: object) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return slug[:80] or "item"
+
+
+def upsert_task(root: Path, task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    if not task_id:
+        return False
+    path = root / "tasks.jsonl"
+    tasks = read_jsonl(path)
+    for index, existing in enumerate(tasks):
+        if str(existing.get("id", "")) != task_id:
+            continue
+        if existing.get("status", "ready") not in {"ready", "rework"}:
+            return False
+        merged = {**existing, **task, "status": existing.get("status", task.get("status", "ready"))}
+        if merged == existing:
+            return False
+        tasks[index] = merged
+        write_jsonl(path, tasks)
+        return True
+    tasks.append(task)
+    write_jsonl(path, tasks)
+    return True
+
+
+def count_low_quality_rows(rows: list[dict[str, str]]) -> int:
+    count = 0
+    for row in rows:
+        if row.get("target") != "autoresearch-quality":
+            continue
+        notes = row.get("notes", "")
+        fields = parse_note_fields(notes)
+        score = parse_float(fields.get("score"))
+        if row.get("status") == "blocked" or (score is not None and score < 70):
+            count += 1
+    return count
+
+
+def choose_gepa_policy_target(
+    *,
+    blocked_rows: int,
+    low_quality_rows: int,
+    rework_tasks: int,
+    trajectory_cases: int,
+    artifact_suspected: bool,
+    exhausted_count: int,
+) -> str:
+    if artifact_suspected or low_quality_rows:
+        return "insight-rubric.json"
+    if rework_tasks or trajectory_cases:
+        return "program.md"
+    if exhausted_count:
+        return "STRATEGY.md"
+    if blocked_rows:
+        return "tasks.jsonl"
+    return "implementation-skill.md"
+
+
+def gepa_escalation_report(
+    root: Path,
+    *,
+    recent_rows: int = 160,
+    min_blocked: int = 3,
+    min_rework: int = 2,
+    min_trajectory: int = 2,
+    min_low_quality: int = 2,
+) -> dict[str, Any]:
+    """Detect when normal routing is stuck and draft a bounded policy canary.
+
+    This is GEPA-inspired: optimize textual policies/rubrics from trajectory
+    evidence. It intentionally avoids a live dependency or runtime mutation.
+    """
+    ensure_research_state(root)
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    blocked = [row for row in rows if row.get("status") == "blocked"]
+    low_quality = count_low_quality_rows(rows)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    rework = [
+        task
+        for task in tasks
+        if task.get("status") == "rework" or int(task.get("rework_attempts") or 0) > 0
+    ]
+    trajectory = read_jsonl(root / "trajectory-corpus.jsonl")[-max(1, recent_rows) :]
+    artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
+    exhausted = exhausted_lanes(root)
+    triggers: list[dict[str, Any]] = []
+    if len(blocked) >= min_blocked:
+        triggers.append({"name": "blocked_rows", "value": len(blocked), "threshold": min_blocked})
+    if len(rework) >= min_rework:
+        triggers.append({"name": "rework_tasks", "value": len(rework), "threshold": min_rework})
+    if len(trajectory) >= min_trajectory:
+        triggers.append({"name": "trajectory_cases", "value": len(trajectory), "threshold": min_trajectory})
+    if low_quality >= min_low_quality:
+        triggers.append({"name": "low_quality_reviews", "value": low_quality, "threshold": min_low_quality})
+    if artifact.get("artifact_suspected"):
+        triggers.append({"name": "measurement_artifact", "value": True, "threshold": "false"})
+
+    target = choose_gepa_policy_target(
+        blocked_rows=len(blocked),
+        low_quality_rows=low_quality,
+        rework_tasks=len(rework),
+        trajectory_cases=len(trajectory),
+        artifact_suspected=bool(artifact.get("artifact_suspected")),
+        exhausted_count=len(exhausted),
+    )
+    needed = bool(triggers)
+    trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
+    candidate_id = f"gepa-policy-canary-{slugify(target)}-{slugify(trigger_signature)}"
+    candidate = {
+        "id": candidate_id,
+        "target": target,
+        "allowed_targets": list(GEPA_POLICY_TARGETS),
+        "policy_kind": "gepa-inspired-text-policy-canary",
+        "objective": (
+            "Improve autoresearch routing, rubric quality, and implementation handoff using "
+            "recent blocked/rework trajectories while preserving OpenClaw runtime behavior."
+        ),
+        "constraints": [
+            "OpenClaw only; do not touch opencode.",
+            "Do not change the selected model.",
+            "Do not mutate live runtime or model profile from this candidate.",
+            "Canary artifact first; promotion must use existing replay, patch, and approval gates.",
+        ],
+        "promotion_gates": [
+            "replay_checks_ok",
+            "quality_review_not_worse",
+            "no_new_broad_tool_commands",
+            "no_memory_or_metal_guard_regression",
+            "human_approval_for_architectural_policy_change",
+        ],
+    }
+    return {
+        "ok": True,
+        "kind": "gepa-escalation",
+        "needed": needed,
+        "triggers": triggers,
+        "candidate": candidate if needed else {},
+        "recent_rows": len(rows),
+        "blocked_rows": len(blocked),
+        "low_quality_reviews": low_quality,
+        "rework_tasks": len(rework),
+        "trajectory_cases": len(trajectory),
+        "exhausted_lanes": sorted(exhausted),
+        "measurement_artifact": artifact,
+        "next": "write_canary_candidate" if needed else "continue_default_supervisor_route",
+    }
+
+
+def seed_gepa_canary_task(root: Path, report: dict[str, Any]) -> bool:
+    if not report.get("needed"):
+        return False
+    candidate = report.get("candidate", {})
+    if not isinstance(candidate, dict):
+        return False
+    task_id = str(candidate.get("id", ""))
+    target = str(candidate.get("target", "program.md"))
+    task = {
+        "id": task_id,
+        "status": "ready",
+        "priority": 97,
+        "lane": "policy-optimization",
+        "task_type": "supervisor",
+        "supervisor_action": "gepa-policy-canary",
+        "target": target,
+        "hypothesis": "A bounded GEPA-style policy canary can improve routing quality after repeated blocked/rework trajectories.",
+        "metric": "autoresearch_quality_delta",
+        "guard_checks": [
+            "no_runtime_mutation",
+            "no_model_change",
+            "no_opencode_changes",
+            "replay_required",
+            "canary_only",
+        ],
+        "gepa_candidate": candidate,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research gepa-policy-canary",
+    }
+    changed = upsert_task(root, task)
+    if changed:
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": task_id,
+                "finding": "GEPA-style supervisor escalation seeded a bounded policy canary task",
+                "evidence": report,
+                "next": "run_gepa_policy_canary",
+            },
+        )
+    return changed
+
+
+def write_gepa_policy_canary(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    ensure_research_state(root)
+    candidate = task.get("gepa_candidate")
+    if not isinstance(candidate, dict) or not candidate:
+        candidate = {
+            "id": str(task.get("id", "gepa-policy-canary")),
+            "target": str(task.get("target", "program.md")),
+            "policy_kind": "gepa-inspired-text-policy-canary",
+            "constraints": ["canary_only"],
+            "promotion_gates": ["replay_checks_ok"],
+        }
+    target = str(candidate.get("target") or task.get("target") or "program.md")
+    if target not in GEPA_POLICY_TARGETS:
+        target = "program.md"
+    source_path = root / target
+    if ":" in target:
+        source_path = root / target.split(":", 1)[0]
+    source_preview = ""
+    if source_path.exists() and source_path.is_file():
+        source_preview = source_path.read_text(encoding="utf-8", errors="replace")[:4000]
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task_id": str(task.get("id", candidate.get("id", "gepa-policy-canary"))),
+        "status": "canary-recorded",
+        "candidate": candidate,
+        "source_preview": source_preview,
+        "proposed_policy_delta": {
+            "target": target,
+            "change_type": "text_policy_candidate",
+            "instruction": (
+                "Use the recent trajectory failures to tighten one policy/rubric decision. "
+                "The candidate must make the next cycle more deterministic without widening file access, "
+                "changing the model, or bypassing canary/promotion gates."
+            ),
+        },
+        "promotion": {
+            "auto_promote": False,
+            "reason": "GEPA policy candidates remain canary-only until replay, review, and explicit approval gates pass.",
+        },
+    }
+    canary_dir = root / "gepa-canaries"
+    canary_dir.mkdir(parents=True, exist_ok=True)
+    path = canary_dir / f"{slugify(payload['task_id'])}-{int(time.time())}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(root / "gepa-candidates.jsonl", {**payload, "path": str(path), "source_preview": source_preview[:500]})
+    return {"ok": True, "path": str(path), **payload}
 
 
 def stddev(values: list[float]) -> float:

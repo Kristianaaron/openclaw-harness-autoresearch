@@ -29,6 +29,7 @@ from openclaw_speed_research_core import (
     benchmark_spec,
     ensure_research_state,
     exhausted_lanes,
+    gepa_escalation_report,
     mark_lane_exhausted,
     measurement_artifact_analysis,
     load_benchmark_manifest,
@@ -36,7 +37,9 @@ from openclaw_speed_research_core import (
     read_jsonl,
     replay_checks,
     score_insight,
+    seed_gepa_canary_task,
     variance_analysis,
+    write_gepa_policy_canary,
     write_jsonl,
 )
 
@@ -777,6 +780,19 @@ Before pushing, run a staged diff secret scan and confirm no `.env`, passwords, 
 """
 
 
+def dynamic_policy_optimization_section() -> str:
+    return """## Dynamic Policy Optimization
+
+GEPA-style policy optimization is a supervisor reflex, not a default mode.
+
+The deterministic supervisor may run `gepa-escalation` after quality and frontier review. It should only escalate when recent evidence shows repeated blocked rows, rework tasks, trajectory failures, low-quality reviews, or measurement artifacts.
+
+Escalation creates a bounded policy canary for `program.md`, `STRATEGY.md`, `insight-rubric.json`, `implementation-skill.md`, or `tasks.jsonl`. It must not mutate live runtime code, model profiles, opencode, or the selected model.
+
+Promotion requires replay checks, quality review, no new broad tool commands, no memory/Metal regression, and the existing patch/approval gates. If those gates are not met, keep the canary as evidence and continue the default supervisor route.
+"""
+
+
 def prompt_text(root: Path) -> str:
     compact_workspace(root)
     return f"""OpenClaw Speed Autoresearch bootstrap.
@@ -820,6 +836,7 @@ def setup_workspace(args: argparse.Namespace) -> int:
     upsert_section(root / "program.md", "Realistic Experiment Backlog", realistic_experiment_backlog_section())
     upsert_section(root / "program.md", "Speed Targets", speed_targets_section())
     upsert_section(root / "program.md", "Implementation Gate", implementation_gate_section())
+    upsert_section(root / "program.md", "Dynamic Policy Optimization", dynamic_policy_optimization_section())
     refresh_strategy_objective(root / "STRATEGY.md")
     upsert_section(root / "STRATEGY.md", "Current Best Understanding", strategy_current_best_section())
     upsert_section(root / "STRATEGY.md", "Top Hypotheses", strategy_top_hypotheses_section())
@@ -1470,6 +1487,98 @@ def frontier_review(args: argparse.Namespace) -> int:
         ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
+def gepa_escalation(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    report = gepa_escalation_report(
+        root,
+        recent_rows=args.recent_rows,
+        min_blocked=args.min_blocked,
+        min_rework=args.min_rework,
+        min_trajectory=args.min_trajectory,
+        min_low_quality=args.min_low_quality,
+    )
+    seeded = seed_gepa_canary_task(root, report)
+    timestamp = int(time.time())
+    artifact = {**report, "timestamp": timestamp, "seeded_task": seeded}
+    path = root / "benchmarks" / f"gepa-escalation-{timestamp}.json"
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "gepa-escalation",
+            "finding": "supervisor checked whether GEPA-style policy optimization is needed",
+            "evidence": artifact,
+            "next": artifact["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"gepa-escalation-{timestamp}",
+        status="keep",
+        target="autoresearch-gepa-escalation",
+        hypothesis="GEPA should be a dynamic supervisor reflex only when default routing is stuck",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"needed={report.get('needed')} seeded={seeded} "
+            f"triggers={','.join(str(item.get('name')) for item in report.get('triggers', []))}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **artifact}, indent=2))
+    return 0
+
+
+def gepa_policy_canary(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    selected: dict[str, Any] | None = None
+    for task in tasks:
+        if args.task_id and task.get("id") != args.task_id:
+            continue
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("supervisor_action") != "gepa-policy-canary":
+            continue
+        selected = task
+        break
+    if selected is None:
+        result = {"ok": False, "reason": "no ready GEPA policy canary task"}
+        print(json.dumps(result, indent=2))
+        return 2
+    canary = write_gepa_policy_canary(root, selected)
+    completed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for task in tasks:
+        if task.get("id") == selected.get("id"):
+            task["status"] = "done"
+            task["completed_at"] = completed_at
+            task["canary_path"] = canary["path"]
+            break
+    write_jsonl(root / "tasks.jsonl", tasks)
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": completed_at,
+            "task_id": selected.get("id"),
+            "status": "gepa-canary-recorded",
+            "artifact": canary["path"],
+            "target": selected.get("target"),
+        },
+    )
+    append_result(
+        root,
+        run_id=f"gepa-policy-canary-{int(time.time())}",
+        status="keep",
+        target="autoresearch-gepa-policy-canary",
+        hypothesis="GEPA policy optimization should be canary-only until replay and approval gates pass",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=f"task_id={selected.get('id')} target={selected.get('target')} path={canary['path']}",
+    )
+    print(json.dumps(canary, indent=2))
     return 0
 
 
@@ -2826,6 +2935,18 @@ def main() -> int:
     frontier.add_argument("--recent-rows", type=int, default=160)
     frontier.add_argument("--min-samples", type=int, default=3)
     frontier.set_defaults(func=frontier_review)
+
+    gepa = sub.add_parser("gepa-escalation")
+    gepa.add_argument("--recent-rows", type=int, default=160)
+    gepa.add_argument("--min-blocked", type=int, default=3)
+    gepa.add_argument("--min-rework", type=int, default=2)
+    gepa.add_argument("--min-trajectory", type=int, default=2)
+    gepa.add_argument("--min-low-quality", type=int, default=2)
+    gepa.set_defaults(func=gepa_escalation)
+
+    gepa_canary = sub.add_parser("gepa-policy-canary")
+    gepa_canary.add_argument("--task-id", default="")
+    gepa_canary.set_defaults(func=gepa_policy_canary)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)

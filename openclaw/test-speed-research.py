@@ -121,6 +121,8 @@ def main() -> int:
             assert "Autoresearch quality metrics are tertiary" in program
             assert "## Implementation Gate" in program
             assert "implementation-skill.md" in program
+            assert "## Dynamic Policy Optimization" in program
+            assert "GEPA-style policy optimization is a supervisor reflex" in program
             implementation = (root / "implementation-skill.md").read_text(encoding="utf-8")
             assert "OpenClaw Speed Implementation Skill" in implementation
             assert "Do not touch opencode" in implementation
@@ -134,6 +136,7 @@ def main() -> int:
             assert (root / "rejections.jsonl").exists()
             assert (root / "journal.jsonl").exists()
             assert (root / "trajectory-corpus.jsonl").exists()
+            assert (root / "gepa-candidates.jsonl").exists()
             assert (root / "exhausted-approaches.jsonl").exists()
             tasks = helper.read_jsonl(root / "tasks.jsonl")
             assert any(task.get("id") == "mtp-loop-overhead-map" for task in tasks)
@@ -324,6 +327,24 @@ def main() -> int:
             frontier = json.loads(frontier_paths[-1].read_text(encoding="utf-8"))
             assert frontier["variance"]["best_variant"] == "2"
             assert "mtp-decode" in frontier["exhausted_lanes"]
+            helper.append_jsonl(
+                root / "trajectory-corpus.jsonl",
+                {"task_id": "unit-gepa", "reason": "repeated blocked trajectory", "evidence": "unit"},
+            )
+            assert helper.gepa_escalation(
+                Namespace(recent_rows=80, min_blocked=1, min_rework=1, min_trajectory=1, min_low_quality=1)
+            ) == 0
+            gepa_paths = list((root / "benchmarks").glob("gepa-escalation-*.json"))
+            assert gepa_paths
+            gepa = json.loads(gepa_paths[-1].read_text(encoding="utf-8"))
+            assert gepa["needed"] is True
+            assert gepa["candidate"]["target"] in {"program.md", "insight-rubric.json", "STRATEGY.md", "tasks.jsonl"}
+            assert "gepa-policy-canary" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert helper.gepa_policy_canary(Namespace(task_id=gepa["candidate"]["id"])) == 0
+            assert list((root / "gepa-canaries").glob("*.json"))
+            assert "GEPA policy candidates remain canary-only" in (root / "gepa-candidates.jsonl").read_text(
+                encoding="utf-8"
+            )
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas

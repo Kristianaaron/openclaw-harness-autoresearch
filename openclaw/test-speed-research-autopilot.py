@@ -115,6 +115,9 @@ def main() -> int:
     assert helper.is_supervisor_focused_test_task(
         {"task_type": "supervisor", "supervisor_action": "focused-test"}
     )
+    assert helper.is_supervisor_gepa_policy_canary_task(
+        {"task_type": "supervisor", "supervisor_action": "gepa-policy-canary"}
+    )
     assert not helper.is_supervisor_benchmark_task(
         {
             "benchmark_mode": "decode-sample",
@@ -616,6 +619,42 @@ def main() -> int:
         assert code == 0
         assert issue == ""
         assert "supervisor-focused-test-10" in helper.RESULTS.read_text(encoding="utf-8")
+        gepa_helper = Path(tmp) / "gepa-helper.py"
+        gepa_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "task_id = sys.argv[sys.argv.index('--task-id') + 1]\n"
+            f"pathlib.Path({str(helper.RESULTS)!r}).write_text("
+            f"{helper.RESULTS_HEADER!r} + "
+            "'2026-05-05T00:00:00+0000\\tgepa-policy-canary-test\\tkeep\\tautoresearch-gepa-policy-canary\\th\\t\\t\\t\\t\\t\\tabc123\\ttask_id=' + task_id + '\\n', "
+            "encoding='utf-8')\n"
+            "print(json.dumps({'ok': True, 'path': '/tmp/gepa-canary.json'}))\n",
+            encoding="utf-8",
+        )
+        gepa_helper.chmod(0o700)
+        gepa_args = Namespace(research_helper_bin=str(gepa_helper), gepa_canary_timeout_seconds=5)
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "gepa",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "gepa-policy-canary",
+                    "target": "program.md",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_gepa_policy_canary_task(
+            gepa_args,
+            11,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert "gepa-policy-canary-test" in helper.RESULTS.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
@@ -645,6 +684,10 @@ def main() -> int:
             review_min_sweeps=3,
             review_min_samples_per_block=3,
             review_target_tps=30.0,
+            gepa_min_blocked=3,
+            gepa_min_rework=2,
+            gepa_min_trajectory=2,
+            gepa_min_low_quality=2,
             quality_review_timeout_seconds=5,
         )
         ok, issue = helper.run_supervisor_quality_review(review_args, 8, "nightly", Path(tmp) / "autopilot.log")
@@ -653,6 +696,7 @@ def main() -> int:
         review_log = (Path(tmp) / "autopilot.log").read_text(encoding="utf-8")
         assert "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0" in review_log
         assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
+        assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
             9,
