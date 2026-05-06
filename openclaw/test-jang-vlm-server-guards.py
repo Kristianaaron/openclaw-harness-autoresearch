@@ -113,7 +113,7 @@ def test_dflash_adapter_and_kwargs() -> None:
             max_position_embeddings=262144,
             final_logit_softcapping=30.0,
             num_target_layers=60,
-            target_layer_ids=(1, 12, 23, 35, 46, 57),
+            dflash_config={"target_layer_ids": (1, 12, 23, 35, 46, 57)},
         )
         server.validate_dflash_compatibility(
             SimpleNamespace(language_model=SimpleNamespace(config=target_cfg)),

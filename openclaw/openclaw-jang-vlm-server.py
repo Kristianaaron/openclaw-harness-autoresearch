@@ -339,13 +339,26 @@ def target_text_config(model: Any) -> Any:
     )
 
 
+def dflash_target_layer_ids(draft_cfg: Any) -> tuple[Any, ...]:
+    direct = getattr(draft_cfg, "target_layer_ids", None)
+    if direct:
+        return tuple(direct)
+    nested = getattr(draft_cfg, "dflash_config", None)
+    if isinstance(nested, dict) and nested.get("target_layer_ids"):
+        return tuple(nested["target_layer_ids"])
+    nested_ids = getattr(nested, "target_layer_ids", None)
+    if nested_ids:
+        return tuple(nested_ids)
+    return ()
+
+
 def validate_dflash_compatibility(model: Any, draft: Any) -> None:
     target_cfg = target_text_config(model)
     draft_cfg = getattr(draft, "config", None)
     if target_cfg is None or draft_cfg is None:
         raise RuntimeError("DFlash compatibility check requires target and draft configs")
     target_layers = int(getattr(target_cfg, "num_hidden_layers", 0) or 0)
-    target_layer_ids = tuple(getattr(draft_cfg, "target_layer_ids", ()) or ())
+    target_layer_ids = dflash_target_layer_ids(draft_cfg)
     checks = {
         "hidden_size": (
             getattr(target_cfg, "hidden_size", None),
@@ -371,6 +384,8 @@ def validate_dflash_compatibility(model: Any, draft: Any) -> None:
     ]
     if target_layers <= 0:
         mismatches.append("target num_hidden_layers is unavailable")
+    if not target_layer_ids:
+        mismatches.append("target_layer_ids are unavailable")
     bad_layers = [layer for layer in target_layer_ids if int(layer) < 0 or int(layer) >= target_layers]
     if bad_layers:
         mismatches.append(f"target_layer_ids out of range for target layers={target_layers}: {bad_layers}")
