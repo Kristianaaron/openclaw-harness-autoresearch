@@ -1193,6 +1193,23 @@ def quality_review(args: argparse.Namespace) -> int:
         }
         for block, values in sorted(decode_by_block.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 999)
     }
+    required_blocks = {"2", "3", "4"}
+    covered_blocks = {block for block, summary in block_summary.items() if int(summary.get("samples") or 0) >= int(args.min_samples_per_block)}
+    missing_required_blocks = sorted(required_blocks - covered_blocks, key=int)
+    best_block = ""
+    best_mean: float | None = None
+    best_max: float | None = None
+    for block, summary in block_summary.items():
+        if int(summary.get("samples") or 0) < int(args.min_samples_per_block):
+            continue
+        mean_decode = summary.get("mean_decode_tps")
+        if not isinstance(mean_decode, (int, float)):
+            continue
+        if best_mean is None or float(mean_decode) > best_mean:
+            best_block = block
+            best_mean = float(mean_decode)
+            max_decode = summary.get("max_decode_tps")
+            best_max = float(max_decode) if isinstance(max_decode, (int, float)) else None
     sweep_rows = [
         row
         for row in recent
@@ -1204,9 +1221,39 @@ def quality_review(args: argparse.Namespace) -> int:
     repeated_keep_current = len(sweep_fields) >= int(args.min_sweeps) and all(
         fields.get("decision") == "keep-current" for fields in sweep_fields[-int(args.min_sweeps) :]
     )
+    tasks = read_jsonl(root / "tasks.jsonl")
+    active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    active_lanes = {str(task.get("lane", "")) for task in active_tasks}
+    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+    frontier_ready = sorted(active_lanes & frontier_lanes)
+    plateau_below_target = (
+        repeated_block2
+        and repeated_keep_current
+        and best_mean is not None
+        and best_mean < float(args.target_tps)
+    )
     review_status = "keep"
     recommendations: list[str] = []
+    gates: dict[str, Any] = {
+        "no_blocked_rows": not blocked,
+        "required_block_coverage": not missing_required_blocks,
+        "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
+        "has_frontier_next_lane": bool(frontier_ready),
+        "target_met": best_mean is not None and best_mean >= float(args.target_tps),
+    }
+    quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
+    if blocked:
+        quality_score -= 30
+    if missing_required_blocks:
+        quality_score -= 20
+        recommendations.append(
+            "coverage gap: rerun a bounded sweep before trusting conclusions; missing blocks="
+            + ",".join(missing_required_blocks)
+        )
+    if len(sweep_rows) < int(args.min_sweeps):
+        quality_score -= 15
+        recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
     if repeated_block2 and repeated_keep_current:
         recommendations.append("block-size sweep has converged on block 2; move to acceptance, drafter-fit, DFlash, and MTP-loop overhead.")
         seeded_tasks.extend(
@@ -1235,13 +1282,58 @@ def quality_review(args: argparse.Namespace) -> int:
                     "guard_checks": ["no_model_load", "no_opencode_changes", "no_live_profile_change"],
                     "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
                 },
+                {
+                    "id": "review-dflash-compatibility-next",
+                    "status": "ready",
+                    "priority": 90,
+                    "lane": "frontier-dflash",
+                    "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
+                    "hypothesis": "The 30+ tok/s path may require DFlash-style block drafting, but JANQ compatibility must be proven before any live runtime change.",
+                    "metric": "compatibility_decision_then_decode_tps",
+                    "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard"],
+                    "next_action": "read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md, then inspect the DFlash compatibility plan without installing into the live runtime",
+                },
             ]
         )
     if blocked:
         review_status = "blocked"
         recommendations.append(f"recent run has {len(blocked)} blocked rows; inspect the last blocker before trusting speed conclusions.")
+    if plateau_below_target and frontier_ready:
+        recommendations.append(
+            f"plateau detected below {args.target_tps} tok/s; prioritize frontier lanes={','.join(frontier_ready)} over more block sweeps."
+        )
+    exhaustion_candidate = (
+        plateau_below_target
+        and not frontier_ready
+        and not missing_required_blocks
+        and len(sweep_rows) >= int(args.min_sweeps)
+    )
+    if exhaustion_candidate:
+        recommendations.append(
+            "exhaustion candidate: block-size tuning is settled below target and no frontier tasks are ready; produce a bottleneck report before more overnight cycles."
+        )
+        seeded_tasks.append(
+            {
+                "id": "review-exhaustion-report",
+                "status": "ready",
+                "priority": 96,
+                "lane": "exhaustion-report",
+                "target": "STRATEGY.md/results.tsv/quality-review",
+                "hypothesis": "If all local speed lanes are exhausted below target, the harness must state the hardware/runtime bottleneck with evidence.",
+                "metric": "bottleneck_evidence",
+                "guard_checks": ["no_live_profile_change", "evidence_required", "no_model_turn_required"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+            }
+        )
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
+    verdict = "healthy"
+    if exhaustion_candidate:
+        verdict = "exhaustion-candidate"
+    elif missing_required_blocks or blocked:
+        verdict = "needs-repair"
+    elif plateau_below_target:
+        verdict = "converged-below-target"
     seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
     timestamp = int(time.time())
     artifact = {
@@ -1252,6 +1344,17 @@ def quality_review(args: argparse.Namespace) -> int:
         "blocked_rows": len(blocked),
         "sweep_rows": len(sweep_rows),
         "block_summary": block_summary,
+        "best_block": best_block,
+        "best_mean_decode_tps": best_mean,
+        "best_max_decode_tps": best_max,
+        "target_tps": float(args.target_tps),
+        "quality_score": max(0, quality_score),
+        "verdict": verdict,
+        "gates": gates,
+        "missing_required_blocks": missing_required_blocks,
+        "frontier_ready_lanes": frontier_ready,
+        "plateau_below_target": plateau_below_target,
+        "exhaustion_candidate": exhaustion_candidate,
         "repeated_block2_winner": repeated_block2,
         "repeated_keep_current": repeated_keep_current,
         "recommendations": recommendations,
@@ -1278,6 +1381,8 @@ def quality_review(args: argparse.Namespace) -> int:
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"recent_rows={len(recent)} blocked={len(blocked)} sweeps={len(sweep_rows)} "
+            f"verdict={verdict} score={max(0, quality_score)} best_block={best_block} "
+            f"best_mean_tps={best_mean if best_mean is not None else ''} "
             f"repeated_block2={repeated_block2} seeded_tasks={seeded} "
             f"recommendation={recommendations[0]}"
         ),
@@ -2594,6 +2699,8 @@ def main() -> int:
     review = sub.add_parser("quality-review")
     review.add_argument("--recent-rows", type=int, default=120)
     review.add_argument("--min-sweeps", type=int, default=3)
+    review.add_argument("--min-samples-per-block", type=int, default=3)
+    review.add_argument("--target-tps", type=float, default=30.0)
     review.set_defaults(func=quality_review)
 
     compact_parser = sub.add_parser("compact")

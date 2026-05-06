@@ -292,11 +292,25 @@ def main() -> int:
                         "OPENCLAW_JANG_DRAFT_BLOCK_SIZE\tpaired drafter block-size sweep\t\t\t14.2\t\t\tabc123\t"
                         "decision=keep-current control_block=2 winner_block=2 delta_vs_control=0.0\n"
                     )
-            assert helper.quality_review(Namespace(recent_rows=80, min_sweeps=3)) == 0
+                for block, tps in (("2", "14.2"), ("3", "12.5"), ("4", "10.5")):
+                    for index in range(3):
+                        file.write(
+                            f"2026-05-05T00:11:{block}{index}+0000\tbenchmark-review-{block}-{index}\tkeep\t"
+                            "decode-sample\tbounded OpenClaw decode-sample probe\t\t\t"
+                            f"{tps}\t6.8\t1.2\tabc123\tmodel=local completion_tokens=96 "
+                            f"token_source=usage.completion_tokens draft_block_size={block}\n"
+                        )
+            assert helper.quality_review(
+                Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+            ) == 0
             review_paths = list((root / "benchmarks").glob("quality-review-*.json"))
             assert review_paths
             review = json.loads(review_paths[-1].read_text(encoding="utf-8"))
             assert review["repeated_block2_winner"] is True
+            assert review["verdict"] == "converged-below-target"
+            assert review["gates"]["required_block_coverage"] is True
+            assert review["best_block"] == "2"
+            assert review["target_tps"] == 30.0
             assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")

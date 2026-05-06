@@ -635,12 +635,16 @@ def main() -> int:
             research_helper_bin=str(review_helper),
             review_recent_rows=120,
             review_min_sweeps=3,
+            review_min_samples_per_block=3,
+            review_target_tps=30.0,
             quality_review_timeout_seconds=5,
         )
         ok, issue = helper.run_supervisor_quality_review(review_args, 8, "nightly", Path(tmp) / "autopilot.log")
         assert ok
         assert issue == ""
-        assert review_marker.read_text(encoding="utf-8") == "quality-review --recent-rows 120 --min-sweeps 3"
+        assert review_marker.read_text(encoding="utf-8") == (
+            "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0"
+        )
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
             9,

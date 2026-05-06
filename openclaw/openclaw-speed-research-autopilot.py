@@ -1944,6 +1944,10 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
         str(args.review_recent_rows),
         "--min-sweeps",
         str(args.review_min_sweeps),
+        "--min-samples-per-block",
+        str(args.review_min_samples_per_block),
+        "--target-tps",
+        str(args.review_target_tps),
     ]
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} supervisor quality review =====\n")
@@ -2022,6 +2026,8 @@ def main() -> int:
     parser.add_argument("--quality-review-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TIMEOUT", "45")))
     parser.add_argument("--review-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_RECENT_ROWS", "120")))
     parser.add_argument("--review-min-sweeps", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SWEEPS", "3")))
+    parser.add_argument("--review-min-samples-per-block", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SAMPLES_PER_BLOCK", "3")))
+    parser.add_argument("--review-target-tps", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TARGET_TPS", "30")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
