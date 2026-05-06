@@ -72,10 +72,18 @@ def test_dflash_adapter_and_kwargs() -> None:
     old_draft = server.DRAFT_MODEL
     old_backend = server.DRAFT_BACKEND
     old_env = os.environ.get("OPENCLAW_JANG_DFLASH_BLOCK_SIZE")
+    old_allow_tools = os.environ.get("OPENCLAW_JANG_DFLASH_ALLOW_TOOLS")
+    old_allow_thinking = os.environ.get("OPENCLAW_JANG_DFLASH_ALLOW_THINKING")
     try:
         server.DRAFT_MODEL = object()
         server.DRAFT_BACKEND = "dflash"
         os.environ["OPENCLAW_JANG_DFLASH_BLOCK_SIZE"] = "16"
+        assert server.should_use_dflash({"messages": [{"role": "user", "content": "hi"}]})
+        assert not server.should_use_dflash({"tools": [{"type": "function"}]})
+        assert not server.should_use_dflash({"enable_thinking": True})
+        os.environ["OPENCLAW_JANG_DFLASH_ALLOW_TOOLS"] = "1"
+        os.environ["OPENCLAW_JANG_DFLASH_ALLOW_THINKING"] = "1"
+        assert server.should_use_dflash({"tools": [{"type": "function"}], "enable_thinking": True})
         kwargs = server.generation_kwargs({"max_tokens": 32})
         assert "draft_model" not in kwargs
         assert "draft_kind" not in kwargs
@@ -91,6 +99,36 @@ def test_dflash_adapter_and_kwargs() -> None:
         server.record_dflash_acceptance(SimpleNamespace(accepted=16), first_response=True)
         server.record_dflash_acceptance(SimpleNamespace(accepted=8), first_response=False)
         assert server.DFLASH_ACCEPT_LENS == [8]
+        target_cfg = SimpleNamespace(
+            model_type="gemma4_text",
+            hidden_size=5376,
+            vocab_size=262144,
+            max_position_embeddings=262144,
+            final_logit_softcapping=30.0,
+            num_hidden_layers=60,
+        )
+        draft_cfg = SimpleNamespace(
+            hidden_size=5376,
+            vocab_size=262144,
+            max_position_embeddings=262144,
+            final_logit_softcapping=30.0,
+            num_target_layers=60,
+            target_layer_ids=(1, 12, 23, 35, 46, 57),
+        )
+        server.validate_dflash_compatibility(
+            SimpleNamespace(language_model=SimpleNamespace(config=target_cfg)),
+            SimpleNamespace(config=draft_cfg),
+        )
+        draft_cfg.hidden_size = 4096
+        try:
+            server.validate_dflash_compatibility(
+                SimpleNamespace(language_model=SimpleNamespace(config=target_cfg)),
+                SimpleNamespace(config=draft_cfg),
+            )
+        except RuntimeError as error:
+            assert "hidden_size" in str(error)
+        else:
+            raise AssertionError("DFlash structural mismatch should fail")
     finally:
         server.DRAFT_MODEL = old_draft
         server.DRAFT_BACKEND = old_backend
@@ -99,6 +137,14 @@ def test_dflash_adapter_and_kwargs() -> None:
             os.environ.pop("OPENCLAW_JANG_DFLASH_BLOCK_SIZE", None)
         else:
             os.environ["OPENCLAW_JANG_DFLASH_BLOCK_SIZE"] = old_env
+        for key, value in {
+            "OPENCLAW_JANG_DFLASH_ALLOW_TOOLS": old_allow_tools,
+            "OPENCLAW_JANG_DFLASH_ALLOW_THINKING": old_allow_thinking,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 if __name__ == "__main__":

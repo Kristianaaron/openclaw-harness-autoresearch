@@ -67,6 +67,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def configure_mlx_memory() -> None:
     try:
         import mlx.core as mx
@@ -105,9 +112,15 @@ def load_model(model_path: str) -> None:
     if draft_path:
         draft_start = time.monotonic()
         if draft_kind == "dflash" or dflash_path:
+            if not env_bool("OPENCLAW_JANG_DFLASH_EXPERIMENTAL_ACK"):
+                raise RuntimeError(
+                    "DFlash is experimental for the JANQ target; set "
+                    "OPENCLAW_JANG_DFLASH_EXPERIMENTAL_ACK=1 for isolated canaries only"
+                )
             from dflash.model_mlx import load_draft
 
             DRAFT_MODEL = load_draft(draft_path)
+            validate_dflash_compatibility(MODEL, DRAFT_MODEL)
             DRAFT_BACKEND = "dflash"
         else:
             from mlx_vlm.speculative.drafters import load_drafter
@@ -285,6 +298,27 @@ def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def has_request_tools(payload: dict[str, Any]) -> bool:
+    tools = payload.get("tools")
+    return isinstance(tools, list) and bool(tools)
+
+
+def request_enables_thinking(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("enable_thinking"))
+
+
+def should_use_dflash(payload: dict[str, Any]) -> bool:
+    if DRAFT_BACKEND != "dflash" or DRAFT_MODEL is None:
+        return False
+    if has_request_tools(payload) and not env_bool("OPENCLAW_JANG_DFLASH_ALLOW_TOOLS"):
+        log("DFlash bypassed for tool-bearing request; using target-only decode")
+        return False
+    if request_enables_thinking(payload) and not env_bool("OPENCLAW_JANG_DFLASH_ALLOW_THINKING"):
+        log("DFlash bypassed for thinking request; using target-only decode")
+        return False
+    return True
+
+
 def dflash_generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     kwargs = generation_kwargs(payload)
     allowed = {
@@ -297,6 +331,60 @@ def dflash_generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     if draft_block_size:
         allowed["block_size"] = max(1, int(draft_block_size))
     return allowed
+
+
+def target_text_config(model: Any) -> Any:
+    return getattr(getattr(model, "config", None), "text_config", None) or getattr(
+        getattr(model, "language_model", None), "config", None
+    )
+
+
+def validate_dflash_compatibility(model: Any, draft: Any) -> None:
+    target_cfg = target_text_config(model)
+    draft_cfg = getattr(draft, "config", None)
+    if target_cfg is None or draft_cfg is None:
+        raise RuntimeError("DFlash compatibility check requires target and draft configs")
+    target_layers = int(getattr(target_cfg, "num_hidden_layers", 0) or 0)
+    target_layer_ids = tuple(getattr(draft_cfg, "target_layer_ids", ()) or ())
+    checks = {
+        "hidden_size": (
+            getattr(target_cfg, "hidden_size", None),
+            getattr(draft_cfg, "hidden_size", None),
+        ),
+        "vocab_size": (
+            getattr(target_cfg, "vocab_size", None),
+            getattr(draft_cfg, "vocab_size", None),
+        ),
+        "max_position_embeddings": (
+            getattr(target_cfg, "max_position_embeddings", None),
+            getattr(draft_cfg, "max_position_embeddings", None),
+        ),
+        "final_logit_softcapping": (
+            getattr(target_cfg, "final_logit_softcapping", None),
+            getattr(draft_cfg, "final_logit_softcapping", None),
+        ),
+    }
+    mismatches = [
+        f"{name}: target={target!r} draft={draft_value!r}"
+        for name, (target, draft_value) in checks.items()
+        if target != draft_value
+    ]
+    if target_layers <= 0:
+        mismatches.append("target num_hidden_layers is unavailable")
+    bad_layers = [layer for layer in target_layer_ids if int(layer) < 0 or int(layer) >= target_layers]
+    if bad_layers:
+        mismatches.append(f"target_layer_ids out of range for target layers={target_layers}: {bad_layers}")
+    if int(getattr(draft_cfg, "num_target_layers", target_layers) or 0) != target_layers:
+        mismatches.append(
+            f"num_target_layers: target={target_layers} draft={getattr(draft_cfg, 'num_target_layers', None)!r}"
+        )
+    if mismatches:
+        raise RuntimeError("DFlash/JANQ structural mismatch: " + "; ".join(mismatches))
+    log(
+        "DFlash structural compatibility passed "
+        f"target_layers={target_layers} target_layer_ids={list(target_layer_ids)} "
+        "but JANQ behavioral acceptance still requires canary benchmarks"
+    )
 
 
 class DFlashVLMTargetAdapter:
@@ -540,7 +628,7 @@ def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = build_prompt(payload)
     start = time.monotonic()
     speculative_start = current_speculative_stat_index()
-    if DRAFT_BACKEND == "dflash":
+    if should_use_dflash(payload):
         raw_text = ""
         prompt_tokens = 0
         completion_tokens = 0
@@ -605,7 +693,8 @@ def _stream_chat_completion_on_worker(
     completion_tokens = 0
     finish_reason = "stop"
     try:
-        if DRAFT_BACKEND == "dflash":
+        use_dflash = should_use_dflash(payload)
+        if use_dflash:
             response_iter = dflash_stream(prompt, payload)
         else:
             from mlx_vlm import stream_generate
@@ -619,7 +708,7 @@ def _stream_chat_completion_on_worker(
                 raw_text += segment
             prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
             completion_tokens = int(getattr(response, "generation_tokens", completion_tokens) or completion_tokens)
-            if DRAFT_BACKEND == "dflash":
+            if use_dflash:
                 record_dflash_acceptance(response, first_response=first_dflash_response)
                 first_dflash_response = False
             visible = stream_visible_text(raw_text)
