@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -35,6 +36,7 @@ from openclaw_speed_research_core import (
 
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8091/v1"
+DEFAULT_PROXY_LOG = "/Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
 
 
 def home() -> Path:
@@ -878,6 +880,92 @@ def completion_tokens_from_response(parsed: dict[str, Any], content: str) -> tup
     return estimate_tokens(content), "content_estimate"
 
 
+def log_path() -> Path:
+    return Path(os.environ.get("OPENCLAW_MODEL_PROXY_LOG", DEFAULT_PROXY_LOG)).expanduser()
+
+
+def file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def read_since(path: Path, offset: int, limit: int = 20000) -> str:
+    try:
+        size = path.stat().st_size
+        start = min(max(0, offset), size)
+        if size - start > limit:
+            start = size - limit
+        with path.open("rb") as file:
+            file.seek(start)
+            return file.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def parse_generation_log_metrics(text: str) -> dict[str, Any]:
+    pattern = re.compile(
+        r"(?P<stream>stream\s+)?chat completion: "
+        r"prompt=(?P<prompt>\d+) completion=(?P<completion>\d+) "
+        r"elapsed=(?P<elapsed>[0-9.]+)s tok_s=(?P<tok_s>[0-9.]+)"
+        r"(?: mtp_rounds=(?P<rounds>\d+) mean_accept=(?P<accept>[0-9.]+))?"
+    )
+    matches = [match for match in pattern.finditer(text)]
+    if not matches:
+        return {"available": False}
+    match = matches[-1]
+    result: dict[str, Any] = {
+        "available": True,
+        "stream": bool(match.group("stream")),
+        "prompt_tokens": int(match.group("prompt")),
+        "completion_tokens": int(match.group("completion")),
+        "elapsed_s": float(match.group("elapsed")),
+        "server_tok_s": float(match.group("tok_s")),
+    }
+    if match.group("rounds"):
+        result["mtp_rounds"] = int(match.group("rounds"))
+    if match.group("accept"):
+        result["mean_accept"] = float(match.group("accept"))
+    return result
+
+
+def parse_generation_log_summary(text: str) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"(?P<stream>stream\s+)?chat completion: "
+        r"prompt=(?P<prompt>\d+) completion=(?P<completion>\d+) "
+        r"elapsed=(?P<elapsed>[0-9.]+)s tok_s=(?P<tok_s>[0-9.]+)"
+        r"(?: mtp_rounds=(?P<rounds>\d+) mean_accept=(?P<accept>[0-9.]+))?"
+    )
+    for match in pattern.finditer(text):
+        row: dict[str, Any] = {
+            "stream": bool(match.group("stream")),
+            "prompt_tokens": int(match.group("prompt")),
+            "completion_tokens": int(match.group("completion")),
+            "elapsed_s": float(match.group("elapsed")),
+            "server_tok_s": float(match.group("tok_s")),
+        }
+        if match.group("rounds"):
+            row["mtp_rounds"] = int(match.group("rounds"))
+        if match.group("accept"):
+            row["mean_accept"] = float(match.group("accept"))
+        rows.append(row)
+    with_accept = [row for row in rows if "mean_accept" in row]
+    tok_values = [float(row["server_tok_s"]) for row in rows]
+    round_values = [float(row["mtp_rounds"]) for row in with_accept]
+    accept_values = [float(row["mean_accept"]) for row in with_accept]
+    return {
+        "ok": bool(rows),
+        "sample_count": len(rows),
+        "mtp_sample_count": len(with_accept),
+        "mean_server_tok_s": round(sum(tok_values) / len(tok_values), 3) if tok_values else "",
+        "mean_mtp_rounds": round(sum(round_values) / len(round_values), 3) if round_values else "",
+        "mean_accept": round(sum(accept_values) / len(accept_values), 3) if accept_values else "",
+        "latest": rows[-1] if rows else {},
+    }
+
+
 def result_rows(root: Path) -> list[dict[str, str]]:
     results = root / "results.tsv"
     if not results.exists():
@@ -1342,6 +1430,121 @@ def paired_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_int_list(value: str) -> list[int]:
+    items: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        parsed = int(part)
+        if parsed <= 0:
+            raise ValueError("values must be positive integers")
+        if parsed not in items:
+            items.append(parsed)
+    return items
+
+
+def drafter_sweep_plan(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    blocks = parse_int_list(args.blocks)
+    if not blocks:
+        print(json.dumps({"ok": False, "reason": "no block sizes provided"}, indent=2))
+        return 2
+    timestamp = int(time.time())
+    live_block = os.environ.get("OPENCLAW_JANG_DRAFT_BLOCK_SIZE", "2")
+    prompt_set = [
+        {
+            "id": "normal-text",
+            "mode": "decode-sample",
+            "prompt_class": "normal-text",
+            "max_tokens": 96,
+        }
+    ]
+    plan = {
+        "ok": True,
+        "kind": "mtp-drafter-block-sweep",
+        "status": "plan-only",
+        "timestamp": timestamp,
+        "control": {
+            "draft_block_size": live_block,
+            "samples": args.samples,
+            "command": (
+                "/Users/kristian/.openclaw/bin/openclaw-speed-research "
+                f"benchmark --mode decode-sample --draft-block-size {live_block}"
+            ),
+        },
+        "variants": [
+            {
+                "draft_block_size": block,
+                "samples": args.samples,
+                "command": (
+                    "/Users/kristian/.openclaw/bin/openclaw-speed-research "
+                    f"benchmark --mode decode-sample --draft-block-size {block}"
+                ),
+            }
+            for block in blocks
+        ],
+        "prompt_set": prompt_set,
+        "promotion_gate": {
+            "min_decode_tps_delta": args.min_delta,
+            "requires_usage_completion_tokens": True,
+            "requires_mtp_mean_accept": True,
+            "must_pass_replay": True,
+            "must_not_change_live_profile": True,
+        },
+        "rollback": "No rollback needed for plan-only or per-request draft_block_size benchmarks; live profile is not mutated.",
+    }
+    path = root / "experiments" / f"mtp-drafter-sweep-plan-{timestamp}.json"
+    path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-block-sweep-plan",
+            "status": "sweep-plan",
+            "path": str(path),
+            "blocks": blocks,
+            "samples": args.samples,
+            "min_delta": args.min_delta,
+        },
+    )
+    print(json.dumps({"ok": True, "path": str(path), "plan": plan}, indent=2))
+    return 0
+
+
+def mtp_report(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    source = Path(args.log_path).expanduser() if args.log_path else log_path()
+    try:
+        text = "\n".join(source.read_text(encoding="utf-8", errors="replace").splitlines()[-args.lines :])
+    except OSError as error:
+        print(json.dumps({"ok": False, "reason": str(error)}, indent=2))
+        return 2
+    summary = parse_generation_log_summary(text)
+    summary["log_path"] = str(source)
+    summary["lines"] = args.lines
+    summary["timestamp"] = int(time.time())
+    path = root / "benchmarks" / f"mtp-acceptance-report-{summary['timestamp']}.json"
+    path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"mtp-report-{summary['timestamp']}",
+        status="keep" if summary["ok"] else "blocked",
+        target="mtp-acceptance-report",
+        hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence for decode tuning",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"samples={summary['sample_count']} mtp_samples={summary['mtp_sample_count']} "
+            f"mean_server_tok_s={summary['mean_server_tok_s']} mean_accept={summary['mean_accept']} "
+            f"path={path}"
+        ),
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if summary["ok"] else 2
+
+
 def benchmark_prompt(mode: str) -> tuple[str, int]:
     spec = benchmark_spec(workspace_root(), mode)
     return str(spec["prompt"]), int(spec["max_tokens"])
@@ -1463,6 +1666,8 @@ def benchmark(args: argparse.Namespace) -> int:
     model = args.model or (data[0].get("id") if isinstance(data, list) and data and isinstance(data[0], dict) else "local-model")
     spec = benchmark_spec(root, mode)
     prompt, max_tokens = str(spec["prompt"]), int(spec["max_tokens"])
+    active_log = log_path()
+    log_offset = file_size(active_log)
     before_memory = memory_snapshot()
     payload = {
         "model": model,
@@ -1471,6 +1676,8 @@ def benchmark(args: argparse.Namespace) -> int:
         "max_tokens": max_tokens,
         "stream": bool(spec.get("stream", mode == "streaming-ttft")),
     }
+    if args.draft_block_size and mode == "decode-sample":
+        payload["draft_block_size"] = args.draft_block_size
     try:
         if mode == "streaming-ttft":
             ttft_s, wall_s, content = stream_model_request(base_url, payload, args.timeout)
@@ -1494,6 +1701,7 @@ def benchmark(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "status": "blocked", "reason": str(error)}, indent=2))
         return 2
     after_memory = memory_snapshot()
+    mtp = parse_generation_log_metrics(read_since(active_log, log_offset))
     decode_tps = round(completion_tokens / wall_s, 3) if mode == "decode-sample" and wall_s > 0 else ""
     result = {
         "ok": True,
@@ -1510,6 +1718,8 @@ def benchmark(args: argparse.Namespace) -> int:
         "second_wall_s": round(wall_s, 3) if mode == "prefill-reuse" else "",
         "memory_before_mb": before_memory,
         "memory_after_mb": after_memory,
+        "draft_block_size": args.draft_block_size if args.draft_block_size else "",
+        "mtp": mtp,
         "content_preview": str(content)[:120],
         "timestamp": int(time.time()),
     }
@@ -1549,6 +1759,10 @@ def benchmark(args: argparse.Namespace) -> int:
             f"token_source={completion_token_source} "
             f"manifest_version={spec.get('manifest_version', 'unknown')} "
             f"prompt_class={spec.get('prompt_class', 'unknown')} "
+            f"draft_block_size={args.draft_block_size or ''} "
+            f"server_tok_s={mtp.get('server_tok_s', '')} "
+            f"mtp_rounds={mtp.get('mtp_rounds', '')} "
+            f"mean_accept={mtp.get('mean_accept', '')} "
             f"preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}"
         ),
     )
@@ -1616,6 +1830,12 @@ def main() -> int:
         default="quick-health",
     )
     bench.add_argument("--timeout", type=float, default=180.0)
+    bench.add_argument(
+        "--draft-block-size",
+        type=int,
+        default=0,
+        help="send a per-request Gemma MTP draft_block_size for safe block-size benchmarking",
+    )
     bench.set_defaults(func=benchmark)
 
     record = sub.add_parser("record")
@@ -1649,6 +1869,17 @@ def main() -> int:
     paired = sub.add_parser("paired-plan")
     paired.add_argument("--task-id", required=True)
     paired.set_defaults(func=paired_plan)
+
+    sweep = sub.add_parser("drafter-sweep-plan")
+    sweep.add_argument("--blocks", default="1,2,3,4,6")
+    sweep.add_argument("--samples", type=int, default=3)
+    sweep.add_argument("--min-delta", type=float, default=0.5)
+    sweep.set_defaults(func=drafter_sweep_plan)
+
+    report = sub.add_parser("mtp-report")
+    report.add_argument("--lines", type=int, default=160)
+    report.add_argument("--log-path", default="")
+    report.set_defaults(func=mtp_report)
 
     args = parser.parse_args()
     return int(args.func(args))

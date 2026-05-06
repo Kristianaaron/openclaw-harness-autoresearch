@@ -8,6 +8,7 @@ module owns the durable research memory that makes those turns purposeful.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,13 @@ def benchmark_result_schema_ok(root: Path, result: dict[str, Any]) -> tuple[bool
         return False, f"missing result keys: {','.join(sorted(set(missing)))}"
     if mode == "decode-sample" and result.get("completion_token_source") != "usage.completion_tokens":
         return False, "decode-sample missing usage.completion_tokens source"
+    if mode == "decode-sample":
+        try:
+            completion_tokens = int(result.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        if completion_tokens < 64:
+            return False, f"decode-sample too short for throughput evidence: completion_tokens={completion_tokens}"
     return True, ""
 
 
@@ -396,6 +404,10 @@ def paired_profile_plan(task: dict[str, Any]) -> dict[str, Any]:
 def replay_checks(root: Path) -> dict[str, Any]:
     ensure_research_state(root)
     rows = all_result_rows(root)
+    def note_completion_tokens(row: dict[str, str]) -> int:
+        match = re.search(r"completion_tokens=(\d+)", row.get("notes", ""))
+        return int(match.group(1)) if match else 0
+
     bad_decode = [
         row.get("run_id", "")
         for row in rows
@@ -404,6 +416,14 @@ def replay_checks(root: Path) -> dict[str, Any]:
         and row.get("decode_tps")
         and "completion_tokens=" in row.get("notes", "")
         and "token_source=usage.completion_tokens" not in row.get("notes", "")
+    ]
+    short_decode = [
+        row.get("run_id", "")
+        for row in rows
+        if row.get("target") == "decode-sample"
+        and row.get("status") == "keep"
+        and "completion_tokens=" in row.get("notes", "")
+        and note_completion_tokens(row) < 64
     ]
     legacy_decode = [
         row.get("run_id", "")
@@ -421,10 +441,11 @@ def replay_checks(root: Path) -> dict[str, Any]:
         and str(task.get("target", "")).startswith("OPENCLAW_JANG_DRAFT_")
         and "restore_live_profile" not in {str(item) for item in task.get("guard_checks", [])}
     ]
-    passed = not bad_decode and not unsafe_profile_tasks
+    passed = not bad_decode and not short_decode and not unsafe_profile_tasks
     return {
         "ok": passed,
         "bad_decode_rows": bad_decode,
+        "short_decode_rows": short_decode,
         "legacy_decode_rows_ignored": legacy_decode,
         "unsafe_profile_tasks": unsafe_profile_tasks,
         "cases": [row["id"] for row in DEFAULT_REPLAY_CASES],

@@ -55,6 +55,20 @@ def main() -> int:
                 "Write one compact paragraph about reducing local LLM decode latency. Keep it practical.",
                 96,
             )
+            parsed_log = helper.parse_generation_log_metrics(
+                "[openclaw-jang-vlm-server] chat completion: prompt=10 completion=96 "
+                "elapsed=6.00s tok_s=16.0 mtp_rounds=24 mean_accept=0.75\n"
+            )
+            assert parsed_log["server_tok_s"] == 16.0
+            assert parsed_log["mtp_rounds"] == 24
+            assert parsed_log["mean_accept"] == 0.75
+            summary = helper.parse_generation_log_summary(
+                "chat completion: prompt=10 completion=96 elapsed=6.00s tok_s=16.0 mtp_rounds=24 mean_accept=0.75\n"
+                "stream chat completion: prompt=12 completion=96 elapsed=8.00s tok_s=12.0 mtp_rounds=48 mean_accept=0.25\n"
+            )
+            assert summary["sample_count"] == 2
+            assert summary["mean_server_tok_s"] == 14.0
+            assert summary["mean_accept"] == 0.5
             assert (root / "results.tsv").read_text(encoding="utf-8").startswith("timestamp\trun_id\tstatus")
             assert (root / "sources" / "queue.md").exists()
             assert helper.add_source(
@@ -115,16 +129,79 @@ def main() -> int:
             assert helper.benchmark(
                 Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-shape", timeout=1.0)
             ) == 0
+            assert helper.drafter_sweep_plan(Namespace(blocks="2,3,4", samples=2, min_delta=0.5)) == 0
+            sweep_paths = list((root / "experiments").glob("mtp-drafter-sweep-plan-*.json"))
+            assert sweep_paths
+            sweep = json.loads(sweep_paths[-1].read_text(encoding="utf-8"))
+            assert sweep["promotion_gate"]["must_not_change_live_profile"] is True
+            assert "--draft-block-size 3" in json.dumps(sweep)
             assert helper.completion_tokens_from_response(
                 {"usage": {"completion_tokens": 96}},
                 "short visible text",
             ) == (96, "usage.completion_tokens")
+            assert helper.benchmark_result_schema_ok(
+                root,
+                {
+                    "ok": True,
+                    "model": "local",
+                    "mode": "decode-sample",
+                    "wall_s": 0.5,
+                    "memory_before_mb": {},
+                    "memory_after_mb": {},
+                    "timestamp": 1,
+                    "completion_tokens": 1,
+                    "completion_token_source": "usage.completion_tokens",
+                    "decode_tps": 2.0,
+                },
+            )[0] is False
             fallback_tokens, fallback_source = helper.completion_tokens_from_response({}, "short visible text")
             assert fallback_tokens > 1
             assert fallback_source == "content_estimate"
             benchmark_rows = (root / "results.tsv").read_text(encoding="utf-8")
             assert "prompt-size" in benchmark_rows
             assert "prompt-shape" in benchmark_rows
+            fake_log = root / "fake-proxy.log"
+            fake_log.write_text("before\n", encoding="utf-8")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def read(self):
+                    return b'{"data":[{"id":"local-model"}]}'
+
+            def fake_model_request(_base_url, _payload, _timeout):
+                with fake_log.open("a", encoding="utf-8") as file:
+                    file.write(
+                        "chat completion: prompt=10 completion=96 elapsed=6.00s "
+                        "tok_s=16.0 mtp_rounds=24 mean_accept=0.75\n"
+                    )
+                return (
+                    6.0,
+                    b'{"choices":[{"message":{"content":"done"}}],"usage":{"completion_tokens":96}}',
+                )
+
+            with patch.dict(os.environ, {"OPENCLAW_MODEL_PROXY_LOG": str(fake_log)}, clear=False):
+                with patch.object(helper.urllib.request, "urlopen", return_value=FakeResponse()):
+                    with patch.object(helper, "model_request", side_effect=fake_model_request):
+                        assert helper.benchmark(
+                            Namespace(
+                                base_url="http://127.0.0.1:8091/v1",
+                                model="",
+                                quick=False,
+                                mode="decode-sample",
+                                timeout=1.0,
+                                draft_block_size=3,
+                            )
+                        ) == 0
+            benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
+            benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
+            assert benchmark_data["draft_block_size"] == 3
+            assert benchmark_data["mtp"]["mean_accept"] == 0.75
+            assert "mean_accept=0.75" in (root / "results.tsv").read_text(encoding="utf-8")
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas
