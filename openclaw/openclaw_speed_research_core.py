@@ -17,6 +17,80 @@ RESULTS_HEADER = (
     "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
+BENCHMARK_MANIFEST_VERSION = 1
+DEFAULT_BENCHMARK_MANIFEST: dict[str, Any] = {
+    "version": BENCHMARK_MANIFEST_VERSION,
+    "locked": True,
+    "success_schema": {
+        "required": ["ok", "model", "mode", "wall_s", "memory_before_mb", "memory_after_mb", "timestamp"],
+        "decode-sample": ["completion_tokens", "completion_token_source", "decode_tps"],
+    },
+    "modes": {
+        "quick-health": {
+            "prompt": "Reply with exactly: OK",
+            "max_tokens": 12,
+            "temperature": 0,
+            "stream": False,
+            "prompt_class": "health",
+        },
+        "streaming-ttft": {
+            "prompt": "Reply with exactly: OK",
+            "max_tokens": 12,
+            "temperature": 0,
+            "stream": True,
+            "prompt_class": "health-stream",
+        },
+        "tool-roundtrip": {
+            "prompt": "For OpenClaw speed research, reply with exactly TOOL_ROUNDTRIP_OK and no extra text.",
+            "max_tokens": 24,
+            "temperature": 0,
+            "stream": False,
+            "prompt_class": "tool-minimal",
+        },
+        "decode-sample": {
+            "prompt": "Write one compact paragraph about reducing local LLM decode latency. Keep it practical.",
+            "max_tokens": 96,
+            "temperature": 0,
+            "stream": False,
+            "prompt_class": "normal-text",
+            "requires_usage_completion_tokens": True,
+        },
+        "prefill-reuse": {
+            "prompt": "Reply with one sentence about prefix-cache reuse in local agent harnesses.",
+            "max_tokens": 48,
+            "temperature": 0,
+            "stream": False,
+            "prompt_class": "cache-small",
+        },
+    },
+}
+DEFAULT_INSIGHT_RUBRIC: dict[str, Any] = {
+    "version": 1,
+    "required_fields": ["cause", "evidence", "proposed_change", "expected_metric_delta", "risk", "rollback"],
+    "min_score_for_candidate": 5,
+}
+DEFAULT_REPLAY_CASES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "decode-token-source-required",
+        "failure": "word-count decode estimates polluted task advancement",
+        "guard": "decode-sample evidence must include token_source=usage.completion_tokens",
+    },
+    {
+        "id": "profile-variant-paired-control",
+        "failure": "normal decode benchmark falsely stood in for no-drafter or block-size control",
+        "guard": "profile variants require paired-control plan and restore_live_profile",
+    },
+    {
+        "id": "malformed-tool-fallback",
+        "failure": "malformed tool or hidden output wasted cycles",
+        "guard": "supervisor fallback runs deterministic benchmark or synthesis",
+    },
+    {
+        "id": "memory-pressure-breaker",
+        "failure": "Metal/Python crash risk during long local 31B turns",
+        "guard": "active memory circuit breaker stops unsafe turns",
+    },
+)
 
 DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
@@ -188,6 +262,9 @@ def ensure_research_state(root: Path) -> None:
         path = root / name
         if not path.exists():
             path.write_text("", encoding="utf-8")
+    write_json_if_missing_or_stale(root / "benchmark-manifest.json", DEFAULT_BENCHMARK_MANIFEST, "version")
+    write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
+    ensure_replay_buffer(root / "replay-buffer.jsonl")
     tasks_path = root / "tasks.jsonl"
     if not tasks_path.exists() or tasks_path.stat().st_size == 0:
         write_jsonl(tasks_path, [dict(task) for task in DEFAULT_TASKS])
@@ -206,6 +283,152 @@ def ensure_research_state(root: Path) -> None:
                     changed = True
         if missing or changed:
             write_jsonl(tasks_path, existing + missing)
+
+
+def write_json_if_missing_or_stale(path: Path, payload: dict[str, Any], version_key: str) -> None:
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+        if isinstance(existing, dict) and existing.get(version_key) == payload.get(version_key):
+            return
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def ensure_replay_buffer(path: Path) -> None:
+    existing_ids = {str(row.get("id", "")) for row in read_jsonl(path)}
+    additions = [dict(row) for row in DEFAULT_REPLAY_CASES if str(row["id"]) not in existing_ids]
+    if additions:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            for row in additions:
+                file.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def load_benchmark_manifest(root: Path) -> dict[str, Any]:
+    ensure_research_state(root)
+    path = root / "benchmark-manifest.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = DEFAULT_BENCHMARK_MANIFEST
+    return value if isinstance(value, dict) else DEFAULT_BENCHMARK_MANIFEST
+
+
+def benchmark_spec(root: Path, mode: str) -> dict[str, Any]:
+    manifest = load_benchmark_manifest(root)
+    modes = manifest.get("modes", {})
+    if not isinstance(modes, dict) or mode not in modes:
+        mode = "quick-health"
+    spec = modes.get(mode, {})
+    if not isinstance(spec, dict):
+        spec = DEFAULT_BENCHMARK_MANIFEST["modes"]["quick-health"]
+    return {**spec, "mode": mode, "manifest_version": manifest.get("version", "unknown")}
+
+
+def benchmark_result_schema_ok(root: Path, result: dict[str, Any]) -> tuple[bool, str]:
+    manifest = load_benchmark_manifest(root)
+    schema = manifest.get("success_schema", {})
+    required = list(schema.get("required", [])) if isinstance(schema, dict) else []
+    missing = [key for key in required if key not in result]
+    mode = str(result.get("mode", ""))
+    if isinstance(schema, dict):
+        missing.extend(key for key in schema.get(mode, []) if key not in result)
+    if missing:
+        return False, f"missing result keys: {','.join(sorted(set(missing)))}"
+    if mode == "decode-sample" and result.get("completion_token_source") != "usage.completion_tokens":
+        return False, "decode-sample missing usage.completion_tokens source"
+    return True, ""
+
+
+def score_insight(idea: dict[str, Any], rubric: dict[str, Any] | None = None) -> dict[str, Any]:
+    active = rubric or DEFAULT_INSIGHT_RUBRIC
+    required = [str(item) for item in active.get("required_fields", [])]
+    missing = [field for field in required if not str(idea.get(field, "")).strip()]
+    evidence_text = str(idea.get("evidence", ""))
+    metric_text = str(idea.get("expected_metric_delta", ""))
+    risk_text = str(idea.get("risk", ""))
+    score = len(required) - len(missing)
+    if any(token in evidence_text for token in ("tok/s", "mean_accept", "decode", "benchmark", "completion_tokens")):
+        score += 1
+    if any(token in metric_text for token in ("tok/s", "%", "decode_tps", "mean_accept")):
+        score += 1
+    if risk_text and str(idea.get("rollback", "")).strip():
+        score += 1
+    threshold = int(active.get("min_score_for_candidate", 5))
+    return {
+        "score": score,
+        "threshold": threshold,
+        "passed": score >= threshold and not missing,
+        "missing": missing,
+    }
+
+
+def paired_profile_plan(task: dict[str, Any]) -> dict[str, Any]:
+    target = str(task.get("target", "profile-variant"))
+    return {
+        "task_id": str(task.get("id", "unknown")),
+        "target": target,
+        "status": "plan-only",
+        "control": {
+            "label": "current-live-profile",
+            "restore_before": True,
+            "benchmark_mode": str(task.get("benchmark_mode", "decode-sample")),
+            "samples": 3,
+        },
+        "variant": {
+            "label": target,
+            "set_env": {target: "<candidate-value>"},
+            "benchmark_mode": str(task.get("benchmark_mode", "decode-sample")),
+            "samples": 3,
+        },
+        "promotion_gate": {
+            "min_decode_tps_delta": 0.5,
+            "must_restore_live_profile": True,
+            "must_pass_replay": True,
+            "must_keep_model_id": True,
+        },
+        "rollback": "restore live OpenClaw model profile/env override before any further task",
+    }
+
+
+def replay_checks(root: Path) -> dict[str, Any]:
+    ensure_research_state(root)
+    rows = all_result_rows(root)
+    bad_decode = [
+        row.get("run_id", "")
+        for row in rows
+        if row.get("target") == "decode-sample"
+        and row.get("status") == "keep"
+        and row.get("decode_tps")
+        and "completion_tokens=" in row.get("notes", "")
+        and "token_source=usage.completion_tokens" not in row.get("notes", "")
+    ]
+    legacy_decode = [
+        row.get("run_id", "")
+        for row in rows
+        if row.get("target") == "decode-sample"
+        and row.get("status") == "keep"
+        and row.get("decode_tps")
+        and "completion_tokens=" not in row.get("notes", "")
+    ]
+    tasks = read_jsonl(root / "tasks.jsonl")
+    unsafe_profile_tasks = [
+        str(task.get("id", ""))
+        for task in tasks
+        if task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("target", "")).startswith("OPENCLAW_JANG_DRAFT_")
+        and "restore_live_profile" not in {str(item) for item in task.get("guard_checks", [])}
+    ]
+    passed = not bad_decode and not unsafe_profile_tasks
+    return {
+        "ok": passed,
+        "bad_decode_rows": bad_decode,
+        "legacy_decode_rows_ignored": legacy_decode,
+        "unsafe_profile_tasks": unsafe_profile_tasks,
+        "cases": [row["id"] for row in DEFAULT_REPLAY_CASES],
+    }
 
 
 def normalize_results_ledger(path: Path) -> None:

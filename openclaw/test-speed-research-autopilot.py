@@ -390,6 +390,9 @@ def main() -> int:
         assert "dedicated paired-control runner" in issue
         assert "supervisor-profile-variant-7" in helper.RESULTS.read_text(encoding="utf-8")
         assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
+        paired_plan = helper.WORKSPACE / "experiments" / "paired-profile-plan-profile-variant.json"
+        assert paired_plan.exists()
+        assert "must_restore_live_profile" in paired_plan.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
@@ -404,6 +407,16 @@ def main() -> int:
         assert ok
         assert issue == ""
         assert synth_marker.read_text(encoding="utf-8") == "synthesize --kind frontier"
+        ok, issue = helper.run_supervisor_reflection(
+            synth_args,
+            9,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+            reason="unit-test",
+        )
+        assert ok
+        assert issue == ""
+        assert "supervisor-reflection" in helper.FINDINGS.read_text(encoding="utf-8")
         tasks = [
             {
                 "id": "impl",

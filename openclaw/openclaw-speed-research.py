@@ -22,8 +22,14 @@ from openclaw_speed_research_core import (
     RESULTS_HEADER,
     append_result,
     append_jsonl,
+    benchmark_result_schema_ok,
+    benchmark_spec,
     ensure_research_state,
+    load_benchmark_manifest,
+    paired_profile_plan,
     read_jsonl,
+    replay_checks,
+    score_insight,
     write_jsonl,
 )
 
@@ -994,37 +1000,53 @@ def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         {
             "id": "mtp-acceptance-bottleneck",
             "lane": "production-mtp",
+            "cause": "Speculative decode speed is limited when accepted draft tokens do not offset drafter and verification overhead.",
+            "proposed_change": "Add a deterministic MTP acceptance report and use it to choose the next drafter/block experiment.",
+            "expected_metric_delta": "Raise decode_tps by selecting only changes that improve mean_accept or reduce verification overhead.",
             "expected": "Raise real decode TPS by identifying whether low `mean_accept` or drafter overhead is the limiting factor.",
             "math": "Speculative speedup S ~= T_target_only / (T_draft + T_verify); acceptance must be high enough that avoided target steps exceed drafter cost.",
             "prototype": "Parse recent proxy/server logs for `mtp_rounds`, `mean_accept`, block size, drafter path, and decode tok/s, then compare against no-drafter control.",
             "risk": "Log-only conclusions can be misleading; promote only ideas that survive a paired decode benchmark.",
+            "rollback": "Discard acceptance-based changes unless paired decode benchmarks improve and replay checks pass.",
             "evidence": f"Current decode sample mean={decode if decode is not None else 'not yet measured'} tok/s; live target is >18 tok/s first.",
         },
         {
             "id": "drafter-block-and-quant-sweep",
             "lane": "production-mtp",
+            "cause": "MTP block size and drafter quantization trade off acceptance, overhead, and memory pressure.",
+            "proposed_change": "Create a paired-control sweep plan that restores the live profile around every block/quantization trial.",
+            "expected_metric_delta": "Find a configuration with positive decode_tps_delta over the current live profile.",
             "expected": "Find the fastest safe assistant drafter configuration without changing the JANQ target model.",
             "math": "Choose argmax_config decode_tps(config) subject to memory_ok, no_loop, no_reasoning_leak, and quality_guard.",
             "prototype": "Run a paired sweep for block size and drafter quantization, restoring the live profile after each bounded benchmark.",
             "risk": "A faster synthetic prompt can regress normal text or code; use a fixed mixed prompt set.",
+            "rollback": "Restore the live profile after each trial and keep no setting unless the same prompt set improves.",
             "evidence": "The current live q4 drafter at block size 2 improved decode modestly; prior 3-bit and heuristic schedule attempts were slower.",
         },
         {
             "id": "janq-drafter-alignment",
             "lane": "drafter-alignment",
+            "cause": "The assistant drafter may be misaligned with unlocked JANQ target behavior, lowering acceptance.",
+            "proposed_change": "Gate JANQ-specific calibration by wall-clock decode and acceptance improvements, not loss-only proxies.",
+            "expected_metric_delta": "Improve mean_accept and decode_tps on the fixed manifest prompt set.",
             "expected": "Improve acceptance by making the assistant drafter better match the unlocked JANQ target behavior.",
             "math": "Minimize KL(target_logits || drafter_logits) on rolling JANQ traces, weighted by positions where draft rejection currently occurs.",
             "prototype": "Use `openclaw-mtp-drafter-calibrate.py` to test one narrow calibration target at a time, then benchmark against the official q4 drafter.",
             "risk": "Calibration can overfit traces or slow the drafter; discard unless wall-clock decode TPS improves.",
+            "rollback": "Keep official q4 drafter unless calibrated variant beats it under the promotion gate.",
             "evidence": "Pre-projection-only calibration did not beat official q4, so future calibration must target acceptance gaps with stronger evidence.",
         },
         {
             "id": "mlx-vlm-mtp-loop-overhead",
             "lane": "runtime-overhead",
+            "cause": "Python loop, cache rollback, or verification synchronization may dominate per-token cost.",
+            "proposed_change": "Profile exact MTP loop overhead before proposing a local or upstream patch.",
+            "expected_metric_delta": "Reduce per-token overhead enough to raise decode_tps without changing model outputs.",
             "expected": "Recover speed if the current MLX/VLM MTP loop spends too much time on verification, cache rollback, or synchronization.",
             "math": "Per-token cost C = C_target_verify/k + C_draft + C_cache_rollback + C_python_loop; reduce the largest measured term.",
             "prototype": "Inspect one exact MTP loop source/log at a time and propose a minimal upstreamable or local patch only if timing evidence supports it.",
             "risk": "Runtime loop changes can destabilize streaming, tool parsing, or memory; require tests and easy rollback.",
+            "rollback": "Revert runtime loop patches if replay checks, streaming, or decode benchmarks regress.",
             "evidence": "The desired 30+ tok/s requires either much higher acceptance or lower MTP overhead than the current live path.",
         },
     ]
@@ -1129,15 +1151,21 @@ def synthesize(args: argparse.Namespace) -> int:
         "",
     ]
     for index, idea in enumerate(ideas, start=1):
+        quality = score_insight(idea)
         idea_lines.extend(
             [
                 f"### {index}. {idea['id']}",
                 "",
                 f"- lane: {idea['lane']}",
+                f"- quality score: {quality['score']}/{quality['threshold']} passed={str(quality['passed']).lower()}",
+                f"- cause: {idea['cause']}",
+                f"- proposed change: {idea['proposed_change']}",
+                f"- expected metric delta: {idea['expected_metric_delta']}",
                 f"- expected impact: {idea['expected']}",
                 f"- mathematical handle: {idea['math']}",
                 f"- smallest prototype: {idea['prototype']}",
                 f"- reliability risk: {idea['risk']}",
+                f"- rollback: {idea['rollback']}",
                 f"- evidence: {idea['evidence']}",
                 "",
             ]
@@ -1231,7 +1259,13 @@ def synthesize(args: argparse.Namespace) -> int:
             "timestamp": generated_at,
             "task_id": "synthesize-speed-ideas",
             "finding": "benchmark queue exhausted; synthesized ranked speed ideas and seeded measurable follow-up tasks",
-            "ideas": [idea["id"] for idea in ideas],
+            "ideas": [
+                {
+                    "id": idea["id"],
+                    "quality": score_insight(idea),
+                }
+                for idea in ideas
+            ],
             "implementation_candidates": [
                 task["id"] for task in candidate_tasks if task.get("task_type") == "implementation"
             ],
@@ -1259,23 +1293,58 @@ def compact(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_manifest(_args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    print(json.dumps(load_benchmark_manifest(root), indent=2, sort_keys=True))
+    return 0
+
+
+def replay(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    result = replay_checks(root)
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "replay-regression-checks",
+            "finding": "supervisor replayed known autoresearch failure guards",
+            "evidence": result,
+            "next": "fix failing replay cases before running overnight",
+        },
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] or args.allow_fail else 2
+
+
+def paired_plan(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    task = next((item for item in tasks if item.get("id") == args.task_id), None)
+    if task is None:
+        print(json.dumps({"ok": False, "reason": f"task not found: {args.task_id}"}, indent=2))
+        return 2
+    plan = paired_profile_plan(task)
+    path = root / "experiments" / f"paired-profile-plan-{args.task_id}.json"
+    path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": args.task_id,
+            "status": "paired-profile-plan",
+            "path": str(path),
+            "plan": plan,
+        },
+    )
+    print(json.dumps({"ok": True, "path": str(path), "plan": plan}, indent=2))
+    return 0
+
+
 def benchmark_prompt(mode: str) -> tuple[str, int]:
-    if mode == "tool-roundtrip":
-        return (
-            "For OpenClaw speed research, reply with exactly TOOL_ROUNDTRIP_OK and no extra text.",
-            24,
-        )
-    if mode == "decode-sample":
-        return (
-            "Write one compact paragraph about reducing local LLM decode latency. Keep it practical.",
-            96,
-        )
-    if mode == "prefill-reuse":
-        return (
-            "Reply with one sentence about prefix-cache reuse in local agent harnesses.",
-            48,
-        )
-    return ("Reply with exactly: OK", 12)
+    spec = benchmark_spec(workspace_root(), mode)
+    return str(spec["prompt"]), int(spec["max_tokens"])
 
 
 def prompt_size_probe(root: Path) -> dict[str, Any]:
@@ -1392,14 +1461,15 @@ def benchmark(args: argparse.Namespace) -> int:
         return 2
     data = models.get("data") if isinstance(models, dict) else None
     model = args.model or (data[0].get("id") if isinstance(data, list) and data and isinstance(data[0], dict) else "local-model")
-    prompt, max_tokens = benchmark_prompt(mode)
+    spec = benchmark_spec(root, mode)
+    prompt, max_tokens = str(spec["prompt"]), int(spec["max_tokens"])
     before_memory = memory_snapshot()
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
+        "temperature": spec.get("temperature", 0),
         "max_tokens": max_tokens,
-        "stream": mode == "streaming-ttft",
+        "stream": bool(spec.get("stream", mode == "streaming-ttft")),
     }
     try:
         if mode == "streaming-ttft":
@@ -1429,6 +1499,8 @@ def benchmark(args: argparse.Namespace) -> int:
         "ok": True,
         "model": model,
         "mode": mode,
+        "manifest_version": spec.get("manifest_version", "unknown"),
+        "prompt_class": spec.get("prompt_class", "unknown"),
         "wall_s": round(wall_s, 3),
         "ttft_s": round(ttft_s, 3) if isinstance(ttft_s, float) else ttft_s,
         "completion_tokens": completion_tokens if completion_tokens else "",
@@ -1441,6 +1513,24 @@ def benchmark(args: argparse.Namespace) -> int:
         "content_preview": str(content)[:120],
         "timestamp": int(time.time()),
     }
+    schema_ok, schema_issue = benchmark_result_schema_ok(root, result)
+    if not schema_ok:
+        append_result(
+            root,
+            run_id=f"benchmark-{result['timestamp']}",
+            status="blocked",
+            target=mode,
+            hypothesis=f"bounded OpenClaw {mode} probe",
+            wall_s=result["wall_s"],
+            memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
+            commit=commit,
+            notes=f"schema_issue={schema_issue}",
+        )
+        result["ok"] = False
+        result["status"] = "blocked"
+        result["reason"] = schema_issue
+        print(json.dumps(result, indent=2))
+        return 2
     out = root / "benchmarks" / f"benchmark-{result['timestamp']}-{mode}.json"
     out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     append_result(
@@ -1457,6 +1547,8 @@ def benchmark(args: argparse.Namespace) -> int:
         notes=(
             f"model={model} completion_tokens={completion_tokens} "
             f"token_source={completion_token_source} "
+            f"manifest_version={spec.get('manifest_version', 'unknown')} "
+            f"prompt_class={spec.get('prompt_class', 'unknown')} "
             f"preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}"
         ),
     )
@@ -1546,6 +1638,17 @@ def main() -> int:
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)
     compact_parser.set_defaults(func=compact)
+
+    manifest = sub.add_parser("manifest")
+    manifest.set_defaults(func=print_manifest)
+
+    replay_parser = sub.add_parser("replay")
+    replay_parser.add_argument("--allow-fail", action="store_true")
+    replay_parser.set_defaults(func=replay)
+
+    paired = sub.add_parser("paired-plan")
+    paired.add_argument("--task-id", required=True)
+    paired.set_defaults(func=paired_plan)
 
     args = parser.parse_args()
     return int(args.func(args))

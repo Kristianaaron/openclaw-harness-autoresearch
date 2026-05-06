@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import tempfile
 from argparse import Namespace
@@ -32,6 +33,28 @@ def main() -> int:
             assert (root / "program.md").exists()
             assert (root / "README-openclaw-speed.md").exists()
             assert (root / "implementation-skill.md").exists()
+            assert (root / "benchmark-manifest.json").exists()
+            assert (root / "insight-rubric.json").exists()
+            assert (root / "replay-buffer.jsonl").exists()
+            manifest = json.loads((root / "benchmark-manifest.json").read_text(encoding="utf-8"))
+            assert manifest["locked"] is True
+            assert manifest["modes"]["decode-sample"]["max_tokens"] == 96
+            assert manifest["modes"]["decode-sample"]["requires_usage_completion_tokens"] is True
+            rubric = json.loads((root / "insight-rubric.json").read_text(encoding="utf-8"))
+            assert "rollback" in rubric["required_fields"]
+            replay_cases = (root / "replay-buffer.jsonl").read_text(encoding="utf-8")
+            assert "decode-token-source-required" in replay_cases
+            assert "profile-variant-paired-control" in replay_cases
+            assert helper.replay(Namespace(allow_fail=False)) == 0
+            assert helper.paired_plan(Namespace(task_id="no-drafter-control")) == 0
+            paired_path = root / "experiments" / "paired-profile-plan-no-drafter-control.json"
+            paired = json.loads(paired_path.read_text(encoding="utf-8"))
+            assert paired["control"]["restore_before"] is True
+            assert paired["promotion_gate"]["must_restore_live_profile"] is True
+            assert helper.benchmark_prompt("decode-sample") == (
+                "Write one compact paragraph about reducing local LLM decode latency. Keep it practical.",
+                96,
+            )
             assert (root / "results.tsv").read_text(encoding="utf-8").startswith("timestamp\trun_id\tstatus")
             assert (root / "sources" / "queue.md").exists()
             assert helper.add_source(
@@ -105,6 +128,10 @@ def main() -> int:
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas
+            assert "quality score" in ideas
+            assert "cause:" in ideas
+            assert "expected metric delta:" in ideas
+            assert "rollback:" in ideas
             assert "drafter-block-and-quant-sweep" in ideas
             assert "janq-drafter-alignment" in ideas
             assert "mathematical handle" in ideas
@@ -124,6 +151,7 @@ def main() -> int:
             assert "First tool call: read exactly" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
             assert "synthesize-speed-ideas" in findings
+            assert '"quality"' in findings
             assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
     return 0

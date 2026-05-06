@@ -25,8 +25,10 @@ from openclaw_speed_research_core import (
     complete_task_from_evidence,
     cycle_quality,
     ensure_research_state,
+    paired_profile_plan,
     read_jsonl,
     record_rejection,
+    replay_checks,
     select_next_task,
     task_summary,
     write_jsonl,
@@ -1202,10 +1204,15 @@ def run_supervisor_profile_variant_guard(
     log_file: Path,
 ) -> tuple[int, str]:
     reason = "profile variant task requires a dedicated paired-control runner; raw benchmark would be invalid"
+    plan = paired_profile_plan(task)
+    plan_path = WORKSPACE / "experiments" / f"paired-profile-plan-{task.get('id', 'unknown')}.json"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = {
         "reason": reason,
         "target": str(task.get("target", "")),
         "guard_checks": task.get("guard_checks", []),
+        "paired_plan": str(plan_path),
         "next": "implement bounded profile-variant runner with restore-before/after and same-prompt comparison",
     }
     with log_file.open("a", encoding="utf-8") as file:
@@ -1289,6 +1296,23 @@ def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
         subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
 
 
+def run_supervisor_reflection(args: argparse.Namespace, cycle: int, session: str, log_file: Path, reason: str) -> tuple[bool, str]:
+    replay_result = replay_checks(WORKSPACE)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "supervisor-reflection",
+            "finding": "reflection checkpoint ran replay guards before synthesis",
+            "reason": reason,
+            "replay": replay_result,
+        },
+    )
+    if not replay_result["ok"]:
+        return False, f"replay guards failed: {replay_result}"
+    return run_supervisor_synthesis(args, cycle, session, log_file)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run OpenClaw speed autoresearch in autonomous cycles.")
     parser.add_argument("--openclaw-bin", default=os.environ.get("OPENCLAW_REAL_BIN", "/opt/homebrew/bin/openclaw"))
@@ -1304,6 +1328,7 @@ def main() -> int:
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--supervisor-benchmark-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SUPERVISOR_BENCHMARK_TIMEOUT", "180")))
     parser.add_argument("--model-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_START_TIMEOUT", "420")))
+    parser.add_argument("--reflection-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REFLECTION_INTERVAL", "4")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
@@ -1362,6 +1387,11 @@ def main() -> int:
     blocked_cycles = 0
     log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
     run_supervisor_compaction(args, log_file)
+    replay_start = replay_checks(WORKSPACE)
+    if not replay_start["ok"]:
+        append_supervisor_result(0, args.session, "blocked", f"startup replay failed: {replay_start}")
+        log(f"startup replay guards failed: {replay_start}")
+        return 2
     for cycle in range(1, args.cycles + 1):
         if not args.reuse_session:
             current_session = f"{args.session}-cycle-{cycle:03d}"
@@ -1487,6 +1517,22 @@ def main() -> int:
                     f"cycle={cycle} advanced implementation task={advancement['task_id']} "
                     f"artifacts={','.join(str(item) for item in advancement.get('artifacts', []))}"
                 )
+        if (
+            progressed
+            and args.reflection_interval > 0
+            and progress_cycles > 0
+            and progress_cycles % args.reflection_interval == 0
+        ):
+            reflection_ok, reflection_issue = run_supervisor_reflection(
+                args,
+                cycle,
+                current_session,
+                log_file,
+                reason=f"progress_cycles={progress_cycles}",
+            )
+            log(
+                f"cycle={cycle} reflection ok={reflection_ok} issue={reflection_issue or 'none'}"
+            )
         if code not in {0, 124}:
             log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
         if not progressed:
