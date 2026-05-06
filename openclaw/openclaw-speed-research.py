@@ -39,6 +39,31 @@ from openclaw_speed_research_core import (
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8091/v1"
 DEFAULT_PROXY_LOG = "/Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
+DEFAULT_PATCH_TESTS = (
+    "python3 openclaw/test-speed-research.py",
+    "python3 openclaw/test-speed-research-autopilot.py",
+)
+ALLOWED_PATCH_PREFIXES = (
+    "openclaw/",
+    "docs/case-studies/",
+)
+ARCHITECTURAL_PATCH_PREFIXES = (
+    "openclaw/openclaw-wrapper.zsh",
+    "openclaw/openclaw-model-proxy.py",
+    "openclaw/openclaw-jang-vlm-server.py",
+    "openclaw/openclaw-jang-vlm-launcher.py",
+    "openclaw/model-profiles",
+)
+DENIED_PATCH_FRAGMENTS = (
+    ".env",
+    "opencode",
+    "token",
+    "secret",
+    "password",
+    "id_rsa",
+    ".pem",
+    ".key",
+)
 
 
 def home() -> Path:
@@ -410,13 +435,22 @@ Before editing source, state:
 1. State the accepted insight in one sentence.
 2. Identify the exact file or model-profile knob to change.
 3. Define the expected behavior and the failure mode being prevented or improved.
-4. Make the smallest cohesive patch.
-5. Add or update the narrowest relevant test.
-6. Run focused tests before deployment.
+4. Make the smallest cohesive patch as a patch file.
+5. Run `openclaw-speed-research patch-execute` so the patch is classified, applied in a canary worktree, tested, and only then promoted.
+6. Add or update the narrowest relevant test.
 7. Deploy to `~/.openclaw` only after tests pass.
 8. Run a bounded benchmark or record why it is blocked.
 9. Record `keep`, `discard`, or `blocked` in `results.tsv`.
 10. Revert your own failed experiment if it does not improve speed, reliability, or maintainability.
+
+## Patch Executor Rules
+
+- Safe and moderate patches can auto-promote only after canary apply and allowlisted tests pass.
+- Architectural patches are held after canary unless `allow_architectural` is explicitly set by the supervisor.
+- Destructive patches are blocked before canary.
+- Patch files must touch allowlisted OpenClaw paths only.
+- Patch files must not touch opencode, `.env`, secrets, passwords, tokens, private keys, or private runtime config.
+- A canary artifact must record impact classification, changed files, tests, promotion decision, and rollback state.
 
 ## Code Quality Rules
 
@@ -710,10 +744,10 @@ Before implementing an idea, prove it belongs in this setup:
 1. Identify the specific source file or model profile knob.
 2. Name the evidence from `results.tsv`, a benchmark JSON file, a log excerpt, or `ideas.md`.
 3. Write a one-sentence expected behavior.
-4. Make the smallest source/config change.
-5. Add or update the narrowest relevant test.
-6. Run focused tests.
-7. Deploy only if tests pass.
+4. Generate the smallest source/config patch file.
+5. Run the patch through `openclaw-speed-research patch-execute`.
+6. Add or update the narrowest relevant test.
+7. Deploy only if the canary and focused tests pass.
 8. Run a realistic benchmark or record why it is blocked.
 9. Record `keep`, `discard`, or `blocked` in `results.tsv` with the reason.
 
@@ -1803,6 +1837,284 @@ def mtp_report(args: argparse.Namespace) -> int:
     return 0 if summary["ok"] else 2
 
 
+def repo_root() -> Path:
+    return Path(
+        os.environ.get(
+            "OPENCLAW_SPEED_RESEARCH_REPO",
+            "/Users/kristian/Documents/openclaw-harness-autoresearch",
+        )
+    ).expanduser()
+
+
+def normalize_patch_path(path: str) -> str:
+    cleaned = path.strip()
+    if cleaned == "/dev/null":
+        return cleaned
+    for prefix in ("a/", "b/"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+    return cleaned
+
+
+def patch_files(patch_text: str) -> list[str]:
+    files: set[str] = set()
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            for item in parts[2:4]:
+                path = normalize_patch_path(item)
+                if path != "/dev/null":
+                    files.add(path)
+        elif line.startswith("+++ ") or line.startswith("--- "):
+            path = normalize_patch_path(line[4:].split("\t", 1)[0])
+            if path != "/dev/null":
+                files.add(path)
+    return sorted(files)
+
+
+def classify_patch(
+    patch_text: str,
+    *,
+    source_files: list[str] | None = None,
+    allow_architectural: bool = False,
+) -> dict[str, Any]:
+    files = patch_files(patch_text)
+    additions = 0
+    deletions = 0
+    reasons: list[str] = []
+    source_allowlist = {normalize_patch_path(path) for path in source_files or [] if path}
+    for line in patch_text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    if not files:
+        reasons.append("patch has no file changes")
+    for path in files:
+        if path.startswith("/") or ".." in Path(path).parts:
+            reasons.append(f"unsafe path: {path}")
+        lowered = path.lower()
+        if any(fragment in lowered for fragment in DENIED_PATCH_FRAGMENTS):
+            reasons.append(f"denied path fragment: {path}")
+        if not path.startswith(ALLOWED_PATCH_PREFIXES):
+            reasons.append(f"path outside allowlist: {path}")
+        if source_allowlist and path not in source_allowlist:
+            reasons.append(f"path outside task source_files: {path}")
+    changed_lines = additions + deletions
+    architectural = any(path.startswith(ARCHITECTURAL_PATCH_PREFIXES) for path in files)
+    if len(files) > 3 or changed_lines > 220:
+        architectural = True
+    destructive = bool(reasons) or deletions > additions * 3 + 20
+    if destructive:
+        impact = "destructive"
+    elif architectural:
+        impact = "architectural"
+    elif changed_lines <= 80 and len(files) <= 2:
+        impact = "safe"
+    else:
+        impact = "moderate"
+    auto_promote = impact in {"safe", "moderate"} or (impact == "architectural" and allow_architectural)
+    if impact == "architectural" and not allow_architectural:
+        reasons.append("architectural change requires canary evidence and explicit allow_architectural")
+    return {
+        "files": files,
+        "additions": additions,
+        "deletions": deletions,
+        "changed_lines": changed_lines,
+        "impact": impact,
+        "architectural": architectural,
+        "auto_promote": auto_promote and not destructive,
+        "allowed": not destructive,
+        "reasons": reasons,
+    }
+
+
+def run_test_command(command: str, *, cwd: Path, timeout: float) -> dict[str, Any]:
+    allowed = set(DEFAULT_PATCH_TESTS)
+    if command not in allowed:
+        return {"ok": False, "command": command, "reason": "test command is not allowlisted"}
+    try:
+        result = subprocess.run(
+            command.split(),
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "command": command, "reason": "test timeout"}
+    return {
+        "ok": result.returncode == 0,
+        "command": command,
+        "returncode": result.returncode,
+        "output_tail": result.stdout[-2000:],
+    }
+
+
+def patch_execute(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    repo = Path(args.repo or repo_root()).expanduser()
+    patch_path = Path(args.patch_file).expanduser()
+    if not patch_path.exists():
+        result = {"ok": False, "reason": f"patch file not found: {patch_path}"}
+        print(json.dumps(result, indent=2))
+        return 2
+    patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+    source_files = [item.strip() for item in args.source_files.split(",") if item.strip()]
+    classification = classify_patch(
+        patch_text,
+        source_files=source_files or None,
+        allow_architectural=args.allow_architectural,
+    )
+    timestamp = int(time.time())
+    task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.task_id or "manual").strip("-") or "manual"
+    artifact_id = f"{timestamp}-{task_slug}"
+    canary_root = root / "canaries"
+    canary_root.mkdir(parents=True, exist_ok=True)
+    canary = canary_root / f"patch-{artifact_id}"
+    artifact: dict[str, Any] = {
+        "ok": False,
+        "kind": "patch-executor",
+        "timestamp": timestamp,
+        "patch_file": str(patch_path),
+        "repo": str(repo),
+        "canary": str(canary),
+        "classification": classification,
+        "promoted": False,
+        "tests": [],
+    }
+    status = "blocked"
+    reason = ""
+    return_code = 2
+    try:
+        if not classification["allowed"]:
+            reason = "patch failed allowlist or safety classification"
+            artifact["reason"] = reason
+        else:
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "--detach", str(canary), "HEAD"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=True,
+            )
+            check = subprocess.run(
+                ["git", "-C", str(canary), "apply", "--check", str(patch_path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            artifact["apply_check"] = {"ok": check.returncode == 0, "stderr": check.stderr[-2000:]}
+            if check.returncode != 0:
+                reason = "patch did not apply cleanly in canary"
+                artifact["reason"] = reason
+            else:
+                apply = subprocess.run(
+                    ["git", "-C", str(canary), "apply", str(patch_path)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    check=False,
+                )
+                artifact["canary_apply"] = {"ok": apply.returncode == 0, "stderr": apply.stderr[-2000:]}
+                tests = [item.strip() for item in args.tests.split(";") if item.strip()] or list(DEFAULT_PATCH_TESTS)
+                artifact["tests"] = [run_test_command(command, cwd=canary, timeout=args.test_timeout) for command in tests]
+                tests_ok = all(item.get("ok") for item in artifact["tests"])
+                if apply.returncode != 0:
+                    reason = "patch apply failed in canary"
+                    artifact["reason"] = reason
+                elif not tests_ok:
+                    reason = "canary tests failed"
+                    artifact["reason"] = reason
+                elif not classification["auto_promote"] or args.canary_only:
+                    reason = "canary passed; promotion intentionally held"
+                    artifact["reason"] = reason
+                    status = "keep"
+                    return_code = 0
+                else:
+                    main_check = subprocess.run(
+                        ["git", "-C", str(repo), "apply", "--check", str(patch_path)],
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=30,
+                        check=False,
+                    )
+                    artifact["main_apply_check"] = {"ok": main_check.returncode == 0, "stderr": main_check.stderr[-2000:]}
+                    if main_check.returncode != 0:
+                        reason = "patch no longer applies to main repo"
+                        artifact["reason"] = reason
+                    else:
+                        main_apply = subprocess.run(
+                            ["git", "-C", str(repo), "apply", str(patch_path)],
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=30,
+                            check=False,
+                        )
+                        artifact["main_apply"] = {"ok": main_apply.returncode == 0, "stderr": main_apply.stderr[-2000:]}
+                        artifact["promoted"] = main_apply.returncode == 0
+                        status = "keep" if artifact["promoted"] else "blocked"
+                        reason = "" if artifact["promoted"] else "main repo apply failed"
+                        if reason:
+                            artifact["reason"] = reason
+                        return_code = 0 if artifact["promoted"] else 2
+    except subprocess.CalledProcessError as error:
+        reason = f"git canary setup failed: {error.stderr[-500:] if error.stderr else error}"
+        artifact["reason"] = reason
+    except subprocess.TimeoutExpired:
+        reason = "patch executor timeout"
+        artifact["reason"] = reason
+        return_code = 124
+    finally:
+        if not args.keep_canary and canary.exists():
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(canary)],
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            artifact["canary_removed"] = True
+    artifact["ok"] = return_code == 0
+    path = root / "experiments" / f"patch-executor-{artifact_id}.json"
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": args.task_id or "patch-executor",
+            "status": "patch-executor",
+            "path": str(path),
+            "impact": classification["impact"],
+            "promoted": artifact["promoted"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"patch-executor-{artifact_id}",
+        status=status,
+        target="patch-executor",
+        hypothesis=args.hypothesis or "canary-test allowlisted patch before promotion",
+        commit=current_commit(repo),
+        notes=(
+            f"impact={classification['impact']} promoted={artifact['promoted']} "
+            f"files={len(classification['files'])} reason={reason} path={path}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **artifact}, indent=2))
+    return return_code
+
+
 def benchmark_prompt(mode: str) -> tuple[str, int]:
     spec = benchmark_spec(workspace_root(), mode)
     return str(spec["prompt"]), int(spec["max_tokens"])
@@ -2148,6 +2460,19 @@ def main() -> int:
     report.add_argument("--lines", type=int, default=160)
     report.add_argument("--log-path", default="")
     report.set_defaults(func=mtp_report)
+
+    patch = sub.add_parser("patch-execute")
+    patch.add_argument("--patch-file", required=True)
+    patch.add_argument("--task-id", default="")
+    patch.add_argument("--hypothesis", default="")
+    patch.add_argument("--source-files", default="")
+    patch.add_argument("--tests", default=";".join(DEFAULT_PATCH_TESTS))
+    patch.add_argument("--repo", default="")
+    patch.add_argument("--test-timeout", type=float, default=90.0)
+    patch.add_argument("--canary-only", action="store_true")
+    patch.add_argument("--keep-canary", action="store_true")
+    patch.add_argument("--allow-architectural", action="store_true")
+    patch.set_defaults(func=patch_execute)
 
     args = parser.parse_args()
     return int(args.func(args))

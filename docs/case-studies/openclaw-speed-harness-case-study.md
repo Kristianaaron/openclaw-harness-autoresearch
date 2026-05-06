@@ -129,6 +129,29 @@ The production rule is now: the LLM may generate hypotheses and synthesis, but
 benchmarks, MTP reports, drafter sweeps, task advancement, replay checks, and
 bridge recovery are owned by deterministic code.
 
+## Patch Executor Layer - 2026-05-06
+
+OpenClaw now has a deliberate patch execution path inspired by coding-agent
+evaluation patterns: produce a patch, classify it, canary it, test it, and only
+then promote it.
+
+- patch files are classified as `safe`, `moderate`, `architectural`, or
+  `destructive`;
+- patch paths are allowlisted to OpenClaw-owned source/docs paths;
+- opencode, `.env`, token, password, secret, key, and private config paths are
+  blocked before canary;
+- patches are applied first in an isolated git worktree under the research
+  workspace;
+- only allowlisted focused tests can run in the canary;
+- safe/moderate patches can promote after canary success;
+- architectural patches are held unless the supervisor explicitly allows them;
+- every run records a patch-executor artifact with impact, files, test output,
+  promotion state, and rollback status.
+
+This makes implementation a gated artifact flow rather than a free-form model
+edit. The model can still propose or author patch files, but the supervisor owns
+whether they are safe enough to touch the main repo.
+
 ## Open Questions
 
 - Can the supervisor execute the full drafter block-size sweep rather than only

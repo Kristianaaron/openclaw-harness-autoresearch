@@ -388,6 +388,15 @@ def is_supervisor_implementation_bridge_task(task: dict[str, object] | None) -> 
     )
 
 
+def is_supervisor_patch_execute_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "patch-execute"
+        or "openclaw-speed-research patch-execute" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_drafter_fit_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -1558,6 +1567,68 @@ def run_supervisor_implementation_bridge(
     return (0, "") if status == "keep" else (2, issue or "no deterministic implementation tasks available")
 
 
+def run_supervisor_patch_execute_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    patch_file = str(task.get("patch_file") or task.get("patch") or "")
+    if not patch_file:
+        reason = "patch-execute task missing patch_file"
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason}, commit=current_commit())
+        return 2, reason
+    source_files = ",".join(str(item) for item in task.get("source_files", []) if item)
+    tests = ";".join(str(item) for item in task.get("tests", []) if item)
+    cmd = [
+        args.research_helper_bin,
+        "patch-execute",
+        "--patch-file",
+        patch_file,
+        "--task-id",
+        str(task.get("id", "patch-execute")),
+        "--hypothesis",
+        str(task.get("hypothesis", "canary-test allowlisted patch before promotion")),
+        "--source-files",
+        source_files,
+    ]
+    if tests:
+        cmd.extend(["--tests", tests])
+    if task.get("canary_only", False):
+        cmd.append("--canary-only")
+    if task.get("allow_architectural", False):
+        cmd.append("--allow-architectural")
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor patch execute "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=args.patch_execute_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR PATCH EXECUTOR TIMEOUT\n")
+            return 124, "supervisor patch executor timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor patch executor exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
 def run_supervisor_drafter_sweep_plan(
     args: argparse.Namespace,
     cycle: int,
@@ -1903,6 +1974,7 @@ def main() -> int:
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--patch-execute-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_PATCH_EXECUTE_TIMEOUT", "300")))
     parser.add_argument("--supervisor-benchmark-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SUPERVISOR_BENCHMARK_TIMEOUT", "180")))
     parser.add_argument("--model-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_START_TIMEOUT", "420")))
     parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("OPENCLAW_GATEWAY_PORT", "18789")))
@@ -2036,6 +2108,8 @@ def main() -> int:
             code, issue = run_supervisor_mtp_report_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_implementation_bridge_task(selected_task):
             code, issue = run_supervisor_implementation_bridge(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_patch_execute_task(selected_task):
+            code, issue = run_supervisor_patch_execute_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_focused_test_task(selected_task):
             code, issue = run_supervisor_focused_test_task(cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):

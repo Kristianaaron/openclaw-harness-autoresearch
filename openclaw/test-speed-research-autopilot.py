@@ -102,6 +102,9 @@ def main() -> int:
     assert helper.is_supervisor_implementation_bridge_task(
         {"id": "implementation-bridge-cycle-001", "task_type": "supervisor"}
     )
+    assert helper.is_supervisor_patch_execute_task(
+        {"task_type": "supervisor", "supervisor_action": "patch-execute"}
+    )
     assert helper.is_supervisor_drafter_fit_task(
         {
             "task_type": "supervisor",
@@ -546,6 +549,42 @@ def main() -> int:
         assert issue == ""
         assert fit_plan.exists()
         assert "supervisor-drafter-fit-9" in helper.RESULTS.read_text(encoding="utf-8")
+        patch_helper = Path(tmp) / "patch-helper.py"
+        patch_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok': True, 'promoted': False, 'classification': {'impact': 'safe'}}))\n",
+            encoding="utf-8",
+        )
+        patch_helper.chmod(0o700)
+        patch_file = Path(tmp) / "proposal.patch"
+        patch_file.write_text("diff --git a/openclaw/x.py b/openclaw/x.py\n", encoding="utf-8")
+        patch_args = Namespace(research_helper_bin=str(patch_helper), patch_execute_timeout_seconds=5)
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "patch",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "patch-execute",
+                    "patch_file": str(patch_file),
+                    "source_files": ["openclaw/x.py"],
+                    "tests": ["python3 openclaw/test-speed-research.py"],
+                    "hypothesis": "canary patch",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_patch_execute_task(
+            patch_args,
+            10,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
         helper.write_jsonl(
             helper.TASKS,
             [

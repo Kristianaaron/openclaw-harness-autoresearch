@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 from argparse import Namespace
 from pathlib import Path
@@ -257,6 +258,54 @@ def main() -> int:
             assert '"quality"' in findings
             assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
+            patch_repo = Path(tmp) / "patch-repo"
+            (patch_repo / "openclaw").mkdir(parents=True)
+            (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (patch_repo / "openclaw" / "test-speed-research.py").write_text("print('ok')\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=patch_repo, stdout=subprocess.DEVNULL, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=patch_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=patch_repo, check=True)
+            subprocess.run(["git", "add", "."], cwd=patch_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=patch_repo, stdout=subprocess.DEVNULL, check=True)
+            (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+            patch_file = root / "patches" / "sample.patch"
+            patch_file.parent.mkdir(parents=True, exist_ok=True)
+            diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)
+            patch_file.write_text(diff.stdout, encoding="utf-8")
+            subprocess.run(["git", "checkout", "--", "openclaw/sample.py"], cwd=patch_repo, check=True)
+            assert helper.classify_patch(diff.stdout, source_files=["openclaw/sample.py"])["impact"] == "safe"
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(patch_file),
+                    task_id="unit-patch",
+                    hypothesis="unit patch",
+                    source_files="openclaw/sample.py",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=True,
+                    keep_canary=False,
+                    allow_architectural=False,
+                )
+            ) == 0
+            assert "patch-executor" in (root / "results.tsv").read_text(encoding="utf-8")
+            bad_patch = "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-A=1\n+A=2\n"
+            bad_patch_file = root / "patches" / "bad.patch"
+            bad_patch_file.write_text(bad_patch, encoding="utf-8")
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(bad_patch_file),
+                    task_id="bad-patch",
+                    hypothesis="bad patch",
+                    source_files="",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=True,
+                    keep_canary=False,
+                    allow_architectural=False,
+                )
+            ) == 2
     return 0
 
 
