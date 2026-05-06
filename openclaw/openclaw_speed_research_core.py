@@ -135,13 +135,13 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "priority": 80,
         "lane": "mtp-decode",
         "task_type": "supervisor",
-        "supervisor_action": "drafter-sweep-plan",
+        "supervisor_action": "drafter-sweep-run",
         "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
-        "hypothesis": "MTP block size controls the acceptance/overhead tradeoff and should be swept on the same prompt set.",
+        "hypothesis": "MTP block size controls the acceptance/overhead tradeoff and must be swept on the same prompt set before promotion.",
         "metric": "decode_tps",
         "benchmark_mode": "decode-sample",
         "guard_checks": ["memory_ok", "restore_live_profile", "same_prompt_set"],
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-plan --blocks 1,2,3,4",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
     },
     {
         "id": "janq-dflash-drafter-fit-plan",
@@ -175,8 +175,8 @@ TASK_MIGRATIONS: dict[str, dict[str, Any]] = {
     "drafter-block-sweep-plan": {
         "status": "ready",
         "task_type": "supervisor",
-        "supervisor_action": "drafter-sweep-plan",
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-plan --blocks 1,2,3,4",
+        "supervisor_action": "drafter-sweep-run",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
         "blocked_reason": "",
         "supervisor_summary": {},
     },
@@ -184,6 +184,22 @@ TASK_MIGRATIONS: dict[str, dict[str, Any]] = {
         "status": "ready",
         "task_type": "supervisor",
         "supervisor_action": "focused-test",
+    },
+    "implement-mtp-acceptance-report": {
+        "status": "ready",
+        "task_type": "supervisor",
+        "supervisor_action": "mtp-report",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 160",
+        "blocked_reason": "",
+        "supervisor_summary": {},
+    },
+    "implement-drafter-sweep-plan": {
+        "status": "ready",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-sweep-run",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
+        "blocked_reason": "",
+        "supervisor_summary": {},
     },
     "implement-janq-drafter-calibration-gate": {
         "status": "blocked",
@@ -313,6 +329,19 @@ def ensure_research_state(root: Path) -> None:
         missing = [dict(task) for task in DEFAULT_TASKS if str(task["id"]) not in existing_ids]
         changed = False
         for task in existing:
+            task_id = str(task.get("id", ""))
+            if task_id.startswith("implementation-bridge-") and task.get("status", "ready") in {"ready", "rework"}:
+                bridge_update = {
+                    "task_type": "supervisor",
+                    "supervisor_action": "implementation-bridge",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                    "blocked_reason": "",
+                    "supervisor_summary": {},
+                }
+                for key, value in bridge_update.items():
+                    if task.get(key) != value:
+                        task[key] = value
+                        changed = True
             migration = TASK_MIGRATIONS.get(str(task.get("id", "")))
             if not migration:
                 continue

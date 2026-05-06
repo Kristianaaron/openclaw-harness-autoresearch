@@ -204,11 +204,27 @@ def main() -> int:
                                 draft_block_size=3,
                             )
                         ) == 0
+                        assert helper.drafter_sweep_run(
+                            Namespace(
+                                base_url="http://127.0.0.1:8091/v1",
+                                model="",
+                                blocks="1,2",
+                                samples=1,
+                                min_delta=0.5,
+                                control_block=2,
+                                timeout=1.0,
+                            )
+                        ) == 0
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
-            assert benchmark_data["draft_block_size"] == 3
+            assert benchmark_data["draft_block_size"] in {1, 2, 3}
             assert benchmark_data["mtp"]["mean_accept"] == 0.75
             assert "mean_accept=0.75" in (root / "results.tsv").read_text(encoding="utf-8")
+            sweep_run_paths = list((root / "experiments").glob("mtp-drafter-sweep-run-*.json"))
+            assert sweep_run_paths
+            sweep_run = json.loads(sweep_run_paths[-1].read_text(encoding="utf-8"))
+            assert sweep_run["decision"] in {"keep-current", "promotion-ready"}
+            assert sweep_run["promotion_gate"]["must_restore_live_profile"] is True
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas
@@ -233,7 +249,8 @@ def main() -> int:
             assert "implement-drafter-sweep-plan" in tasks
             assert "implement-janq-drafter-calibration-gate" in tasks
             assert "dflash-janq-compatibility-spike" in tasks
-            assert '"task_type": "implementation"' in tasks
+            assert '"supervisor_action": "drafter-sweep-run"' in tasks
+            assert "openclaw-speed-research mtp-report" in tasks
             assert "First tool call: read exactly" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
             assert "synthesize-speed-ideas" in findings

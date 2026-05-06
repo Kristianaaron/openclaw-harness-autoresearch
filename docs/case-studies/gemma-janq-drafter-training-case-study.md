@@ -88,6 +88,18 @@ generating another plan. The promotion gate should compare each variant against
 the current live default and reject every change unless wall-clock decode speed,
 acceptance, stream safety, tool safety, and reasoning-loop guards all pass.
 
+## Deterministic Drafter Sweep - 2026-05-06
+
+The block-size search is now an executable supervisor task, not an instruction
+for the model to remember. `drafter-sweep-run` runs the current control block
+and candidate block sizes on the same decode benchmark, records decode TPS,
+MTP acceptance, MTP rounds, replay status, and a promotion decision.
+
+Promotion remains gated: no live TUI default changes unless the candidate beats
+the current control by the configured decode TPS delta and replay guards pass.
+This keeps overnight research useful without letting a faster-but-unsafe drafter
+silently enter normal OpenClaw chat.
+
 ## Training Loop Design
 
 The drafter training/calibration loop should be staged:

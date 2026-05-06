@@ -83,7 +83,7 @@ def main() -> int:
     assert helper.is_supervisor_drafter_sweep_task(
         {
             "task_type": "supervisor",
-            "supervisor_action": "drafter-sweep-plan",
+            "supervisor_action": "drafter-sweep-run",
             "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
             "guard_checks": ["restore_live_profile"],
         }
@@ -95,6 +95,12 @@ def main() -> int:
             "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
             "guard_checks": ["restore_live_profile"],
         }
+    )
+    assert helper.is_supervisor_mtp_report_task(
+        {"task_type": "supervisor", "supervisor_action": "mtp-report"}
+    )
+    assert helper.is_supervisor_implementation_bridge_task(
+        {"id": "implementation-bridge-cycle-001", "task_type": "supervisor"}
     )
     assert helper.is_supervisor_drafter_fit_task(
         {
@@ -210,6 +216,7 @@ def main() -> int:
         assert "TUI-relevant real decode TPS" in recurring_tasks
         assert "mtp-acceptance-review-cycle-042" in recurring_tasks
         assert "implementation-bridge-cycle-042" in recurring_tasks
+        assert '"supervisor_action": "implementation-bridge"' in recurring_tasks
         assert "autopilot-refill" in helper.RESULTS.read_text(encoding="utf-8")
         selected = helper.select_next_task(helper.WORKSPACE)
         assert selected["id"] == "decode-mtp-baseline"

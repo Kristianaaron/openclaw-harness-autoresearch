@@ -110,6 +110,25 @@ executable, with paired measurements for block sizes 1, 2, 3, and 4, plus a
 no-drafter control if the backend can expose one safely. Do not rely on the LLM
 to turn the sweep plan into benchmark execution.
 
+## Deterministic Pipeline Upgrade - 2026-05-06
+
+The autoresearch loop now has a supervisor-owned implementation bridge for the
+current speed work:
+
+- `drafter-sweep-run` executes the paired block-size sweep directly instead of
+  only writing a plan;
+- MTP acceptance reporting is a deterministic `mtp-report` task;
+- recurring implementation bridges synthesize and seed deterministic supervisor
+  tasks instead of prompting the model to improvise a patch;
+- old dynamic `implementation-bridge-*` tasks are migrated away from free-form
+  implementation turns;
+- stale live bridge tasks from earlier runs were blocked so the next run starts
+  from concrete supervisor tasks.
+
+The production rule is now: the LLM may generate hypotheses and synthesis, but
+benchmarks, MTP reports, drafter sweeps, task advancement, replay checks, and
+bridge recovery are owned by deterministic code.
+
 ## Open Questions
 
 - Can the supervisor execute the full drafter block-size sweep rather than only

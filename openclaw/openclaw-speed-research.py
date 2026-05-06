@@ -9,6 +9,8 @@ discipline. It intentionally does not start a model by itself.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -1201,7 +1203,8 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "status": "ready",
             "priority": 74,
             "lane": "production-mtp",
-            "task_type": "implementation",
+            "task_type": "supervisor",
+            "supervisor_action": "mtp-report",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
             "hypothesis": "A benchmark-side MTP acceptance report will make decode research deterministic instead of relying on ad hoc log reading.",
@@ -1210,12 +1213,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "acceptance": "Focused tests pass and decode benchmark artifacts include MTP acceptance fields when logs expose them.",
             "rollback": "Revert only the acceptance-report patch and record discard if artifacts become noisy or misleading.",
             "evidence": speed_gap,
-            "next_action": (
-                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
-                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-speed-research.py. "
-                "Patch only openclaw/openclaw-speed-research.py and openclaw/test-speed-research.py, then run exactly "
-                "python3 openclaw/test-speed-research.py."
-            ),
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 160",
         },
         {
             "id": "implement-drafter-sweep-plan",
@@ -1223,16 +1221,16 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "priority": 72,
             "lane": "production-mtp",
             "task_type": "supervisor",
-            "supervisor_action": "drafter-sweep-plan",
+            "supervisor_action": "drafter-sweep-run",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "A bounded drafter block/quantization sweep plan can search decode speed safely without manual overnight babysitting.",
+            "hypothesis": "A bounded drafter block sweep can search decode speed safely without manual overnight babysitting.",
             "metric": "decode_tps",
             "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile"],
-            "acceptance": "A dry-run sweep manifest is generated with fixed prompt set, rollback, and memory gates before any live setting is promoted.",
-            "rollback": "Remove the sweep planner if it creates ambiguous or unsafe profile recommendations.",
+            "acceptance": "A paired sweep artifact records control and variant decode TPS, MTP acceptance, promotion decision, and rollback policy.",
+            "rollback": "Keep the current live block size unless a variant beats the promotion gate.",
             "evidence": speed_gap,
-            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-plan --blocks 1,2,3,4",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
         },
         {
             "id": "janq-dflash-drafter-fit-plan",
@@ -1256,7 +1254,8 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "status": "ready",
             "priority": 68,
             "lane": "drafter-alignment",
-            "task_type": "implementation",
+            "task_type": "supervisor",
+            "supervisor_action": "focused-test",
             "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
             "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/test-speed-research.py"],
             "hypothesis": "JANQ drafter calibration must be gated by decode TPS and acceptance improvements, not loss-only improvements.",
@@ -1265,11 +1264,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "acceptance": "The calibrator records pass/fail evidence against the official q4 drafter and refuses promotion unless wall-clock decode TPS improves.",
             "rollback": "Remove the gate if it blocks valid calibration or cannot compare against baseline safely.",
             "evidence": speed_gap,
-            "next_action": (
-                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
-                "Then read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py. "
-                "Add a promotion gate only; do not change the live drafter automatically."
-            ),
+            "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
         },
         {
             "id": "dflash-janq-compatibility-spike",
@@ -1339,7 +1334,7 @@ def synthesize(args: argparse.Namespace) -> int:
         ]
     )
     for task in implementation_tasks:
-        if task.get("task_type") != "implementation":
+        if task.get("task_type") not in {"implementation", "supervisor"}:
             continue
         idea_lines.extend(
             [
@@ -1426,7 +1421,9 @@ def synthesize(args: argparse.Namespace) -> int:
                 for idea in ideas
             ],
             "implementation_candidates": [
-                task["id"] for task in candidate_tasks if task.get("task_type") == "implementation"
+                task["id"]
+                for task in candidate_tasks
+                if task.get("task_type") in {"implementation", "supervisor"}
             ],
             "seeded_tasks": seeded,
             "kind": args.kind,
@@ -1515,6 +1512,18 @@ def parse_int_list(value: str) -> list[int]:
     return items
 
 
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def drafter_sweep_plan(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -1582,6 +1591,184 @@ def drafter_sweep_plan(args: argparse.Namespace) -> int:
     )
     print(json.dumps({"ok": True, "path": str(path), "plan": plan}, indent=2))
     return 0
+
+
+def mean_float(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def drafter_sweep_run(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    blocks = parse_int_list(args.blocks)
+    if not blocks:
+        print(json.dumps({"ok": False, "reason": "no block sizes provided"}, indent=2))
+        return 2
+    samples = max(1, min(int(args.samples), 10))
+    live_block = int(args.control_block or os.environ.get("OPENCLAW_JANG_DRAFT_BLOCK_SIZE", "2") or 2)
+    trial_blocks = [live_block, *[block for block in blocks if block != live_block]]
+    timestamp = int(time.time())
+    trials: dict[str, Any] = {}
+    failures: list[dict[str, Any]] = []
+
+    for block in trial_blocks:
+        block_results: list[dict[str, Any]] = []
+        for sample_index in range(samples):
+            capture = io.StringIO()
+            bench_args = argparse.Namespace(
+                base_url=args.base_url,
+                model=args.model,
+                quick=False,
+                mode="decode-sample",
+                timeout=args.timeout,
+                draft_block_size=block,
+            )
+            with contextlib.redirect_stdout(capture):
+                code = benchmark(bench_args)
+            parsed = parse_json_object(capture.getvalue()) or {}
+            block_results.append(
+                {
+                    "sample": sample_index + 1,
+                    "returncode": code,
+                    "result": parsed,
+                }
+            )
+            if code != 0 or parsed.get("ok") is False:
+                failures.append(
+                    {
+                        "block": block,
+                        "sample": sample_index + 1,
+                        "reason": parsed.get("reason") or f"benchmark exit {code}",
+                    }
+                )
+                break
+        good = [row["result"] for row in block_results if row.get("returncode") == 0 and row.get("result", {}).get("ok")]
+        decode_values = [float(row["decode_tps"]) for row in good if row.get("decode_tps") not in {"", None}]
+        accept_values = [
+            float(row["mtp"]["mean_accept"])
+            for row in good
+            if isinstance(row.get("mtp"), dict) and row["mtp"].get("mean_accept") not in {"", None}
+        ]
+        round_values = [
+            float(row["mtp"]["mtp_rounds"])
+            for row in good
+            if isinstance(row.get("mtp"), dict) and row["mtp"].get("mtp_rounds") not in {"", None}
+        ]
+        server_values = [
+            float(row["mtp"]["server_tok_s"])
+            for row in good
+            if isinstance(row.get("mtp"), dict) and row["mtp"].get("server_tok_s") not in {"", None}
+        ]
+        trials[str(block)] = {
+            "block": block,
+            "requested_samples": samples,
+            "sample_count": len(good),
+            "mean_decode_tps": mean_float(decode_values),
+            "mean_accept": mean_float(accept_values),
+            "mean_mtp_rounds": mean_float(round_values),
+            "mean_server_tok_s": mean_float(server_values),
+            "failures": [failure for failure in failures if failure["block"] == block],
+        }
+
+    control = trials.get(str(live_block), {})
+    valid_trials = [trial for trial in trials.values() if trial.get("mean_decode_tps") is not None]
+    replay = replay_checks(root)
+    if not valid_trials:
+        decision = "blocked"
+        winner = {}
+        delta = None
+        status = "blocked"
+        reason = "no successful sweep benchmark samples"
+    else:
+        winner = max(valid_trials, key=lambda trial: float(trial["mean_decode_tps"]))
+        control_tps = control.get("mean_decode_tps")
+        delta = (
+            round(float(winner["mean_decode_tps"]) - float(control_tps), 3)
+            if control_tps is not None
+            else None
+        )
+        passed_gate = (
+            winner.get("block") != live_block
+            and delta is not None
+            and delta >= float(args.min_delta)
+            and replay["ok"]
+            and int(winner.get("sample_count") or 0) >= samples
+        )
+        decision = "promotion-ready" if passed_gate else "keep-current"
+        status = "keep"
+        reason = ""
+
+    artifact = {
+        "ok": status == "keep",
+        "kind": "mtp-drafter-block-sweep-run",
+        "timestamp": timestamp,
+        "control_block": live_block,
+        "blocks": trial_blocks,
+        "samples": samples,
+        "min_delta": float(args.min_delta),
+        "trials": trials,
+        "winner": winner,
+        "delta_vs_control": delta,
+        "decision": decision,
+        "replay": replay,
+        "promotion_gate": {
+            "min_decode_tps_delta": float(args.min_delta),
+            "must_restore_live_profile": True,
+            "must_pass_replay": True,
+            "must_keep_model_id": True,
+            "requires_mtp_acceptance": True,
+        },
+        "rollback": "No live rollback needed: every variant used per-request draft_block_size and did not mutate the active profile.",
+        "failures": failures,
+    }
+    path = root / "experiments" / f"mtp-drafter-sweep-run-{timestamp}.json"
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-block-sweep-run",
+            "status": "sweep-run" if status == "keep" else "blocked",
+            "path": str(path),
+            "decision": decision,
+            "winner": winner,
+            "delta_vs_control": delta,
+        },
+    )
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-block-sweep-run",
+            "finding": "supervisor executed paired drafter block sweep instead of generating another plan",
+            "evidence": {
+                "path": str(path),
+                "decision": decision,
+                "winner": winner,
+                "delta_vs_control": delta,
+            },
+            "next": "promote only if decision=promotion-ready and replay guards pass",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-sweep-run-{timestamp}",
+        status=status,
+        target="OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+        hypothesis="paired drafter block-size sweep should find a faster safe MTP setting",
+        decode_tps=winner.get("mean_decode_tps", "") if winner else "",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"decision={decision} control_block={live_block} "
+            f"winner_block={winner.get('block', '') if winner else ''} "
+            f"delta_vs_control={delta if delta is not None else ''} "
+            f"path={path} reason={reason}"
+        ),
+    )
+    print(json.dumps({"ok": status == "keep", "path": str(path), **artifact}, indent=2))
+    return 0 if status == "keep" else 2
 
 
 def mtp_report(args: argparse.Namespace) -> int:
@@ -1946,6 +2133,16 @@ def main() -> int:
     sweep.add_argument("--samples", type=int, default=3)
     sweep.add_argument("--min-delta", type=float, default=0.5)
     sweep.set_defaults(func=drafter_sweep_plan)
+
+    sweep_run = sub.add_parser("drafter-sweep-run")
+    sweep_run.add_argument("--blocks", default="1,2,3,4")
+    sweep_run.add_argument("--samples", type=int, default=3)
+    sweep_run.add_argument("--min-delta", type=float, default=0.5)
+    sweep_run.add_argument("--control-block", type=int, default=0)
+    sweep_run.add_argument("--base-url", default=DEFAULT_MODEL_URL)
+    sweep_run.add_argument("--model", default="")
+    sweep_run.add_argument("--timeout", type=float, default=180.0)
+    sweep_run.set_defaults(func=drafter_sweep_run)
 
     report = sub.add_parser("mtp-report")
     report.add_argument("--lines", type=int, default=160)

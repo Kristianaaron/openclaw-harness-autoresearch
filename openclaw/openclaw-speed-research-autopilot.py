@@ -362,9 +362,29 @@ def is_supervisor_log_review_task(task: dict[str, object] | None) -> bool:
 def is_supervisor_drafter_sweep_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
+    action = str(task.get("next_action", ""))
     return (
-        task.get("supervisor_action") == "drafter-sweep-plan"
-        or "openclaw-speed-research drafter-sweep-plan" in str(task.get("next_action", ""))
+        task.get("supervisor_action") in {"drafter-sweep-plan", "drafter-sweep-run"}
+        or "openclaw-speed-research drafter-sweep-plan" in action
+        or "openclaw-speed-research drafter-sweep-run" in action
+    )
+
+
+def is_supervisor_mtp_report_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "mtp-report"
+        or "openclaw-speed-research mtp-report" in str(task.get("next_action", ""))
+    )
+
+
+def is_supervisor_implementation_bridge_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "implementation-bridge"
+        or str(task.get("id", "")).startswith("implementation-bridge-")
     )
 
 
@@ -777,19 +797,16 @@ def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
             "status": "ready",
             "priority": 72,
             "lane": "implementation-gate",
-            "task_type": "implementation",
+            "task_type": "supervisor",
+            "supervisor_action": "implementation-bridge",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "When synthesis identifies a grounded TUI decode/MTP improvement, convert exactly one insight into a minimal tested OpenClaw patch.",
+            "hypothesis": "When synthesis identifies a grounded TUI decode/MTP improvement, seed deterministic supervisor tasks instead of asking the LLM to improvise a patch.",
             "metric": "decode_tps_delta_or_guardrail",
             "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
-            "acceptance": "Patch is minimal, focused tests pass, and results.tsv records keep/discard/blocked evidence.",
-            "rollback": "Revert only this implementation experiment if it fails tests or does not improve speed/reliability.",
-            "next_action": (
-                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
-                "Then read exactly /Users/kristian/.openclaw/research/speed/ideas.md. "
-                "Implement only the smallest currently evidenced OpenClaw TUI decode/MTP improvement; do not touch opencode."
-            ),
+            "acceptance": "Supervisor records which deterministic follow-up tasks were ready or seeded; no generic implementation turn is required.",
+            "rollback": "No source rollback needed; the bridge only advances the deterministic queue.",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
         },
     ]
 
@@ -1417,6 +1434,45 @@ def run_supervisor_log_review_task(
     return 0, ""
 
 
+def run_supervisor_mtp_report_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    lines = str(task.get("lines") or os.environ.get("OPENCLAW_MTP_REPORT_LINES", "160"))
+    cmd = [args.research_helper_bin, "mtp-report", "--lines", lines]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor mtp report "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR MTP REPORT TIMEOUT\n")
+            return 124, "supervisor mtp report timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor mtp report exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
 def run_supervisor_profile_variant_guard(
     cycle: int,
     session: str,
@@ -1454,6 +1510,54 @@ def run_supervisor_profile_variant_guard(
     return 2, reason
 
 
+def run_supervisor_implementation_bridge(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    before_ids = {
+        str(item.get("id", ""))
+        for item in read_jsonl(TASKS)
+        if item.get("status", "ready") in {"ready", "rework"}
+    }
+    ok, issue = run_supervisor_synthesis(args, cycle, session, log_file)
+    after_ready = [
+        item
+        for item in read_jsonl(TASKS)
+        if item.get("status", "ready") in {"ready", "rework"}
+    ]
+    deterministic = [
+        str(item.get("id", ""))
+        for item in after_ready
+        if item.get("task_type") == "supervisor" and str(item.get("id", "")) != str(task.get("id", ""))
+    ]
+    seeded = [task_id for task_id in deterministic if task_id not in before_ids]
+    summary = {
+        "synthesis_ok": ok,
+        "issue": issue,
+        "seeded_deterministic_tasks": seeded,
+        "ready_deterministic_tasks": deterministic[:12],
+        "next": "select_next_ready_supervisor_task",
+    }
+    status = "keep" if ok and deterministic else "blocked"
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-implementation-bridge-{cycle}",
+        status=status,
+        target=str(task.get("target", "implementation-bridge")),
+        hypothesis=str(task.get("hypothesis", "bridge synthesis into deterministic implementation tasks")),
+        commit=current_commit(),
+        notes=(
+            f"seeded={len(seeded)} ready_deterministic={len(deterministic)} "
+            f"issue={clean_tsv(issue)}"
+        ),
+    )
+    complete_supervisor_task(task, status=status, summary=summary, commit=current_commit())
+    return (0, "") if status == "keep" else (2, issue or "no deterministic implementation tasks available")
+
+
 def run_supervisor_drafter_sweep_plan(
     args: argparse.Namespace,
     cycle: int,
@@ -1462,10 +1566,12 @@ def run_supervisor_drafter_sweep_plan(
     log_file: Path,
 ) -> tuple[int, str]:
     blocks = str(task.get("blocks") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_BLOCKS", "1,2,3,4"))
-    cmd = [args.research_helper_bin, "drafter-sweep-plan", "--blocks", blocks]
+    samples = str(task.get("samples") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_SAMPLES", "3"))
+    action = "drafter-sweep-plan" if task.get("supervisor_action") == "drafter-sweep-plan" else "drafter-sweep-run"
+    cmd = [args.research_helper_bin, action, "--blocks", blocks, "--samples", samples]
     with log_file.open("a", encoding="utf-8") as file:
         file.write(
-            f"\n===== cycle {cycle} session {session} supervisor drafter sweep plan "
+            f"\n===== cycle {cycle} session {session} supervisor drafter sweep {action} "
             f"task={task.get('id', 'unknown')} =====\n"
         )
         file.write("$ " + " ".join(cmd) + "\n")
@@ -1481,18 +1587,18 @@ def run_supervisor_drafter_sweep_plan(
             )
         except subprocess.TimeoutExpired:
             file.write("SUPERVISOR DRAFTER SWEEP PLAN TIMEOUT\n")
-            return 124, "supervisor drafter sweep plan timeout"
+            return 124, "supervisor drafter sweep timeout"
         file.write(result.stdout)
         file.flush()
     parsed = parse_json_object(result.stdout) or {}
     if result.returncode != 0 or parsed.get("ok") is False:
-        reason = str(parsed.get("reason") or f"supervisor drafter sweep plan exit {result.returncode}")
+        reason = str(parsed.get("reason") or f"supervisor drafter sweep exit {result.returncode}")
         append_result(
             WORKSPACE,
             run_id=f"supervisor-drafter-sweep-{cycle}",
             status="blocked",
             target=str(task.get("target", "drafter-sweep-plan")),
-            hypothesis=str(task.get("hypothesis", "create bounded drafter sweep plan")),
+            hypothesis=str(task.get("hypothesis", "run bounded drafter sweep")),
             commit=current_commit(),
             notes=reason,
         )
@@ -1503,9 +1609,12 @@ def run_supervisor_drafter_sweep_plan(
         run_id=f"supervisor-drafter-sweep-{cycle}",
         status="keep",
         target=str(task.get("target", "drafter-sweep-plan")),
-        hypothesis=str(task.get("hypothesis", "create bounded drafter sweep plan")),
+        hypothesis=str(task.get("hypothesis", "run bounded drafter sweep")),
         commit=current_commit(),
-        notes=f"blocks={blocks} path={parsed.get('path', '')}",
+        notes=(
+            f"action={action} blocks={blocks} samples={samples} "
+            f"decision={parsed.get('decision', '')} path={parsed.get('path', '')}"
+        ),
     )
     complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
     return 0, ""
@@ -1923,6 +2032,10 @@ def main() -> int:
             code, issue = run_supervisor_drafter_fit_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):
             code, issue = run_supervisor_drafter_sweep_plan(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_mtp_report_task(selected_task):
+            code, issue = run_supervisor_mtp_report_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_implementation_bridge_task(selected_task):
+            code, issue = run_supervisor_implementation_bridge(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_focused_test_task(selected_task):
             code, issue = run_supervisor_focused_test_task(cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):
