@@ -48,6 +48,17 @@ REJECTIONS = WORKSPACE / "rejections.jsonl"
 LOG_DIR = WORKSPACE / "logs"
 PROGRAM = WORKSPACE / "program.md"
 DEFAULT_REPO = "/Users/kristian/Documents/openclaw-harness-autoresearch"
+DEFAULT_JANQ_TARGET_PATH = (
+    "/Users/kristian/.cache/huggingface/hub/"
+    "models--dealignai--Gemma-4-31B-JANG_4M-CRACK/"
+    "snapshots/bb11360eacf55506f6e51eaacc6b0f65f9209b14"
+)
+DEFAULT_DFLASH_DRAFT_PATH = (
+    "/Users/kristian/.cache/huggingface/hub/"
+    "models--z-lab--gemma-4-31B-it-DFlash/"
+    "snapshots/9e3bf61731945317dfb0dc2d130c383c9d051f76"
+)
+DEFAULT_DRAFTER_FIT_PLAN = "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json"
 BLOCKED_PATTERNS = (
     "OpenClaw blocked a broad local tool command",
     "blocked this request before model execution",
@@ -348,8 +359,34 @@ def is_supervisor_log_review_task(task: dict[str, object] | None) -> bool:
     return action == "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
 
 
+def is_supervisor_drafter_sweep_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-sweep-plan"
+        or "openclaw-speed-research drafter-sweep-plan" in str(task.get("next_action", ""))
+    )
+
+
+def is_supervisor_drafter_fit_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-fit-plan"
+        or "openclaw-drafter-fit plan" in str(task.get("next_action", ""))
+    )
+
+
+def is_supervisor_focused_test_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return task.get("supervisor_action") == "focused-test"
+
+
 def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     if not task:
+        return False
+    if is_supervisor_drafter_sweep_task(task):
         return False
     guard_checks = {str(item) for item in task.get("guard_checks", []) if item}
     target = str(task.get("target", ""))
@@ -1253,6 +1290,205 @@ def run_supervisor_profile_variant_guard(
     return 2, reason
 
 
+def run_supervisor_drafter_sweep_plan(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    blocks = str(task.get("blocks") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_BLOCKS", "1,2,3,4"))
+    cmd = [args.research_helper_bin, "drafter-sweep-plan", "--blocks", blocks]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter sweep plan "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER SWEEP PLAN TIMEOUT\n")
+            return 124, "supervisor drafter sweep plan timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor drafter sweep plan exit {result.returncode}")
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-sweep-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-sweep-plan")),
+            hypothesis=str(task.get("hypothesis", "create bounded drafter sweep plan")),
+            commit=current_commit(),
+            notes=reason,
+        )
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-drafter-sweep-{cycle}",
+        status="keep",
+        target=str(task.get("target", "drafter-sweep-plan")),
+        hypothesis=str(task.get("hypothesis", "create bounded drafter sweep plan")),
+        commit=current_commit(),
+        notes=f"blocks={blocks} path={parsed.get('path', '')}",
+    )
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
+def run_supervisor_drafter_fit_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    target_path = str(task.get("target_path") or os.environ.get("OPENCLAW_JANQ_TARGET_PATH", DEFAULT_JANQ_TARGET_PATH))
+    drafter_path = str(task.get("drafter_path") or os.environ.get("OPENCLAW_DFLASH_DRAFT_PATH", DEFAULT_DFLASH_DRAFT_PATH))
+    output = str(task.get("output") or os.environ.get("OPENCLAW_DRAFTER_FIT_PLAN", DEFAULT_DRAFTER_FIT_PLAN))
+    cmd = [
+        args.drafter_fit_bin,
+        "plan",
+        "--target-path",
+        target_path,
+        "--drafter-path",
+        drafter_path,
+        "--output",
+        output,
+    ]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter fit plan "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER FIT TIMEOUT\n")
+            return 124, "supervisor drafter fit timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("decision") or parsed.get("reason") or f"supervisor drafter fit exit {result.returncode}")
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-fit-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-fit-plan")),
+            hypothesis=str(task.get("hypothesis", "create JANQ drafter fit plan")),
+            commit=current_commit(),
+            notes=reason,
+        )
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    notes = (
+        f"decision={parsed.get('decision', '')} "
+        f"output={output} "
+        f"min_speedup={((parsed.get('promotion_gate') or {}).get('minimum_speedup_vs_current', ''))} "
+        f"min_accept={((parsed.get('promotion_gate') or {}).get('minimum_mean_accept', ''))}"
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-drafter-fit-{cycle}",
+        status="keep",
+        target=str(task.get("target", "drafter-fit-plan")),
+        hypothesis=str(task.get("hypothesis", "create JANQ drafter fit plan")),
+        commit=current_commit(),
+        notes=notes,
+    )
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
+def run_supervisor_focused_test_task(
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    action = str(task.get("next_action", ""))
+    allowed = {
+        "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+        "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-drafter-fit.py",
+        "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research-autopilot.py",
+    }
+    if action not in allowed:
+        reason = f"focused test action is not allowlisted: {action}"
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-focused-test-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "focused-test")),
+            hypothesis=str(task.get("hypothesis", "run focused test")),
+            commit=current_commit(),
+            notes=reason,
+        )
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason}, commit=current_commit())
+        return 2, reason
+    cmd = action.split()
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor focused test "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(repo_path()),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR FOCUSED TEST TIMEOUT\n")
+            return 124, "supervisor focused test timeout"
+        file.write(result.stdout)
+        file.flush()
+    status = "keep" if result.returncode == 0 else "blocked"
+    notes = "focused test passed" if result.returncode == 0 else f"focused test exit {result.returncode}"
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-focused-test-{cycle}",
+        status=status,
+        target=str(task.get("target", "focused-test")),
+        hypothesis=str(task.get("hypothesis", "run focused test")),
+        commit=current_commit(),
+        notes=notes,
+    )
+    complete_supervisor_task(
+        task,
+        status=status,
+        summary={"returncode": result.returncode, "action": action, "notes": notes},
+        commit=current_commit(),
+    )
+    return result.returncode, "" if result.returncode == 0 else notes
+
+
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
     return any(pattern.lower() in text.lower() for pattern in MALFORMED_OR_TOOL_ISSUES)
@@ -1382,6 +1618,10 @@ def main() -> int:
         "--research-helper-bin",
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_HELPER", "/Users/kristian/.openclaw/bin/openclaw-speed-research"),
     )
+    parser.add_argument(
+        "--drafter-fit-bin",
+        default=os.environ.get("OPENCLAW_DRAFTER_FIT_HELPER", "/Users/kristian/.openclaw/bin/openclaw-drafter-fit"),
+    )
     parser.add_argument("--session", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SESSION", "speed-research-auto"))
     parser.add_argument("--cycles", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_CYCLES", "48")))
     parser.add_argument("--max-hours", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_HOURS", "8")))
@@ -1510,7 +1750,13 @@ def main() -> int:
             continue
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
-        if requires_profile_variant_runner(selected_task):
+        if is_supervisor_drafter_fit_task(selected_task):
+            code, issue = run_supervisor_drafter_fit_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_sweep_task(selected_task):
+            code, issue = run_supervisor_drafter_sweep_plan(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_focused_test_task(selected_task):
+            code, issue = run_supervisor_focused_test_task(cycle, current_session, selected_task, log_file)
+        elif requires_profile_variant_runner(selected_task):
             code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
         elif is_supervisor_benchmark_task(selected_task):
             code, issue = run_supervisor_benchmark_task(args, cycle, current_session, selected_task, log_file)

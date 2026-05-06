@@ -79,6 +79,32 @@ def main() -> int:
     assert helper.requires_profile_variant_runner(
         {"target": "OPENCLAW_JANG_DRAFT_MODEL", "guard_checks": ["restore_live_profile"]}
     )
+    assert helper.is_supervisor_drafter_sweep_task(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-sweep-plan",
+            "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+            "guard_checks": ["restore_live_profile"],
+        }
+    )
+    assert not helper.requires_profile_variant_runner(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-sweep-plan",
+            "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+            "guard_checks": ["restore_live_profile"],
+        }
+    )
+    assert helper.is_supervisor_drafter_fit_task(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-fit-plan",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
+        }
+    )
+    assert helper.is_supervisor_focused_test_task(
+        {"task_type": "supervisor", "supervisor_action": "focused-test"}
+    )
     assert not helper.is_supervisor_benchmark_task(
         {
             "benchmark_mode": "decode-sample",
@@ -399,6 +425,105 @@ def main() -> int:
         paired_plan = helper.WORKSPACE / "experiments" / "paired-profile-plan-profile-variant.json"
         assert paired_plan.exists()
         assert "must_restore_live_profile" in paired_plan.read_text(encoding="utf-8")
+        sweep_helper = Path(tmp) / "sweep-helper.py"
+        sweep_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "path = pathlib.Path(sys.argv[sys.argv.index('--blocks') + 1].replace(',', '-') + '.json')\n"
+            "print(json.dumps({'ok': True, 'path': str(path), 'plan': {'promotion_gate': {'must_not_change_live_profile': True}}}))\n",
+            encoding="utf-8",
+        )
+        sweep_helper.chmod(0o700)
+        sweep_args = Namespace(research_helper_bin=str(sweep_helper))
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "sweep",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-sweep-plan",
+                    "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+                    "hypothesis": "plan block sweep",
+                    "blocks": "1,2",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_drafter_sweep_plan(
+            sweep_args,
+            8,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert "supervisor-drafter-sweep-8" in helper.RESULTS.read_text(encoding="utf-8")
+        assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+        fit_helper = Path(tmp) / "fit-helper.py"
+        fit_plan = Path(tmp) / "fit-plan.json"
+        fit_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "payload = {'ok': True, 'decision': 'ready-for-target-generated-trace-data', 'promotion_gate': {'minimum_speedup_vs_current': 1.35, 'minimum_mean_accept': 2.25}}\n"
+            "out.parent.mkdir(parents=True, exist_ok=True)\n"
+            "out.write_text(json.dumps(payload), encoding='utf-8')\n"
+            "print(json.dumps(payload))\n",
+            encoding="utf-8",
+        )
+        fit_helper.chmod(0o700)
+        fit_args = Namespace(drafter_fit_bin=str(fit_helper))
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "fit",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-fit-plan",
+                    "target": str(fit_plan),
+                    "target_path": str(Path(tmp) / "target"),
+                    "drafter_path": str(Path(tmp) / "draft"),
+                    "output": str(fit_plan),
+                    "hypothesis": "plan JANQ fit",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_drafter_fit_task(
+            fit_args,
+            9,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert fit_plan.exists()
+        assert "supervisor-drafter-fit-9" in helper.RESULTS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "focused",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "focused-test",
+                    "target": "openclaw/test-drafter-fit.py",
+                    "hypothesis": "focused tests pass",
+                    "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-drafter-fit.py",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_focused_test_task(
+            10,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert "supervisor-focused-test-10" in helper.RESULTS.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
