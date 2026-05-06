@@ -137,6 +137,9 @@ def main() -> int:
             assert (root / "journal.jsonl").exists()
             assert (root / "trajectory-corpus.jsonl").exists()
             assert (root / "gepa-candidates.jsonl").exists()
+            assert (root / "hypothesis-rank.jsonl").exists()
+            assert (root / "promotion-decisions.jsonl").exists()
+            assert (root / "causal-reviews.jsonl").exists()
             assert (root / "exhausted-approaches.jsonl").exists()
             tasks = helper.read_jsonl(root / "tasks.jsonl")
             assert any(task.get("id") == "mtp-loop-overhead-map" for task in tasks)
@@ -345,6 +348,28 @@ def main() -> int:
             assert "GEPA policy candidates remain canary-only" in (root / "gepa-candidates.jsonl").read_text(
                 encoding="utf-8"
             )
+            assert helper.hypothesis_rank(Namespace(limit=5)) == 0
+            rank_paths = list((root / "benchmarks").glob("hypothesis-rank-*.json"))
+            assert rank_paths
+            rank = json.loads(rank_paths[-1].read_text(encoding="utf-8"))
+            assert rank["ranked"]
+            assert rank["ranked"][0]["score"] >= rank["ranked"][-1]["score"]
+            helper.append_jsonl(
+                root / "promotion-decisions.jsonl",
+                {
+                    "task_id": "low-confidence",
+                    "decision": "keep-canary",
+                    "confidence": 0.5,
+                    "target": "program.md",
+                },
+            )
+            assert helper.causal_review(Namespace(recent_rows=80)) == 0
+            causal_paths = list((root / "benchmarks").glob("causal-review-*.json"))
+            assert causal_paths
+            causal = json.loads(causal_paths[-1].read_text(encoding="utf-8"))
+            assert "low-confidence" in causal["low_confidence_kept"]
+            assert causal["seeded_repair_tasks"] >= 1
+            assert "causal-repair" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas

@@ -684,6 +684,7 @@ def main() -> int:
             review_min_sweeps=3,
             review_min_samples_per_block=3,
             review_target_tps=30.0,
+            hypothesis_rank_limit=12,
             gepa_min_blocked=3,
             gepa_min_rework=2,
             gepa_min_trajectory=2,
@@ -696,6 +697,8 @@ def main() -> int:
         review_log = (Path(tmp) / "autopilot.log").read_text(encoding="utf-8")
         assert "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0" in review_log
         assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
+        assert "hypothesis-rank --limit 12" in review_log
+        assert "causal-review --recent-rows 120" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
@@ -754,6 +757,7 @@ def main() -> int:
         assert impl_summary["task_id"] == "impl"
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
         assert "implementation-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
+        assert "impl" in (helper.WORKSPACE / "promotion-decisions.jsonl").read_text(encoding="utf-8")
         bench_helper = Path(tmp) / "benchmark-helper.py"
         bench_helper.write_text(
             "#!/usr/bin/env python3\n"

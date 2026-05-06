@@ -26,6 +26,7 @@ from openclaw_speed_research_core import (
     cycle_quality,
     ensure_research_state,
     paired_profile_plan,
+    promotion_decision,
     read_jsonl,
     record_rejection,
     record_trajectory_case,
@@ -1247,6 +1248,10 @@ def complete_implementation_task(
     }
     append_jsonl(EXPERIMENTS, summary)
     append_jsonl(
+        WORKSPACE / "promotion-decisions.jsonl",
+        promotion_decision(task, summary, status="keep"),
+    )
+    append_jsonl(
         FINDINGS,
         {
             "timestamp": completed_at,
@@ -1293,6 +1298,10 @@ def complete_supervisor_task(
         "commit": commit,
     }
     append_jsonl(EXPERIMENTS, row)
+    append_jsonl(
+        WORKSPACE / "promotion-decisions.jsonl",
+        promotion_decision(task, summary, status=status),
+    )
     append_jsonl(
         FINDINGS,
         {
@@ -2066,6 +2075,8 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
             str(args.review_min_samples_per_block),
         ]
     )
+    commands.append([args.research_helper_bin, "hypothesis-rank", "--limit", str(args.hypothesis_rank_limit)])
+    commands.append([args.research_helper_bin, "causal-review", "--recent-rows", str(args.review_recent_rows)])
     commands.append(
         [
             args.research_helper_bin,
@@ -2163,6 +2174,7 @@ def main() -> int:
     parser.add_argument("--review-min-sweeps", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SWEEPS", "3")))
     parser.add_argument("--review-min-samples-per-block", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SAMPLES_PER_BLOCK", "3")))
     parser.add_argument("--review-target-tps", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TARGET_TPS", "30")))
+    parser.add_argument("--hypothesis-rank-limit", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_HYPOTHESIS_RANK_LIMIT", "12")))
     parser.add_argument("--gepa-min-blocked", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_BLOCKED", "3")))
     parser.add_argument("--gepa-min-rework", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_REWORK", "2")))
     parser.add_argument("--gepa-min-trajectory", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_GEPA_MIN_TRAJECTORY", "2")))

@@ -339,6 +339,9 @@ def ensure_research_state(root: Path) -> None:
         "journal.jsonl",
         "trajectory-corpus.jsonl",
         "gepa-candidates.jsonl",
+        "hypothesis-rank.jsonl",
+        "promotion-decisions.jsonl",
+        "causal-reviews.jsonl",
     ):
         path = root / name
         if not path.exists():
@@ -1028,6 +1031,219 @@ def group_decode_samples(rows: list[dict[str, str]]) -> dict[str, list[float]]:
     return groups
 
 
+def latest_decode_mean(root: Path, *, recent_rows: int = 80) -> float | None:
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    values = [
+        float(value)
+        for row in rows
+        if row.get("status") == "keep"
+        and row.get("target") == "decode-sample"
+        and (value := parse_float(row.get("decode_tps"))) is not None
+    ]
+    return mean(values)
+
+
+def task_risk_level(task: dict[str, Any]) -> str:
+    guards = {str(item) for item in task.get("guard_checks", [])}
+    target = str(task.get("target", ""))
+    if task.get("benchmark_mode"):
+        return "low"
+    if "no_live_profile_change" in guards or "canary_only" in guards or task.get("supervisor_action") in {
+        "gepa-policy-canary",
+        "drafter-fit-plan",
+    }:
+        return "low"
+    if "restore_live_profile" in guards or "memory_gate" in guards or "tests_pass" in guards:
+        return "moderate"
+    if target.endswith("openclaw-model-proxy.py") or target.endswith("openclaw-jang-vlm-server.py"):
+        return "architectural"
+    return "unknown"
+
+
+def task_readiness_reasons(task: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if task.get("benchmark_mode"):
+        reasons.append("direct benchmark task")
+    if task.get("task_type") == "supervisor":
+        reasons.append("deterministic supervisor action")
+    if task.get("source_files"):
+        reasons.append("source scope declared")
+    if task.get("acceptance"):
+        reasons.append("acceptance gate declared")
+    if task.get("rollback"):
+        reasons.append("rollback declared")
+    if "no_opencode_changes" in {str(item) for item in task.get("guard_checks", [])}:
+        reasons.append("opencode guard declared")
+    return reasons
+
+
+def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    rows = all_result_rows(root)
+    recent = rows[-120:]
+    base = int(task.get("priority", 0) or 0)
+    score = float(base)
+    reasons = task_readiness_reasons(task)
+    guard_checks = {str(item) for item in task.get("guard_checks", [])}
+    risk = task_risk_level(task)
+    lane = lane_key_for_task(task)
+
+    if task.get("status") == "rework":
+        score += 30
+        reasons.append("rework keeps a previously useful approach alive")
+    if task.get("task_type") == "supervisor":
+        score += 12
+    if task.get("benchmark_mode") == "decode-sample":
+        score += 10
+        if latest_decode_mean(root) is None:
+            score += 30
+            reasons.append("initial decode baseline is required before higher-risk tuning")
+    if lane in {"drafter-alignment", "runtime-overhead", "frontier-dflash"}:
+        score += 8
+    if "tests_pass" in guard_checks:
+        score += 4
+    if "memory_gate" in guard_checks or "memory_ok" in guard_checks:
+        score += 3
+    if "no_opencode_changes" in guard_checks:
+        score += 3
+    if risk == "low":
+        score += 5
+    elif risk == "architectural":
+        score -= 20
+        reasons.append("architectural risk requires stronger evidence")
+    elif risk == "unknown":
+        score -= 5
+        reasons.append("risk is not fully declared")
+
+    target = str(task.get("target", ""))
+    if target.endswith("openclaw-model-proxy.log"):
+        score += 30
+        reasons.append("log diagnosis should precede source tuning")
+    recent_blocks = [
+        row
+        for row in recent
+        if row.get("status") == "blocked" and (row.get("target") == target or target in row.get("notes", ""))
+    ]
+    if recent_blocks:
+        score -= min(18, len(recent_blocks) * 6)
+        reasons.append(f"recent blockers on target={len(recent_blocks)}")
+
+    decode_mean = latest_decode_mean(root)
+    if decode_mean is not None and decode_mean < 20 and str(task.get("metric")) in {"decode_tps", "decode_tps_delta"}:
+        score += 8
+        reasons.append(f"decode gap remains open mean={decode_mean}")
+    metric_text = str(task.get("metric", ""))
+    if "acceptance" in metric_text or "mean_accept" in metric_text:
+        score += 4
+        reasons.append("acceptance evidence can explain decode bottleneck")
+        if decode_mean is not None and decode_mean < 20:
+            score += 25
+            reasons.append("baseline exists; acceptance diagnosis should precede more tuning")
+
+    return {
+        "task_id": str(task.get("id", "")),
+        "score": round(score, 3),
+        "base_priority": base,
+        "lane": lane,
+        "risk": risk,
+        "reasons": reasons[:8],
+    }
+
+
+def rank_tasks(root: Path, *, limit: int = 12) -> list[dict[str, Any]]:
+    tasks = [
+        task
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    ]
+    ranked = []
+    for task in tasks:
+        ranked.append({**score_task(root, task), "target": str(task.get("target", "")), "metric": str(task.get("metric", ""))})
+    return sorted(ranked, key=lambda item: (float(item["score"]), str(item["task_id"])), reverse=True)[:limit]
+
+
+def promotion_decision(task: dict[str, Any], summary: dict[str, Any], *, status: str) -> dict[str, Any]:
+    risk = task_risk_level(task)
+    reasons: list[str] = []
+    confidence = 0.5
+    decision = "hold"
+    if status != "keep":
+        decision = "block"
+        confidence = 0.9
+        reasons.append("task did not pass deterministic supervisor action")
+    else:
+        confidence += 0.1
+        if task.get("task_type") == "supervisor":
+            confidence += 0.1
+            reasons.append("deterministic supervisor action passed")
+        if summary.get("promoted") is True:
+            decision = "promote"
+            confidence += 0.15
+            reasons.append("patch executor promoted after canary gates")
+        elif summary.get("held_for_approval") or risk == "architectural":
+            decision = "approval-required"
+            confidence += 0.05
+            reasons.append("architectural or approval-gated change is held")
+        elif risk == "low" or summary.get("ok") is True:
+            decision = "keep-canary"
+            confidence += 0.1
+            reasons.append("safe evidence artifact can be kept without live mutation")
+    if summary.get("tests"):
+        tests = summary.get("tests")
+        if isinstance(tests, list) and tests and all(isinstance(test, dict) and test.get("ok") for test in tests):
+            confidence += 0.1
+            reasons.append("allowlisted tests passed")
+    if risk == "unknown":
+        confidence -= 0.15
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task_id": str(task.get("id", "unknown")),
+        "target": str(task.get("target", "")),
+        "decision": decision,
+        "confidence": round(max(0.0, min(confidence, 0.99)), 3),
+        "risk": risk,
+        "status": status,
+        "reasons": reasons or ["no explicit promotion signal"],
+        "summary": summary,
+    }
+
+
+def causal_review_report(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    rows = all_result_rows(root)
+    recent = rows[-max(1, recent_rows) :]
+    decisions = read_jsonl(root / "promotion-decisions.jsonl")[-40:]
+    decode_values = [
+        value
+        for row in recent
+        if row.get("status") == "keep"
+        and row.get("target") == "decode-sample"
+        and (value := parse_float(row.get("decode_tps"))) is not None
+    ]
+    current_mean = mean(decode_values[-5:])
+    previous_mean = mean(decode_values[-10:-5]) if len(decode_values) >= 10 else None
+    delta = None
+    if current_mean is not None and previous_mean is not None:
+        delta = round(current_mean - previous_mean, 3)
+    risky_kept = [
+        decision
+        for decision in decisions
+        if decision.get("decision") in {"promote", "keep-canary"}
+        and float(decision.get("confidence") or 0) < 0.7
+    ]
+    regression = delta is not None and delta < -0.5
+    return {
+        "ok": True,
+        "kind": "causal-review",
+        "recent_rows": len(recent),
+        "decision_count": len(decisions),
+        "current_decode_mean": current_mean,
+        "previous_decode_mean": previous_mean,
+        "decode_delta": delta,
+        "regression_suspected": regression,
+        "low_confidence_kept": [str(item.get("task_id", "")) for item in risky_kept[-5:]],
+        "next": "route_rework_or_remeasure" if regression or risky_kept else "continue_ranked_queue",
+    }
+
+
 def variance_analysis(root: Path, *, recent_rows: int = 160, min_samples: int = 3) -> dict[str, Any]:
     rows = all_result_rows(root)[-max(1, recent_rows) :]
     groups = group_decode_samples(rows)
@@ -1333,13 +1549,15 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
             score += float(parse_float(entry.get("decode_tps")) or 0) / 100.0
         lane_scores[lane] = score
 
-    def task_score(task: dict[str, Any]) -> tuple[int, float]:
+    ranked_scores = {item["task_id"]: item for item in rank_tasks(root, limit=1000)}
+
+    def task_score(task: dict[str, Any]) -> tuple[float, float]:
         status_bonus = 1000 if task.get("status") == "rework" else 0
-        supervisor_bonus = 0
         lane = lane_key_for_task(task)
         frontier_bonus = int(lane_scores.get(lane, 0.0) * 10)
+        ranked_score = float(ranked_scores.get(str(task.get("id", "")), {}).get("score", 0))
         return (
-            status_bonus + supervisor_bonus + int(task.get("priority", 0)) + frontier_bonus,
+            status_bonus + ranked_score + frontier_bonus,
             float(task.get("created_score", 0) or 0),
         )
 

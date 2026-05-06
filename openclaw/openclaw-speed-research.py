@@ -27,6 +27,7 @@ from openclaw_speed_research_core import (
     append_jsonl,
     benchmark_result_schema_ok,
     benchmark_spec,
+    causal_review_report,
     ensure_research_state,
     exhausted_lanes,
     gepa_escalation_report,
@@ -35,6 +36,7 @@ from openclaw_speed_research_core import (
     load_benchmark_manifest,
     paired_profile_plan,
     read_jsonl,
+    rank_tasks,
     replay_checks,
     score_insight,
     seed_gepa_canary_task,
@@ -1582,6 +1584,114 @@ def gepa_policy_canary(args: argparse.Namespace) -> int:
     return 0
 
 
+def hypothesis_rank(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    ranked = rank_tasks(root, limit=args.limit)
+    timestamp = int(time.time())
+    report = {
+        "ok": True,
+        "kind": "hypothesis-rank",
+        "timestamp": timestamp,
+        "ranked": ranked,
+        "next_task": ranked[0]["task_id"] if ranked else "",
+        "next": "select_next_task" if ranked else "synthesize_or_refill_queue",
+    }
+    path = root / "benchmarks" / f"hypothesis-rank-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(root / "hypothesis-rank.jsonl", {**report, "path": str(path)})
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "hypothesis-rank",
+            "finding": "supervisor ranked ready hypotheses by evidence, risk, guard coverage, and decode-speed relevance",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"hypothesis-rank-{timestamp}",
+        status="keep",
+        target="autoresearch-hypothesis-rank",
+        hypothesis="ranked hypothesis selection should reduce low-signal overnight cycles",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=f"ranked={len(ranked)} next_task={report['next_task']}",
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
+def causal_review(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    report = causal_review_report(root, recent_rows=args.recent_rows)
+    timestamp = int(time.time())
+    report["timestamp"] = timestamp
+    repair_tasks: list[dict[str, Any]] = []
+    if report.get("regression_suspected"):
+        repair_tasks.append(
+            {
+                "id": f"causal-remeasure-decode-{timestamp}",
+                "status": "ready",
+                "priority": 98,
+                "lane": "causal-repair",
+                "target": "decode-sample",
+                "hypothesis": "A suspected post-change decode regression must be remeasured before any further promotion.",
+                "metric": "decode_tps",
+                "benchmark_mode": "decode-sample",
+                "guard_checks": ["memory_ok", "no_reasoning_leak", "no_sse_timeout"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+            }
+        )
+    for task_id in report.get("low_confidence_kept", []):
+        repair_tasks.append(
+            {
+                "id": f"causal-review-{task_id}-{timestamp}",
+                "status": "ready",
+                "priority": 93,
+                "lane": "causal-repair",
+                "target": "promotion-decisions.jsonl",
+                "hypothesis": f"Low-confidence kept decision `{task_id}` needs review before related changes are promoted.",
+                "metric": "promotion_confidence",
+                "guard_checks": ["no_live_profile_change", "evidence_required", "no_opencode_changes"],
+                "next_action": "read exactly /Users/kristian/.openclaw/research/speed/promotion-decisions.jsonl and record a keep/discard/blocked note for the named task",
+            }
+        )
+    seeded = upsert_tasks(root, repair_tasks) if repair_tasks else 0
+    report["seeded_repair_tasks"] = seeded
+    path = root / "benchmarks" / f"causal-review-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(root / "causal-reviews.jsonl", {**report, "path": str(path)})
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "causal-review",
+            "finding": "supervisor checked post-change decode metrics and low-confidence kept decisions",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"causal-review-{timestamp}",
+        status="blocked" if report.get("regression_suspected") else "keep",
+        target="autoresearch-causal-review",
+        hypothesis="post-change causal review should catch regressions before promotion confidence drifts",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"current_decode_mean={report.get('current_decode_mean')} "
+            f"previous_decode_mean={report.get('previous_decode_mean')} "
+            f"delta={report.get('decode_delta')} regression={report.get('regression_suspected')} "
+            f"low_confidence={','.join(report.get('low_confidence_kept', []))}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
 def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     decode = mean_value(float_values(rows, "decode-sample", "decode_tps"))
     return [
@@ -2935,6 +3045,14 @@ def main() -> int:
     frontier.add_argument("--recent-rows", type=int, default=160)
     frontier.add_argument("--min-samples", type=int, default=3)
     frontier.set_defaults(func=frontier_review)
+
+    rank = sub.add_parser("hypothesis-rank")
+    rank.add_argument("--limit", type=int, default=12)
+    rank.set_defaults(func=hypothesis_rank)
+
+    causal = sub.add_parser("causal-review")
+    causal.add_argument("--recent-rows", type=int, default=160)
+    causal.set_defaults(func=causal_review)
 
     gepa = sub.add_parser("gepa-escalation")
     gepa.add_argument("--recent-rows", type=int, default=160)
