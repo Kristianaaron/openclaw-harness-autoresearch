@@ -132,6 +132,9 @@ def main() -> int:
             assert (root / "findings.jsonl").exists()
             assert (root / "experiments.jsonl").exists()
             assert (root / "rejections.jsonl").exists()
+            assert (root / "journal.jsonl").exists()
+            assert (root / "trajectory-corpus.jsonl").exists()
+            assert (root / "exhausted-approaches.jsonl").exists()
             tasks = helper.read_jsonl(root / "tasks.jsonl")
             assert any(task.get("id") == "mtp-loop-overhead-map" for task in tasks)
             assert any(task.get("id") == "janq-dflash-drafter-fit-plan" and task.get("priority") == 86 for task in tasks)
@@ -311,7 +314,16 @@ def main() -> int:
             assert review["gates"]["required_block_coverage"] is True
             assert review["best_block"] == "2"
             assert review["target_tps"] == 30.0
+            assert "variance" in review
+            assert review["gates"]["no_measurement_artifact"] is True
+            assert "mtp-decode" in (root / "exhausted-approaches.jsonl").read_text(encoding="utf-8")
             assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert helper.frontier_review(Namespace(recent_rows=80, min_samples=3)) == 0
+            frontier_paths = list((root / "benchmarks").glob("frontier-review-*.json"))
+            assert frontier_paths
+            frontier = json.loads(frontier_paths[-1].read_text(encoding="utf-8"))
+            assert frontier["variance"]["best_variant"] == "2"
+            assert "mtp-decode" in frontier["exhausted_lanes"]
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas

@@ -650,9 +650,9 @@ def main() -> int:
         ok, issue = helper.run_supervisor_quality_review(review_args, 8, "nightly", Path(tmp) / "autopilot.log")
         assert ok
         assert issue == ""
-        assert review_marker.read_text(encoding="utf-8") == (
-            "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0"
-        )
+        review_log = (Path(tmp) / "autopilot.log").read_text(encoding="utf-8")
+        assert "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0" in review_log
+        assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
             9,

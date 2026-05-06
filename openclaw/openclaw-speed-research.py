@@ -28,11 +28,15 @@ from openclaw_speed_research_core import (
     benchmark_result_schema_ok,
     benchmark_spec,
     ensure_research_state,
+    exhausted_lanes,
+    mark_lane_exhausted,
+    measurement_artifact_analysis,
     load_benchmark_manifest,
     paired_profile_plan,
     read_jsonl,
     replay_checks,
     score_insight,
+    variance_analysis,
     write_jsonl,
 )
 
@@ -1232,6 +1236,8 @@ def quality_review(args: argparse.Namespace) -> int:
         and best_mean is not None
         and best_mean < float(args.target_tps)
     )
+    variance = variance_analysis(root, recent_rows=int(args.recent_rows), min_samples=int(args.min_samples_per_block))
+    artifact_check = measurement_artifact_analysis(root, recent_rows=int(args.recent_rows))
     review_status = "keep"
     recommendations: list[str] = []
     gates: dict[str, Any] = {
@@ -1240,6 +1246,8 @@ def quality_review(args: argparse.Namespace) -> int:
         "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
         "has_frontier_next_lane": bool(frontier_ready),
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
+        "variance_significant_best": bool(variance.get("significant_best")),
+        "no_measurement_artifact": not bool(artifact_check.get("artifact_suspected")),
     }
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
@@ -1254,6 +1262,12 @@ def quality_review(args: argparse.Namespace) -> int:
     if len(sweep_rows) < int(args.min_sweeps):
         quality_score -= 15
         recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
+    if artifact_check.get("artifact_suspected"):
+        quality_score -= 25
+        recommendations.append(f"measurement artifact suspected: {artifact_check.get('reason')}; remeasure baseline before promotion.")
+    if variance.get("groups") and not variance.get("significant_best"):
+        quality_score -= 10
+        recommendations.append("variance gate: best decode result has not cleared the observed noise band; keep measuring or change hypothesis.")
     if repeated_block2 and repeated_keep_current:
         recommendations.append("block-size sweep has converged on block 2; move to acceptance, drafter-fit, DFlash, and MTP-loop overhead.")
         seeded_tasks.extend(
@@ -1301,6 +1315,12 @@ def quality_review(args: argparse.Namespace) -> int:
     if plateau_below_target and frontier_ready:
         recommendations.append(
             f"plateau detected below {args.target_tps} tok/s; prioritize frontier lanes={','.join(frontier_ready)} over more block sweeps."
+        )
+        mark_lane_exhausted(
+            root,
+            lane="mtp-decode",
+            reason="block-size/live MTP sweep plateaued below target; route to drafter alignment, DFlash, or runtime overhead",
+            evidence={"best_block": best_block, "best_mean_decode_tps": best_mean, "variance": variance},
         )
     exhaustion_candidate = (
         plateau_below_target
@@ -1357,6 +1377,8 @@ def quality_review(args: argparse.Namespace) -> int:
         "exhaustion_candidate": exhaustion_candidate,
         "repeated_block2_winner": repeated_block2,
         "repeated_keep_current": repeated_keep_current,
+        "variance": variance,
+        "measurement_artifact": artifact_check,
         "recommendations": recommendations,
         "seeded_tasks": seeded,
     }
@@ -1388,6 +1410,66 @@ def quality_review(args: argparse.Namespace) -> int:
         ),
     )
     print(json.dumps({"ok": True, "path": str(path), **artifact}, indent=2))
+    return 0
+
+
+def frontier_review(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    variance = variance_analysis(root, recent_rows=args.recent_rows, min_samples=args.min_samples)
+    artifact = measurement_artifact_analysis(root, recent_rows=args.recent_rows)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    exhausted = exhausted_lanes(root)
+    journal = read_jsonl(root / "journal.jsonl")
+    corpus = read_jsonl(root / "trajectory-corpus.jsonl")
+    action_counts: dict[str, int] = {}
+    for entry in journal[-args.recent_rows :]:
+        action = str(entry.get("action") or "unknown")
+        action_counts[action] = action_counts.get(action, 0) + 1
+    report = {
+        "ok": True,
+        "kind": "frontier-review",
+        "timestamp": int(time.time()),
+        "recent_rows": args.recent_rows,
+        "ready_tasks": len(ready),
+        "ready_lanes": sorted({str(task.get("lane", "")) for task in ready if task.get("lane")}),
+        "exhausted_lanes": sorted(exhausted),
+        "journal_entries": len(journal),
+        "recent_action_counts": action_counts,
+        "trajectory_cases": len(corpus),
+        "variance": variance,
+        "measurement_artifact": artifact,
+        "next": (
+            "promote only variance-significant improvements; rework metric-up guard-fail nodes; "
+            "skip exhausted lanes unless new evidence reopens them"
+        ),
+    }
+    path = root / "benchmarks" / f"frontier-review-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "frontier-review",
+            "finding": "supervisor reviewed journal, variance, artifacts, exhausted lanes, and trajectory corpus",
+            "evidence": report,
+            "next": "select_next_task",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"frontier-review-{report['timestamp']}",
+        status="keep",
+        target="autoresearch-frontier",
+        hypothesis="journal and variance review should keep the autonomous loop focused on high-signal improvements",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"ready={len(ready)} exhausted={','.join(sorted(exhausted))} "
+            f"significant_best={variance.get('significant_best')} artifact={artifact.get('artifact_suspected')}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
     return 0
 
 
@@ -2739,6 +2821,11 @@ def main() -> int:
     review.add_argument("--min-samples-per-block", type=int, default=3)
     review.add_argument("--target-tps", type=float, default=30.0)
     review.set_defaults(func=quality_review)
+
+    frontier = sub.add_parser("frontier-review")
+    frontier.add_argument("--recent-rows", type=int, default=160)
+    frontier.add_argument("--min-samples", type=int, default=3)
+    frontier.set_defaults(func=frontier_review)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)

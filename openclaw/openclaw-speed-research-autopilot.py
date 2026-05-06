@@ -28,6 +28,7 @@ from openclaw_speed_research_core import (
     paired_profile_plan,
     read_jsonl,
     record_rejection,
+    record_trajectory_case,
     replay_checks,
     select_next_task,
     task_summary,
@@ -1296,6 +1297,55 @@ def complete_supervisor_task(
     return row
 
 
+def mark_task_rework(
+    task: dict[str, object] | None,
+    *,
+    reason: str,
+    summary: dict[str, object],
+    commit: str,
+    max_reworks: int = 2,
+) -> bool:
+    if not task:
+        return False
+    task_id = str(task.get("id", ""))
+    tasks = read_jsonl(TASKS)
+    changed = False
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for item in tasks:
+        if item.get("id") != task_id:
+            continue
+        attempts = int(item.get("rework_attempts") or 0) + 1
+        item["rework_attempts"] = attempts
+        item["last_rework_at"] = now
+        item["last_rework_reason"] = reason
+        item["supervisor_summary"] = summary
+        if attempts <= max_reworks:
+            item["status"] = "rework"
+            item["priority"] = int(item.get("priority", 0)) + 5
+            item["next_action"] = "repair the existing patch or record a blocked row; do not invent a new unrelated idea"
+        else:
+            item["status"] = "blocked"
+            item["blocked_at"] = now
+            item["blocked_reason"] = f"rework attempts exhausted: {reason}"
+        changed = True
+        break
+    if not changed:
+        return False
+    write_jsonl(TASKS, tasks)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": now,
+            "task_id": task_id,
+            "finding": "metric/idea may still be useful but guard failed; supervisor routed to bounded rework instead of losing the approach",
+            "reason": reason,
+            "summary": summary,
+            "commit": commit,
+        },
+    )
+    return True
+
+
 def start_model_for_supervisor_benchmark(log_file: Path, timeout_seconds: float) -> None:
     if model_ready():
         return
@@ -1626,6 +1676,9 @@ def run_supervisor_patch_execute_task(
     parsed = parse_json_object(result.stdout) or {}
     if result.returncode != 0 or parsed.get("ok") is False:
         reason = str(parsed.get("reason") or f"supervisor patch executor exit {result.returncode}")
+        if "canary tests failed" in reason or "patch apply failed in canary" in reason:
+            if mark_task_rework(task, reason=reason, summary={"result": parsed}, commit=current_commit()):
+                return result.returncode or 2, f"rework queued: {reason}"
         complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
         return result.returncode or 2, reason
     complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
@@ -1940,7 +1993,7 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
 
 
 def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
-    cmd = [
+    commands = [[
         args.research_helper_bin,
         "quality-review",
         "--recent-rows",
@@ -1951,24 +2004,35 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
         str(args.review_min_samples_per_block),
         "--target-tps",
         str(args.review_target_tps),
-    ]
+    ]]
+    commands.append(
+        [
+            args.research_helper_bin,
+            "frontier-review",
+            "--recent-rows",
+            str(args.review_recent_rows),
+            "--min-samples",
+            str(args.review_min_samples_per_block),
+        ]
+    )
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} supervisor quality review =====\n")
-        file.write("$ " + " ".join(cmd) + "\n")
-        file.flush()
-        try:
-            result = subprocess.run(
-                cmd,
-                text=True,
-                stdout=file,
-                stderr=subprocess.STDOUT,
-                timeout=args.quality_review_timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "supervisor quality review timeout"
-    if result.returncode != 0:
-        return False, f"supervisor quality review exit {result.returncode}"
+        for cmd in commands:
+            file.write("$ " + " ".join(cmd) + "\n")
+            file.flush()
+            try:
+                result = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=file,
+                    stderr=subprocess.STDOUT,
+                    timeout=args.quality_review_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return False, "supervisor quality/frontier review timeout"
+            if result.returncode != 0:
+                return False, f"supervisor quality/frontier review exit {result.returncode}"
     return True, ""
 
 
@@ -2265,10 +2329,19 @@ def main() -> int:
         if code not in {0, 124}:
             log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
         if not progressed:
+            failed_task_id = str((selected_task or select_next_task(WORKSPACE) or {}).get("id", "unknown"))
             record_rejection(
                 WORKSPACE,
                 cycle=cycle,
-                task_id=str((selected_task or select_next_task(WORKSPACE) or {}).get("id", "unknown")),
+                task_id=failed_task_id,
+                reason=str(quality["reason"]),
+                evidence=",".join(progress_reasons) if progress_reasons else last_issue,
+            )
+            record_trajectory_case(
+                WORKSPACE,
+                cycle=cycle,
+                session=current_session,
+                task_id=failed_task_id,
                 reason=str(quality["reason"]),
                 evidence=",".join(progress_reasons) if progress_reasons else last_issue,
             )

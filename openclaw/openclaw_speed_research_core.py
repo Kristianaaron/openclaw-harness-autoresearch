@@ -8,6 +8,7 @@ module owns the durable research memory that makes those turns purposeful.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -324,10 +325,13 @@ def ensure_research_state(root: Path) -> None:
         normalize_results_ledger(root / "results.tsv")
     if not (root / "STRATEGY.md").exists():
         (root / "STRATEGY.md").write_text(strategy_template(), encoding="utf-8")
-    for name in ("findings.jsonl", "experiments.jsonl", "rejections.jsonl"):
+    for name in ("findings.jsonl", "experiments.jsonl", "rejections.jsonl", "journal.jsonl", "trajectory-corpus.jsonl"):
         path = root / name
         if not path.exists():
             path.write_text("", encoding="utf-8")
+    exhausted = root / "exhausted-approaches.jsonl"
+    if not exhausted.exists():
+        exhausted.write_text("", encoding="utf-8")
     write_json_if_missing_or_stale(root / "benchmark-manifest.json", DEFAULT_BENCHMARK_MANIFEST, "version")
     write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
     ensure_replay_buffer(root / "replay-buffer.jsonl")
@@ -654,6 +658,201 @@ def append_result(
     ]
     with results.open("a", encoding="utf-8") as file:
         file.write("\t".join(clean_tsv(item) for item in row) + "\n")
+    append_journal_entry(
+        root,
+        {
+            "id": run_id,
+            "parent_id": parse_note_fields(notes).get("parent_id", ""),
+            "action": parse_note_fields(notes).get("action", infer_journal_action(run_id, status, target, notes)),
+            "status": status,
+            "target": target,
+            "metric": "decode_tps" if decode_tps != "" else ("ttft_s" if ttft_s != "" else "wall_s"),
+            "decode_tps": parse_float(decode_tps),
+            "ttft_s": parse_float(ttft_s),
+            "wall_s": parse_float(wall_s),
+            "guard_status": "pass" if status == "keep" else "fail",
+            "hypothesis": hypothesis,
+            "commit": commit,
+            "notes": clean_tsv(notes),
+        },
+    )
+
+
+def parse_note_fields(notes: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for token in str(notes).replace(",", " ").split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def infer_journal_action(run_id: str, status: str, target: str, notes: str) -> str:
+    text = f"{run_id} {status} {target} {notes}".lower()
+    if "rework" in text:
+        return "rework"
+    if "debug" in text or status == "blocked":
+        return "debug"
+    if "synthesis" in text or "quality-review" in text:
+        return "review"
+    if "sweep" in text or "benchmark" in text or target in {"decode-sample", "quick-health"}:
+        return "improve"
+    return "draft"
+
+
+def append_journal_entry(root: Path, entry: dict[str, Any]) -> None:
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "schema": 1,
+        **entry,
+    }
+    append_jsonl(root / "journal.jsonl", payload)
+
+
+def lane_key_for_task(task: dict[str, Any]) -> str:
+    return str(task.get("lane") or task.get("target") or task.get("id") or "unknown")
+
+
+def exhausted_lanes(root: Path) -> dict[str, dict[str, Any]]:
+    lanes: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(root / "exhausted-approaches.jsonl"):
+        lane = str(row.get("lane", ""))
+        if lane and not row.get("reopened"):
+            lanes[lane] = row
+    return lanes
+
+
+def mark_lane_exhausted(root: Path, *, lane: str, reason: str, evidence: dict[str, Any]) -> bool:
+    if not lane:
+        return False
+    active = exhausted_lanes(root)
+    if lane in active:
+        return False
+    append_jsonl(
+        root / "exhausted-approaches.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "lane": lane,
+            "reason": reason,
+            "evidence": evidence,
+        },
+    )
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": f"exhausted-{lane}",
+            "finding": "supervisor marked an approach lane exhausted to prevent repeated low-value cycles",
+            "reason": reason,
+            "evidence": evidence,
+            "next": "route_to_frontier_or_exhaustion_report",
+        },
+    )
+    return True
+
+
+def stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    avg = sum(values) / len(values)
+    return math.sqrt(sum((value - avg) ** 2 for value in values) / (len(values) - 1))
+
+
+def group_decode_samples(rows: list[dict[str, str]]) -> dict[str, list[float]]:
+    groups: dict[str, list[float]] = {}
+    for row in rows:
+        if row.get("status") != "keep" or row.get("target") != "decode-sample":
+            continue
+        value = parse_float(row.get("decode_tps"))
+        if value is None:
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        variant = fields.get("draft_block_size") or fields.get("variant") or "default"
+        groups.setdefault(variant, []).append(value)
+    return groups
+
+
+def variance_analysis(root: Path, *, recent_rows: int = 160, min_samples: int = 3) -> dict[str, Any]:
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    groups = group_decode_samples(rows)
+    summaries: dict[str, dict[str, Any]] = {}
+    best_variant = ""
+    best_mean: float | None = None
+    for variant, values in sorted(groups.items()):
+        avg = mean(values)
+        sd = round(stddev(values), 3)
+        summaries[variant] = {
+            "samples": len(values),
+            "mean": avg,
+            "stddev": sd,
+            "min": round(min(values), 3) if values else None,
+            "max": round(max(values), 3) if values else None,
+            "noise_band": round(max(sd * 2, (avg or 0) * 0.05), 3) if avg is not None else None,
+        }
+        if len(values) >= min_samples and avg is not None and (best_mean is None or avg > best_mean):
+            best_variant = variant
+            best_mean = avg
+    default_mean = summaries.get("default", {}).get("mean")
+    significant = False
+    if best_variant and best_mean is not None:
+        baseline_summary = summaries.get("default") or summaries.get("2") or {}
+        baseline_mean = baseline_summary.get("mean")
+        noise_band = max(
+            float(summaries[best_variant].get("noise_band") or 0),
+            float(baseline_summary.get("noise_band") or 0),
+        )
+        significant = baseline_mean is None or best_mean - float(baseline_mean) > noise_band
+    return {
+        "ok": True,
+        "groups": summaries,
+        "best_variant": best_variant,
+        "best_mean": best_mean,
+        "default_mean": default_mean,
+        "significant_best": significant,
+        "min_samples": min_samples,
+    }
+
+
+def measurement_artifact_analysis(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    blocked_or_discarded = [row for row in rows if row.get("status") in {"blocked", "discard"}]
+    decode_notes = [parse_note_fields(row.get("notes", "")) for row in blocked_or_discarded]
+    shared_winner_blocks = [fields.get("winner_block") for fields in decode_notes if fields.get("winner_block")]
+    artifact = False
+    reason = ""
+    if len(shared_winner_blocks) >= 3 and len(set(shared_winner_blocks[-3:])) == 1:
+        artifact = True
+        reason = "last three blocked/discarded experiments share the same winner; remeasure baseline before crediting a variant"
+    return {
+        "ok": True,
+        "artifact_suspected": artifact,
+        "reason": reason,
+        "shared_winner_blocks": shared_winner_blocks[-5:],
+    }
+
+
+def record_trajectory_case(
+    root: Path,
+    *,
+    cycle: int,
+    session: str,
+    task_id: str,
+    reason: str,
+    evidence: str,
+) -> None:
+    append_jsonl(
+        root / "trajectory-corpus.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "cycle": cycle,
+            "session": session,
+            "task_id": task_id,
+            "reason": reason,
+            "evidence": evidence[-2000:],
+            "replay_hint": "turn this into a deterministic replay guard if the pattern repeats",
+        },
+    )
 
 
 def all_result_rows(root: Path) -> list[dict[str, str]]:
@@ -857,7 +1056,39 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
     tasks = [task for task in read_jsonl(root / "tasks.jsonl") if task.get("status", "ready") in {"ready", "rework"}]
     if not tasks:
         return None
-    return sorted(tasks, key=lambda task: int(task.get("priority", 0)), reverse=True)[0]
+    exhausted = exhausted_lanes(root)
+    filtered = [
+        task
+        for task in tasks
+        if lane_key_for_task(task) not in exhausted
+        or task.get("lane") in {"exhaustion-report", "frontier-dflash", "drafter-alignment", "runtime-overhead"}
+    ]
+    if not filtered:
+        filtered = tasks
+    journal = read_jsonl(root / "journal.jsonl")
+    lane_scores: dict[str, float] = {}
+    for entry in journal[-250:]:
+        lane = str(entry.get("lane") or entry.get("target") or "")
+        if not lane:
+            continue
+        score = lane_scores.get(lane, 0.0)
+        if entry.get("guard_status") == "pass":
+            score += 0.25
+        if parse_float(entry.get("decode_tps")) is not None:
+            score += float(parse_float(entry.get("decode_tps")) or 0) / 100.0
+        lane_scores[lane] = score
+
+    def task_score(task: dict[str, Any]) -> tuple[int, float]:
+        status_bonus = 1000 if task.get("status") == "rework" else 0
+        supervisor_bonus = 0
+        lane = lane_key_for_task(task)
+        frontier_bonus = int(lane_scores.get(lane, 0.0) * 10)
+        return (
+            status_bonus + supervisor_bonus + int(task.get("priority", 0)) + frontier_bonus,
+            float(task.get("created_score", 0) or 0),
+        )
+
+    return sorted(filtered, key=task_score, reverse=True)[0]
 
 
 def task_summary(root: Path, limit: int = 3) -> str:
