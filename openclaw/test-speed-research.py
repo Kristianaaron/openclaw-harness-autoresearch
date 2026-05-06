@@ -92,6 +92,13 @@ def main() -> int:
             assert helper.benchmark(
                 Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-shape", timeout=1.0)
             ) == 0
+            assert helper.completion_tokens_from_response(
+                {"usage": {"completion_tokens": 96}},
+                "short visible text",
+            ) == (96, "usage.completion_tokens")
+            fallback_tokens, fallback_source = helper.completion_tokens_from_response({}, "short visible text")
+            assert fallback_tokens > 1
+            assert fallback_source == "content_estimate"
             benchmark_rows = (root / "results.tsv").read_text(encoding="utf-8")
             assert "prompt-size" in benchmark_rows
             assert "prompt-shape" in benchmark_rows

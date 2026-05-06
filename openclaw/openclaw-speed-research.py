@@ -861,6 +861,17 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / 3.8))
 
 
+def completion_tokens_from_response(parsed: dict[str, Any], content: str) -> tuple[int, str]:
+    usage = parsed.get("usage")
+    if isinstance(usage, dict):
+        value = usage.get("completion_tokens")
+        if isinstance(value, int) and value > 0:
+            return value, "usage.completion_tokens"
+        if isinstance(value, str) and value.isdigit() and int(value) > 0:
+            return int(value), "usage.completion_tokens"
+    return estimate_tokens(content), "content_estimate"
+
+
 def result_rows(root: Path) -> list[dict[str, str]]:
     results = root / "results.tsv"
     if not results.exists():
@@ -1393,31 +1404,36 @@ def benchmark(args: argparse.Namespace) -> int:
     try:
         if mode == "streaming-ttft":
             ttft_s, wall_s, content = stream_model_request(base_url, payload, args.timeout)
+            completion_tokens = 0
+            completion_token_source = ""
         elif mode == "prefill-reuse":
             first_wall_s, _body = model_request(base_url, payload, args.timeout)
             wall_s, body = model_request(base_url, payload, args.timeout)
             parsed = json.loads(body.decode("utf-8"))
             content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+            completion_tokens, completion_token_source = completion_tokens_from_response(parsed, str(content))
             ttft_s = ""
         else:
             wall_s, body = model_request(base_url, payload, args.timeout)
             parsed = json.loads(body.decode("utf-8"))
             content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+            completion_tokens, completion_token_source = completion_tokens_from_response(parsed, str(content))
             first_wall_s = None
             ttft_s = ""
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         print(json.dumps({"ok": False, "status": "blocked", "reason": str(error)}, indent=2))
         return 2
     after_memory = memory_snapshot()
-    words = max(1, len(str(content).split()))
-    decode_tps = round(words / wall_s, 3) if mode == "decode-sample" and wall_s > 0 else ""
+    decode_tps = round(completion_tokens / wall_s, 3) if mode == "decode-sample" and wall_s > 0 else ""
     result = {
         "ok": True,
         "model": model,
         "mode": mode,
         "wall_s": round(wall_s, 3),
         "ttft_s": round(ttft_s, 3) if isinstance(ttft_s, float) else ttft_s,
-        "decode_tps_estimate": decode_tps,
+        "completion_tokens": completion_tokens if completion_tokens else "",
+        "completion_token_source": completion_token_source,
+        "decode_tps": decode_tps,
         "first_wall_s": round(first_wall_s, 3) if mode == "prefill-reuse" and first_wall_s is not None else "",
         "second_wall_s": round(wall_s, 3) if mode == "prefill-reuse" else "",
         "memory_before_mb": before_memory,
@@ -1438,7 +1454,11 @@ def benchmark(args: argparse.Namespace) -> int:
         wall_s=result["wall_s"],
         memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
         commit=commit,
-        notes=f"model={model} preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}",
+        notes=(
+            f"model={model} completion_tokens={completion_tokens} "
+            f"token_source={completion_token_source} "
+            f"preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}"
+        ),
     )
     print(json.dumps(result, indent=2))
     return 0
