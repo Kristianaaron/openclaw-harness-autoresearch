@@ -3,8 +3,7 @@ set -u
 
 gateway_port="${OPENCLAW_GATEWAY_PORT:-18789}"
 profile_helper="$HOME/.openclaw/bin/openclaw-model-profile"
-tui_js="/opt/homebrew/lib/node_modules/openclaw/dist/tui-DN9rW-QU.js"
-runner_js="/opt/homebrew/lib/node_modules/openclaw/dist/pi-embedded-RhaMl0u2.js"
+openclaw_dist="/opt/homebrew/lib/node_modules/openclaw/dist"
 pi_tui_js="/opt/homebrew/lib/node_modules/openclaw/node_modules/@mariozechner/pi-tui/dist/tui.js"
 loader_js="/opt/homebrew/lib/node_modules/openclaw/node_modules/@mariozechner/pi-tui/dist/components/loader.js"
 config_json="$HOME/.openclaw/openclaw.json"
@@ -45,6 +44,32 @@ check_endpoint() {
   fi
 }
 
+check_bundle_syntax() {
+  local label="$1"
+  shift
+  local -a files
+  local pattern file
+  files=()
+  for pattern in "$@"; do
+    for file in "$openclaw_dist"/${~pattern}(N); do
+      files+=("$file")
+    done
+  done
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    printf "fail %s\n" "$label"
+    ok=1
+    return 1
+  fi
+  for file in "${files[@]}"; do
+    if ! /opt/homebrew/bin/node --check "$file" >/dev/null 2>&1; then
+      printf "fail %s\n" "$label"
+      ok=1
+      return 1
+    fi
+  done
+  printf "ok   %s\n" "$label"
+}
+
 model_health_url="$("$profile_helper" current --field healthUrl 2>/dev/null || true)"
 
 check "wrapper syntax" /bin/zsh -n "$HOME/.zfunc/openclaw"
@@ -67,8 +92,8 @@ check "prefix warmer" /bin/test -x "$prefix_warmer"
 check "speed research helper" /bin/test -x "$speed_research"
 check "generic model LaunchAgent" /usr/bin/plutil -lint "$HOME/Library/LaunchAgents/local.openclaw-model-server.plist"
 check "stale jang server removed" /bin/test ! -e "$HOME/.openclaw/servers/jang_server.py"
-check "tui submit syntax" /opt/homebrew/bin/node --check "$tui_js"
-check "agent runner syntax" /opt/homebrew/bin/node --check "$runner_js"
+check_bundle_syntax "tui submit syntax" "tui-*.js" "tui-cli-*.js" "tui-backend-*.js"
+check_bundle_syntax "agent runner syntax" "agent-runner.runtime*.js" "pi-embedded.runtime*.js" "run-embedded.runtime*.js"
 check "pi-tui syntax" /opt/homebrew/bin/node --check "$pi_tui_js"
 check "loader syntax" /opt/homebrew/bin/node --check "$loader_js"
 if [[ -n "$model_health_url" ]]; then

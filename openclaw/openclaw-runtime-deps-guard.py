@@ -5,7 +5,8 @@ OpenClaw can start a gateway and an embedded agent close together. If npm was
 interrupted during bundled plugin runtime dependency staging, hidden npm staging
 directories can be left under node_modules and later installs fail with
 ENOTEMPTY before the model is called. This guard serializes repair and delegates
-the dependency plan to OpenClaw's native `plugins deps --repair` command.
+to OpenClaw's native plugin health command. OpenClaw 4.x exposed
+`plugins deps`; OpenClaw 5.5 beta moved that surface to `plugins doctor`.
 """
 
 from __future__ import annotations
@@ -29,7 +30,22 @@ def log(message: str) -> None:
     print(f"OpenClaw runtime deps guard: {message}", file=sys.stderr, flush=True)
 
 
-def run_plugins_deps(*extra: str) -> dict[str, Any]:
+def run_openclaw(*args: str, timeout: int = 180) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [OPENCLAW_BIN, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def command_output(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout).strip()
+
+
+def run_plugins_deps(*extra: str) -> dict[str, Any] | None:
     result = subprocess.run(
         [OPENCLAW_BIN, "plugins", "deps", "--json", *extra],
         stdout=subprocess.PIPE,
@@ -39,9 +55,18 @@ def run_plugins_deps(*extra: str) -> dict[str, Any]:
         check=False,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail = command_output(result)
+        if "unknown option '--json'" in detail or "too many arguments for 'plugins'" in detail:
+            return None
         raise RuntimeError(detail or f"openclaw plugins deps exited {result.returncode}")
     return json.loads(result.stdout)
+
+
+def run_plugins_doctor() -> None:
+    result = run_openclaw("plugins", "doctor", timeout=180)
+    if result.returncode != 0:
+        detail = command_output(result)
+        raise RuntimeError(detail or f"openclaw plugins doctor exited {result.returncode}")
 
 
 def process_alive(pid: int) -> bool:
@@ -100,18 +125,44 @@ def cleanup_failed_npm_staging_dirs(install_root: Path) -> int:
     return removed
 
 
+def fallback_install_roots() -> list[Path]:
+    roots: list[Path] = [Path.home() / ".openclaw"]
+    try:
+        real_bin = Path(OPENCLAW_BIN).resolve()
+        for parent in real_bin.parents:
+            if parent.name == "openclaw":
+                roots.append(parent)
+                break
+    except Exception:
+        pass
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            unique.append(root)
+            seen.add(key)
+    return unique
+
+
 def main() -> int:
     plan = run_plugins_deps()
-    install_root = Path(str(plan.get("installRoot") or "")).expanduser()
-    if not install_root:
-        raise SystemExit("OpenClaw runtime deps guard: missing installRoot")
+    install_root = (
+        Path(str(plan.get("installRoot") or "")).expanduser()
+        if isinstance(plan, dict)
+        else Path.home() / ".openclaw"
+    )
     lock_dir = acquire_lock(install_root)
     try:
-        removed = cleanup_failed_npm_staging_dirs(install_root)
-        plan = run_plugins_deps("--repair")
-        missing = plan.get("missing") if isinstance(plan, dict) else None
-        if isinstance(missing, list) and missing:
-            raise RuntimeError(f"runtime deps still missing after repair: {len(missing)}")
+        roots = [install_root] if isinstance(plan, dict) else fallback_install_roots()
+        removed = sum(cleanup_failed_npm_staging_dirs(root) for root in roots)
+        if isinstance(plan, dict):
+            repaired = run_plugins_deps("--repair")
+            missing = repaired.get("missing") if isinstance(repaired, dict) else None
+            if isinstance(missing, list) and missing:
+                raise RuntimeError(f"runtime deps still missing after repair: {len(missing)}")
+        else:
+            run_plugins_doctor()
         if removed:
             log(f"removed {removed} stale npm staging director{'y' if removed == 1 else 'ies'}")
     finally:
