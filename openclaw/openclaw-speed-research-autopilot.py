@@ -1638,8 +1638,15 @@ def run_supervisor_drafter_sweep_plan(
 ) -> tuple[int, str]:
     blocks = str(task.get("blocks") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_BLOCKS", "1,2,3,4"))
     samples = str(task.get("samples") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_SAMPLES", "3"))
+    retries = str(task.get("retries") or os.environ.get("OPENCLAW_DRAFTER_SWEEP_RETRIES", "2"))
     action = "drafter-sweep-plan" if task.get("supervisor_action") == "drafter-sweep-plan" else "drafter-sweep-run"
     cmd = [args.research_helper_bin, action, "--blocks", blocks, "--samples", samples]
+    if action == "drafter-sweep-run":
+        cmd.extend(["--retries", retries])
+    block_count = len([part for part in blocks.split(",") if part.strip()])
+    timeout_seconds = 30
+    if action == "drafter-sweep-run":
+        timeout_seconds = max(90, block_count * int(samples) * (int(retries) + 1) * 12)
     with log_file.open("a", encoding="utf-8") as file:
         file.write(
             f"\n===== cycle {cycle} session {session} supervisor drafter sweep {action} "
@@ -1653,11 +1660,11 @@ def run_supervisor_drafter_sweep_plan(
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=30,
+                timeout=timeout_seconds,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            file.write("SUPERVISOR DRAFTER SWEEP PLAN TIMEOUT\n")
+            file.write(f"SUPERVISOR DRAFTER SWEEP {action.upper()} TIMEOUT after {timeout_seconds}s\n")
             return 124, "supervisor drafter sweep timeout"
         file.write(result.stdout)
         file.flush()
@@ -1684,6 +1691,7 @@ def run_supervisor_drafter_sweep_plan(
         commit=current_commit(),
         notes=(
             f"action={action} blocks={blocks} samples={samples} "
+            f"retries={retries if action == 'drafter-sweep-run' else ''} "
             f"decision={parsed.get('decision', '')} path={parsed.get('path', '')}"
         ),
     )

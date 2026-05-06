@@ -1641,6 +1641,7 @@ def drafter_sweep_run(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "reason": "no block sizes provided"}, indent=2))
         return 2
     samples = max(1, min(int(args.samples), 10))
+    retries = max(0, min(int(getattr(args, "retries", 2)), 5))
     live_block = int(args.control_block or os.environ.get("OPENCLAW_JANG_DRAFT_BLOCK_SIZE", "2") or 2)
     trial_blocks = [live_block, *[block for block in blocks if block != live_block]]
     timestamp = int(time.time())
@@ -1650,21 +1651,39 @@ def drafter_sweep_run(args: argparse.Namespace) -> int:
     for block in trial_blocks:
         block_results: list[dict[str, Any]] = []
         for sample_index in range(samples):
-            capture = io.StringIO()
-            bench_args = argparse.Namespace(
-                base_url=args.base_url,
-                model=args.model,
-                quick=False,
-                mode="decode-sample",
-                timeout=args.timeout,
-                draft_block_size=block,
-            )
-            with contextlib.redirect_stdout(capture):
-                code = benchmark(bench_args)
-            parsed = parse_json_object(capture.getvalue()) or {}
+            attempts: list[dict[str, Any]] = []
+            parsed: dict[str, Any] = {}
+            code = 2
+            for attempt_index in range(retries + 1):
+                capture = io.StringIO()
+                bench_args = argparse.Namespace(
+                    base_url=args.base_url,
+                    model=args.model,
+                    quick=False,
+                    mode="decode-sample",
+                    timeout=args.timeout,
+                    draft_block_size=block,
+                    record_schema_failures=False,
+                )
+                with contextlib.redirect_stdout(capture):
+                    code = benchmark(bench_args)
+                parsed = parse_json_object(capture.getvalue()) or {}
+                attempts.append(
+                    {
+                        "attempt": attempt_index + 1,
+                        "returncode": code,
+                        "result": parsed,
+                    }
+                )
+                if code == 0 and parsed.get("ok"):
+                    break
+                reason = str(parsed.get("reason") or "")
+                if "completion_tokens=1" not in reason and "too short for throughput evidence" not in reason:
+                    break
             block_results.append(
                 {
                     "sample": sample_index + 1,
+                    "attempts": attempts,
                     "returncode": code,
                     "result": parsed,
                 }
@@ -1674,6 +1693,7 @@ def drafter_sweep_run(args: argparse.Namespace) -> int:
                     {
                         "block": block,
                         "sample": sample_index + 1,
+                        "attempts": len(attempts),
                         "reason": parsed.get("reason") or f"benchmark exit {code}",
                     }
                 )
@@ -1698,6 +1718,7 @@ def drafter_sweep_run(args: argparse.Namespace) -> int:
         trials[str(block)] = {
             "block": block,
             "requested_samples": samples,
+            "retries_per_sample": retries,
             "sample_count": len(good),
             "mean_decode_tps": mean_float(decode_values),
             "mean_accept": mean_float(accept_values),
@@ -2295,17 +2316,18 @@ def benchmark(args: argparse.Namespace) -> int:
     }
     schema_ok, schema_issue = benchmark_result_schema_ok(root, result)
     if not schema_ok:
-        append_result(
-            root,
-            run_id=f"benchmark-{result['timestamp']}",
-            status="blocked",
-            target=mode,
-            hypothesis=f"bounded OpenClaw {mode} probe",
-            wall_s=result["wall_s"],
-            memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
-            commit=commit,
-            notes=f"schema_issue={schema_issue}",
-        )
+        if getattr(args, "record_schema_failures", True):
+            append_result(
+                root,
+                run_id=f"benchmark-{result['timestamp']}",
+                status="blocked",
+                target=mode,
+                hypothesis=f"bounded OpenClaw {mode} probe",
+                wall_s=result["wall_s"],
+                memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
+                commit=commit,
+                notes=f"schema_issue={schema_issue}",
+            )
         result["ok"] = False
         result["status"] = "blocked"
         result["reason"] = schema_issue
@@ -2451,6 +2473,7 @@ def main() -> int:
     sweep_run.add_argument("--samples", type=int, default=3)
     sweep_run.add_argument("--min-delta", type=float, default=0.5)
     sweep_run.add_argument("--control-block", type=int, default=0)
+    sweep_run.add_argument("--retries", type=int, default=2)
     sweep_run.add_argument("--base-url", default=DEFAULT_MODEL_URL)
     sweep_run.add_argument("--model", default="")
     sweep_run.add_argument("--timeout", type=float, default=180.0)

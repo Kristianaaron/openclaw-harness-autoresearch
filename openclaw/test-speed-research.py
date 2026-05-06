@@ -214,8 +214,46 @@ def main() -> int:
                                 min_delta=0.5,
                                 control_block=2,
                                 timeout=1.0,
+                                retries=2,
                             )
                         ) == 0
+                    short_then_good_calls = {"count": 0}
+
+                    def fake_short_then_good(_base_url, _payload, _timeout):
+                        short_then_good_calls["count"] += 1
+                        if short_then_good_calls["count"] == 1:
+                            return (
+                                0.1,
+                                b'{"choices":[{"message":{"content":"x"}}],"usage":{"completion_tokens":1}}',
+                            )
+                        with fake_log.open("a", encoding="utf-8") as file:
+                            file.write(
+                                "chat completion: prompt=10 completion=96 elapsed=6.00s "
+                                "tok_s=16.0 mtp_rounds=24 mean_accept=0.75\n"
+                            )
+                        return (
+                            6.0,
+                            b'{"choices":[{"message":{"content":"done"}}],"usage":{"completion_tokens":96}}',
+                        )
+
+                    with patch.object(helper, "model_request", side_effect=fake_short_then_good):
+                        before_retry_rows = (root / "results.tsv").read_text(encoding="utf-8")
+                        assert helper.drafter_sweep_run(
+                            Namespace(
+                                base_url="http://127.0.0.1:8091/v1",
+                                model="",
+                                blocks="2",
+                                samples=1,
+                                min_delta=0.5,
+                                control_block=2,
+                                timeout=1.0,
+                                retries=2,
+                            )
+                        ) == 0
+                        after_retry_rows = (root / "results.tsv").read_text(encoding="utf-8")
+                        assert after_retry_rows.count("schema_issue=decode-sample too short") == before_retry_rows.count(
+                            "schema_issue=decode-sample too short"
+                        )
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
