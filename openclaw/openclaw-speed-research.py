@@ -531,7 +531,7 @@ Primary research questions:
 
 - Why is MTP acceptance low for this JANQ target, and can acceptance be raised without changing the target model?
 - Can drafter quantization, block size, calibration, sampling/logit settings, cache handling, or the MLX MTP loop improve wall-clock decode TPS?
-- Can Rapid-MLX or upstream MLX/VLM implementation details reduce drafter overhead while preserving OpenClaw behavior?
+- Can DFlash, Rapid-MLX, or upstream MLX/VLM implementation details reduce drafter overhead while preserving OpenClaw behavior?
 
 In-scope source files and knobs:
 
@@ -541,6 +541,7 @@ In-scope source files and knobs:
 - `openclaw/model-profiles.example.json`
 - `openclaw/openclaw-model-proxy.py` only when proxy streaming or shaping affects measured decode
 - Live profile env vars for `OPENCLAW_JANG_DRAFT_MODEL`, `OPENCLAW_JANG_DRAFT_BLOCK_SIZE`, drafter quantization, temperature, top-p, and repetition penalty
+- DFlash reference only: `https://github.com/z-lab/dflash` and `z-lab/gemma-4-31B-it-DFlash`, gated behind compatibility proof before any live runtime change
 
 Think broadly, but every useful idea must become one of: a TUI-relevant decode benchmark result, MTP acceptance measurement, drafter calibration/quantization experiment, rejected experiment with evidence, or a small source patch with tests.
 
@@ -566,6 +567,7 @@ Frontier proposal areas include:
 - MTP scheduler policy: fixed block size, acceptance-aware block sizing, prompt-class-specific block size, and early stop on acceptance collapse.
 - MLX/VLM MTP implementation: eval boundaries, cache rollback cost, shared-KV slicing, prompt-cache reuse, target/drafter stream synchronization, and opportunities to upstream a cleaner faster loop.
 - Rapid-MLX compatibility: whether separate assistant drafters can be supported natively rather than only built-in MTP heads.
+- DFlash compatibility: whether `dflash.model_mlx.stream_generate` can safely wrap the JANG-loaded Gemma4 target, capture the required hidden layers, and preserve OpenClaw streaming/tool/reasoning guards.
 - Benchmark design: separating decode wall time from prefill, extracting `mtp_rounds` and `mean_accept` from logs, and comparing against no-drafter baseline.
 
 For every frontier idea, record: expected decode TPS impact, expected acceptance impact, feasibility, reliability risk, files/upstream projects involved, smallest prototype, and rollback path. Promote only ideas with a plausible path to a tested OpenClaw patch.
@@ -584,6 +586,7 @@ Prioritize decode/MTP experiments over generic LLM speed prompts:
 - JANQ calibration: use `openclaw/openclaw-mtp-drafter-calibrate.py` to test small calibration ideas. Promote only if benchmarked decode TPS beats the current official 4-bit drafter.
 - Acceptance diagnostics: parse logs for `mtp_rounds` and `mean_accept`; identify prompts/classes with acceptance collapse and record why.
 - MTP loop overhead: inspect `mlx_vlm.generate._mtp_rounds` behavior and compare with OpenClaw server usage. Look for avoidable eval/cache/rollback overhead.
+- DFlash compatibility spike: inspect `dflash.model_mlx` against `mlx_vlm.models.gemma4.gemma4.Model` and the JANQ target loader. Do not install or promote DFlash into the live server until a no-load structural check and a bounded canary pass.
 - Deterministic decode settings: test temperature, top-p, repetition penalty, and logit processors for acceptance and loop safety. Keep deterministic settings unless quality/reliability regresses.
 - Proxy streaming control: verify OpenClaw proxy is not hiding decode gains by buffering content. Measure time to first visible token separately from decode TPS.
 - Memory safety during decode: record Metal/RSS/compressor before and after drafter experiments; discard anything that increases crash risk.
@@ -1158,6 +1161,19 @@ def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
             "rollback": "Revert runtime loop patches if replay checks, streaming, or decode benchmarks regress.",
             "evidence": "The desired 30+ tok/s requires either much higher acceptance or lower MTP overhead than the current live path.",
         },
+        {
+            "id": "dflash-janq-compatibility",
+            "lane": "frontier-dflash",
+            "cause": "DFlash reports large speculative speedups for standard Gemma4 targets, but its MLX loop hooks hidden layers on an mlx_lm-style target while OpenClaw uses a JANG-loaded mlx_vlm Gemma4 target.",
+            "proposed_change": "Create a compatibility spike before any live runtime change: prove the DFlash draft can bind to the JANG target, capture Gemma4 hidden layers, and stream through OpenClaw guardrails.",
+            "expected_metric_delta": "Potentially raise decode_tps beyond the current MTP assistant drafter if DFlash acceptance and block drafting outweigh target verification overhead.",
+            "expected": "Either produce a safe DFlash canary plan for the TUI path or reject DFlash for JANQ with a precise incompatibility reason.",
+            "math": "Speculative speedup depends on accepted_tokens_per_round / (draft_cost + verify_cost + rollback_cost); DFlash only helps if its block diffusion draft has higher accepted tokens than the current MTP assistant path.",
+            "prototype": "Inspect `dflash.model_mlx.stream_generate`, add a no-load structural compatibility checklist for mlx_vlm Gemma4/JANG, then run a separate-env canary only if memory gates are green.",
+            "risk": "The published Gemma4 DFlash drafter is paired with google/gemma-4-31B-it, not the unlocked JANQ target; mismatch can reduce acceptance, leak reasoning markers, or destabilize cache rollback.",
+            "rollback": "Keep the existing Gemma4 MTP assistant drafter unless DFlash beats it on paired TUI decode benchmarks and passes stream/tool/reasoning guards.",
+            "evidence": "DFlash README lists an MLX path and `z-lab/gemma-4-31B-it-DFlash`; the model card says it must be paired with `google/gemma-4-31B-it`, so JANQ compatibility must be proven rather than assumed.",
+        },
     ]
 
 
@@ -1241,6 +1257,26 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
                 "Add a promotion gate only; do not change the live drafter automatically."
             ),
         },
+        {
+            "id": "dflash-janq-compatibility-spike",
+            "status": "ready",
+            "priority": 64,
+            "lane": "frontier-dflash",
+            "task_type": "analysis",
+            "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
+            "source_files": ["openclaw/openclaw-jang-vlm-server.py", "openclaw/test-speed-research.py"],
+            "hypothesis": "DFlash can only improve TUI decode speed if its MLX draft loop can wrap the JANQ-loaded mlx_vlm Gemma4 target without bypassing OpenClaw guardrails.",
+            "metric": "compatibility_decision_then_decode_tps",
+            "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_reasoning_leak"],
+            "acceptance": "Record a keep/discard/blocked decision with exact compatibility evidence before any DFlash install or live model benchmark.",
+            "rollback": "No live rollback needed; this task must not change the active model profile or server path.",
+            "evidence": speed_gap,
+            "next_action": (
+                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
+                "Then inspect exactly https://github.com/z-lab/dflash or /tmp/dflash-openclaw-inspect/dflash/model_mlx.py if already cloned. "
+                "Do not install DFlash into the live OpenClaw runtime and do not change the active model profile."
+            ),
+        },
     ]
 
 
@@ -1314,7 +1350,7 @@ def synthesize(args: argparse.Namespace) -> int:
             "- measurement loop is healthy, but exhausted queues must switch to decode/MTP ideas, ranked hypotheses, and implementation candidates.",
             "- top production idea: MTP acceptance bottleneck report.",
             "- top sweep idea: drafter block/quantization comparison with fixed prompt set and rollback.",
-            "- top frontier idea: JANQ-specific drafter alignment only if wall-clock decode TPS improves.",
+            "- top frontier idea: compare JANQ-specific drafter alignment with a guarded DFlash compatibility spike; promote only if wall-clock TUI decode TPS improves.",
             "",
         ]
     )

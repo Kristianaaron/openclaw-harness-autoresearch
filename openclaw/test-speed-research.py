@@ -108,6 +108,8 @@ def main() -> int:
             assert "## Frontier Speed Track" in program
             assert "50-70 tok/s" in program
             assert "Lane B: drafter alignment" in program
+            assert "DFlash compatibility" in program
+            assert "z-lab/gemma-4-31B-it-DFlash" in program
             assert "## Realistic Experiment Backlog" in program
             assert "No-drafter control" in program
             assert "Drafter block sweep" in program
@@ -216,6 +218,7 @@ def main() -> int:
             assert "rollback:" in ideas
             assert "drafter-block-and-quant-sweep" in ideas
             assert "janq-drafter-alignment" in ideas
+            assert "dflash-janq-compatibility" in ideas
             assert "mathematical handle" in ideas
             assert "Implementation Candidates" in ideas
             assert "implement-mtp-acceptance-report" in ideas
@@ -229,6 +232,7 @@ def main() -> int:
             assert "implement-mtp-acceptance-report" in tasks
             assert "implement-drafter-sweep-plan" in tasks
             assert "implement-janq-drafter-calibration-gate" in tasks
+            assert "dflash-janq-compatibility-spike" in tasks
             assert '"task_type": "implementation"' in tasks
             assert "First tool call: read exactly" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
