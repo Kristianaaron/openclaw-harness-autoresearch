@@ -364,6 +364,12 @@ case "${1:-}" in
     ;;
   speed-research-benchmark|research-speed-benchmark)
     shift
+    if ! _openclaw_has_arg_prefix "--help" "$@" && ! _openclaw_has_arg_prefix "-h" "$@"; then
+      export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-local-dev-token}"
+      _openclaw_clear_model_env_override
+      mkdir -p "$log_dir"
+      _openclaw_start_model_once || return $?
+    fi
     "$speed_research" benchmark "$@"
     return $?
     ;;
@@ -377,6 +383,12 @@ case "${1:-}" in
       setup|prompt|benchmark|record|synthesize|compact)
         local speed_research_subcommand="${2:-}"
         shift 2
+        if [[ "$speed_research_subcommand" == "benchmark" ]] && ! _openclaw_has_arg_prefix "--help" "$@" && ! _openclaw_has_arg_prefix "-h" "$@"; then
+          export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-local-dev-token}"
+          _openclaw_clear_model_env_override
+          mkdir -p "$log_dir"
+          _openclaw_start_model_once || return $?
+        fi
         "$speed_research" "$speed_research_subcommand" "$@"
         return $?
         ;;

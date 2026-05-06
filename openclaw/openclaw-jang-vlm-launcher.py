@@ -17,6 +17,7 @@ OPENCLAW_DIR = Path.home() / ".openclaw"
 RUNTIME_DIR = OPENCLAW_DIR / "runtime" / "rapid-mlx"
 JANG_TARGET = RUNTIME_DIR / "site"
 CHILD: subprocess.Popen[bytes] | None = None
+STOPPING = False
 
 
 def log(message: str) -> None:
@@ -159,15 +160,21 @@ def build_env() -> dict[str, str]:
 
 
 def stop_child() -> None:
-    global CHILD
+    global CHILD, STOPPING
     if CHILD is None or CHILD.poll() is not None:
         return
+    if STOPPING:
+        return
+    STOPPING = True
     CHILD.terminate()
     try:
         CHILD.wait(timeout=15)
     except subprocess.TimeoutExpired:
         CHILD.kill()
-        CHILD.wait(timeout=5)
+        try:
+            CHILD.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log(f"child pid={CHILD.pid} did not exit after kill; leaving process supervisor to reap it")
 
 
 def handle_signal(_signum: int, _frame: object) -> None:
