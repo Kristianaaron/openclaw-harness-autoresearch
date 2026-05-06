@@ -25,3 +25,8 @@ Append dated entries when a change creates useful evidence:
 
 Keep these logs portfolio-readable: problem, action, evidence, result, and next
 question. Avoid raw secrets, local tokens, or private environment details.
+
+## GitHub Attribution Check
+
+Future commits should use the GitHub-linked noreply author identity so pushed
+OpenClaw harness work appears in the account contribution graph.
