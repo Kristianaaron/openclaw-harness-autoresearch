@@ -1599,6 +1599,9 @@ def run_supervisor_patch_execute_task(
         cmd.append("--canary-only")
     if task.get("allow_architectural", False):
         cmd.append("--allow-architectural")
+    approval_file = str(task.get("architectural_approval_file") or args.architectural_approval_file or "")
+    if approval_file:
+        cmd.extend(["--architectural-approval-file", approval_file])
     with log_file.open("a", encoding="utf-8") as file:
         file.write(
             f"\n===== cycle {cycle} session {session} supervisor patch execute "
@@ -2016,6 +2019,7 @@ def main() -> int:
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--patch-execute-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_PATCH_EXECUTE_TIMEOUT", "300")))
+    parser.add_argument("--architectural-approval-file", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ARCHITECTURAL_APPROVAL_FILE", ""))
     parser.add_argument("--supervisor-benchmark-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SUPERVISOR_BENCHMARK_TIMEOUT", "180")))
     parser.add_argument("--model-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_START_TIMEOUT", "420")))
     parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("OPENCLAW_GATEWAY_PORT", "18789")))

@@ -446,7 +446,7 @@ Before editing source, state:
 ## Patch Executor Rules
 
 - Safe and moderate patches can auto-promote only after canary apply and allowlisted tests pass.
-- Architectural patches are held after canary unless `allow_architectural` is explicitly set by the supervisor.
+- Architectural patches are held after canary unless `allow_architectural` is set and an explicit approval file contains the task id.
 - Destructive patches are blocked before canary.
 - Patch files must touch allowlisted OpenClaw paths only.
 - Patch files must not touch opencode, `.env`, secrets, passwords, tokens, private keys, or private runtime config.
@@ -2174,6 +2174,8 @@ def classify_patch(
     architectural = any(path.startswith(ARCHITECTURAL_PATCH_PREFIXES) for path in files)
     if len(files) > 3 or changed_lines > 220:
         architectural = True
+    if architectural and not allow_architectural:
+        reasons.append("architectural change requires canary evidence and explicit allow_architectural")
     destructive = bool(reasons) or deletions > additions * 3 + 20
     if destructive:
         impact = "destructive"
@@ -2183,9 +2185,7 @@ def classify_patch(
         impact = "safe"
     else:
         impact = "moderate"
-    auto_promote = impact in {"safe", "moderate"} or (impact == "architectural" and allow_architectural)
-    if impact == "architectural" and not allow_architectural:
-        reasons.append("architectural change requires canary evidence and explicit allow_architectural")
+    auto_promote = impact in {"safe", "moderate"}
     return {
         "files": files,
         "additions": additions,
@@ -2193,10 +2193,28 @@ def classify_patch(
         "changed_lines": changed_lines,
         "impact": impact,
         "architectural": architectural,
+        "approval_required": impact == "architectural",
         "auto_promote": auto_promote and not destructive,
         "allowed": not destructive,
         "reasons": reasons,
     }
+
+
+def architectural_approval_granted(task_id: str, approval_file: str) -> bool:
+    if not approval_file:
+        return False
+    try:
+        text = Path(approval_file).expanduser().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    task = task_id or "manual"
+    accepted = {
+        "APPROVE_ARCHITECTURAL_PATCH=*",
+        f"APPROVE_ARCHITECTURAL_PATCH={task}",
+        f"APPROVE_PATCH={task}",
+        task,
+    }
+    return any(line.strip() in accepted for line in text.splitlines())
 
 
 def run_test_command(command: str, *, cwd: Path, timeout: float) -> dict[str, Any]:
@@ -2239,6 +2257,8 @@ def patch_execute(args: argparse.Namespace) -> int:
         source_files=source_files or None,
         allow_architectural=args.allow_architectural,
     )
+    approval_file = str(getattr(args, "architectural_approval_file", "") or "")
+    approval_granted = architectural_approval_granted(args.task_id or "manual", approval_file)
     timestamp = int(time.time())
     task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.task_id or "manual").strip("-") or "manual"
     artifact_id = f"{timestamp}-{task_slug}"
@@ -2253,6 +2273,9 @@ def patch_execute(args: argparse.Namespace) -> int:
         "repo": str(repo),
         "canary": str(canary),
         "classification": classification,
+        "architectural_approval_file": approval_file,
+        "approval_required": bool(classification.get("approval_required")),
+        "approval_granted": approval_granted,
         "promoted": False,
         "tests": [],
     }
@@ -2297,13 +2320,27 @@ def patch_execute(args: argparse.Namespace) -> int:
                 tests = [item.strip() for item in args.tests.split(";") if item.strip()] or list(DEFAULT_PATCH_TESTS)
                 artifact["tests"] = [run_test_command(command, cwd=canary, timeout=args.test_timeout) for command in tests]
                 tests_ok = all(item.get("ok") for item in artifact["tests"])
+                can_promote = bool(classification["auto_promote"]) or (
+                    bool(classification.get("approval_required")) and approval_granted
+                )
                 if apply.returncode != 0:
                     reason = "patch apply failed in canary"
                     artifact["reason"] = reason
                 elif not tests_ok:
                     reason = "canary tests failed"
                     artifact["reason"] = reason
-                elif not classification["auto_promote"] or args.canary_only:
+                elif classification.get("approval_required") and not approval_granted:
+                    reason = "canary passed; architectural promotion requires explicit approval file"
+                    artifact["reason"] = reason
+                    artifact["held_for_approval"] = True
+                    artifact["approval_instruction"] = (
+                        "After reviewing the canary artifact and confirming the change is safe, "
+                        f"write APPROVE_ARCHITECTURAL_PATCH={args.task_id or 'manual'} to the approval file "
+                        "and rerun patch-execute with --allow-architectural."
+                    )
+                    status = "blocked"
+                    return_code = 0
+                elif not can_promote or args.canary_only:
                     reason = "canary passed; promotion intentionally held"
                     artifact["reason"] = reason
                     status = "keep"
@@ -2751,6 +2788,10 @@ def main() -> int:
     patch.add_argument("--canary-only", action="store_true")
     patch.add_argument("--keep-canary", action="store_true")
     patch.add_argument("--allow-architectural", action="store_true")
+    patch.add_argument(
+        "--architectural-approval-file",
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ARCHITECTURAL_APPROVAL_FILE", ""),
+    )
     patch.set_defaults(func=patch_execute)
 
     args = parser.parse_args()

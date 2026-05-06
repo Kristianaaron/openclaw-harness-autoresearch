@@ -347,6 +347,7 @@ def main() -> int:
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'old'\n", encoding="utf-8")
             (patch_repo / "openclaw" / "test-speed-research.py").write_text("print('ok')\n", encoding="utf-8")
             subprocess.run(["git", "init"], cwd=patch_repo, stdout=subprocess.DEVNULL, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=patch_repo, check=True)
@@ -372,9 +373,67 @@ def main() -> int:
                     canary_only=True,
                     keep_canary=False,
                     allow_architectural=False,
+                    architectural_approval_file="",
                 )
             ) == 0
             assert "patch-executor" in (root / "results.tsv").read_text(encoding="utf-8")
+            (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'new'\n", encoding="utf-8")
+            arch_patch_file = root / "patches" / "architectural.patch"
+            arch_diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)
+            arch_patch_file.write_text(arch_diff.stdout, encoding="utf-8")
+            subprocess.run(["git", "checkout", "--", "openclaw/openclaw-model-proxy.py"], cwd=patch_repo, check=True)
+            arch_blocked = helper.classify_patch(
+                arch_diff.stdout,
+                source_files=["openclaw/openclaw-model-proxy.py"],
+                allow_architectural=False,
+            )
+            assert arch_blocked["allowed"] is False
+            arch_allowed = helper.classify_patch(
+                arch_diff.stdout,
+                source_files=["openclaw/openclaw-model-proxy.py"],
+                allow_architectural=True,
+            )
+            assert arch_allowed["impact"] == "architectural"
+            assert arch_allowed["auto_promote"] is False
+            assert arch_allowed["approval_required"] is True
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(arch_patch_file),
+                    task_id="arch-patch",
+                    hypothesis="architectural patch",
+                    source_files="openclaw/openclaw-model-proxy.py",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=False,
+                    keep_canary=False,
+                    allow_architectural=True,
+                    architectural_approval_file="",
+                )
+            ) == 0
+            arch_artifact = sorted((root / "experiments").glob("patch-executor-*-arch-patch.json"))[-1]
+            arch_data = json.loads(arch_artifact.read_text(encoding="utf-8"))
+            assert arch_data["held_for_approval"] is True
+            assert arch_data["promoted"] is False
+            assert (patch_repo / "openclaw" / "openclaw-model-proxy.py").read_text(encoding="utf-8") == "MODE = 'old'\n"
+            approval_file = root / "architectural-approval.txt"
+            approval_file.write_text("APPROVE_ARCHITECTURAL_PATCH=arch-patch\n", encoding="utf-8")
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(arch_patch_file),
+                    task_id="arch-patch",
+                    hypothesis="architectural patch",
+                    source_files="openclaw/openclaw-model-proxy.py",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=False,
+                    keep_canary=False,
+                    allow_architectural=True,
+                    architectural_approval_file=str(approval_file),
+                )
+            ) == 0
+            assert (patch_repo / "openclaw" / "openclaw-model-proxy.py").read_text(encoding="utf-8") == "MODE = 'new'\n"
             bad_patch = "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-A=1\n+A=2\n"
             bad_patch_file = root / "patches" / "bad.patch"
             bad_patch_file.write_text(bad_patch, encoding="utf-8")
@@ -390,6 +449,7 @@ def main() -> int:
                     canary_only=True,
                     keep_canary=False,
                     allow_architectural=False,
+                    architectural_approval_file="",
                 )
             ) == 2
     return 0

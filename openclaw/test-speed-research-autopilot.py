@@ -559,7 +559,11 @@ def main() -> int:
         patch_helper.chmod(0o700)
         patch_file = Path(tmp) / "proposal.patch"
         patch_file.write_text("diff --git a/openclaw/x.py b/openclaw/x.py\n", encoding="utf-8")
-        patch_args = Namespace(research_helper_bin=str(patch_helper), patch_execute_timeout_seconds=5)
+        patch_args = Namespace(
+            research_helper_bin=str(patch_helper),
+            patch_execute_timeout_seconds=5,
+            architectural_approval_file=str(Path(tmp) / "arch-approval.txt"),
+        )
         helper.write_jsonl(
             helper.TASKS,
             [
@@ -572,6 +576,7 @@ def main() -> int:
                     "source_files": ["openclaw/x.py"],
                     "tests": ["python3 openclaw/test-speed-research.py"],
                     "hypothesis": "canary patch",
+                    "allow_architectural": True,
                 }
             ],
         )
@@ -585,6 +590,9 @@ def main() -> int:
         assert code == 0
         assert issue == ""
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+        patch_log = (Path(tmp) / "autopilot.log").read_text(encoding="utf-8")
+        assert "--allow-architectural" in patch_log
+        assert "--architectural-approval-file" in patch_log
         helper.write_jsonl(
             helper.TASKS,
             [
