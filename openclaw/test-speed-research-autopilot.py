@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 from argparse import Namespace
 from pathlib import Path
@@ -66,6 +67,38 @@ def main() -> int:
     assert helper.recovery_mode(3, "no durable progress") == "fresh-session"
     assert helper.recovery_mode(1, "metal out of memory") == "diagnose"
     assert helper.recovery_mode(1, "TOOL RESULT CAP") == "force-benchmark"
+    assert helper.benchmark_mode_for_task({"benchmark_mode": "decode-sample"}) == "decode-sample"
+    assert helper.benchmark_mode_for_task(
+        {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode prompt-shape"}
+    ) == "prompt-shape"
+    assert helper.benchmark_mode_for_task({"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --quick"}) == "quick-health"
+    assert helper.is_supervisor_benchmark_task({"benchmark_mode": "decode-sample"})
+    assert not helper.is_supervisor_benchmark_task({"task_type": "implementation", "benchmark_mode": "decode-sample"})
+    assert helper.requires_profile_variant_runner(
+        {"target": "OPENCLAW_JANG_DRAFT_MODEL", "guard_checks": ["restore_live_profile"]}
+    )
+    assert not helper.is_supervisor_benchmark_task(
+        {
+            "benchmark_mode": "decode-sample",
+            "target": "OPENCLAW_JANG_DRAFT_MODEL",
+            "guard_checks": ["restore_live_profile"],
+        }
+    )
+    assert helper.is_supervisor_log_review_task(
+        {"next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log"}
+    )
+    assert helper.parse_json_object('noise {"ok": true, "value": 3} tail') == {"ok": True, "value": 3}
+    assert helper.parse_json_object("not json") is None
+    mtp_summary = helper.parse_mtp_log_tail(
+        "[server] chat completion elapsed=6.92s tok_s=13.9 mtp_rounds=58 mean_accept=0.60\n"
+        "[server] chat completion elapsed=6.38s tok_s=15.0\n"
+    )
+    assert mtp_summary["sample_count"] == 2
+    assert mtp_summary["mean_tok_s"] == 14.45
+    assert mtp_summary["mean_accept"] == 0.6
+    assert helper.should_run_deterministic_fallback("TOOL RESULT CAP", {"reason": ""})
+    assert helper.should_run_deterministic_fallback("", {"reason": "no durable artifact"})
+    assert not helper.should_run_deterministic_fallback("memory gate waiting", {"reason": "memory"})
 
     assert helper.summarize_issue("x OpenClaw blocked a broad local tool command y", "", 0) == (
         "OpenClaw blocked a broad local tool command"
@@ -151,13 +184,13 @@ def main() -> int:
             for index, decode_tps in enumerate(("14.100", "14.600"), start=1):
                 file.write(
                     f"2026-05-05T00:00:0{index}+0000\tbenchmark-{index}\tkeep\tdecode-sample\t"
-                    f"bounded OpenClaw decode-sample probe\t\t\t{decode_tps}\t6.9\t1.5\tabc123\tmodel=local\n"
+                    f"bounded OpenClaw decode-sample probe\t\t\t{decode_tps}\t6.9\t1.5\tabc123\tmodel=local completion_tokens=96 token_source=usage.completion_tokens\n"
                 )
         assert helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123") is None
         with helper.RESULTS.open("a", encoding="utf-8") as file:
             file.write(
                 "2026-05-05T00:00:03+0000\tbenchmark-3\tkeep\tdecode-sample\t"
-                "bounded OpenClaw decode-sample probe\t\t\t15.000\t6.6\t1.5\tabc123\tmodel=local\n"
+                "bounded OpenClaw decode-sample probe\t\t\t15.000\t6.6\t1.5\tabc123\tmodel=local completion_tokens=96 token_source=usage.completion_tokens\n"
             )
         advancement = helper.complete_task_from_evidence(helper.WORKSPACE, selected, min_samples=3, commit="abc123")
         assert advancement is not None
@@ -180,6 +213,19 @@ def main() -> int:
         assert "baseline-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
         assert "supervisor advanced" in helper.FINDINGS.read_text(encoding="utf-8")
         assert "Accepted Baselines" in helper.STRATEGY.read_text(encoding="utf-8")
+        invalid_decode_task = {
+            "id": "invalid-decode",
+            "status": "ready",
+            "benchmark_mode": "decode-sample",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+        }
+        helper.write_jsonl(helper.TASKS, [invalid_decode_task])
+        helper.RESULTS.write_text(
+            helper.RESULTS_HEADER
+            + "2026-05-05T00:00:04+0000\tbenchmark-old\tkeep\tdecode-sample\th\t\t\t10.0\t7.0\t1.5\tabc123\tmodel=local preview=old\n",
+            encoding="utf-8",
+        )
+        assert helper.complete_task_from_evidence(helper.WORKSPACE, invalid_decode_task, min_samples=1, commit="abc123") is None
         before = helper.durable_snapshot()
         helper.IDEAS.write_text("# idea\n", encoding="utf-8")
         helper.BENCHMARKS.mkdir(exist_ok=True)
@@ -286,6 +332,64 @@ def main() -> int:
         )
         assert helper.block_stale_rejected_implementation_tasks() == 1
         assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "log-review",
+                    "status": "ready",
+                    "target": "openclaw-model-proxy.log",
+                    "hypothesis": "parse MTP logs",
+                    "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
+                }
+            ],
+        )
+        proxy_log = Path(tmp) / "openclaw-model-proxy.log"
+        proxy_log.write_text(
+            "[openclaw-jang-vlm-server] chat completion: prompt=29 completion=96 "
+            "elapsed=6.92s tok_s=13.9 mtp_rounds=58 mean_accept=0.60\n",
+            encoding="utf-8",
+        )
+        original_proxy_env = os.environ.get("OPENCLAW_MODEL_PROXY_LOG")
+        os.environ["OPENCLAW_MODEL_PROXY_LOG"] = str(proxy_log)
+        try:
+            code, issue = helper.run_supervisor_log_review_task(
+                6,
+                "test-session",
+                helper.read_jsonl(helper.TASKS)[0],
+                Path(tmp) / "autopilot.log",
+            )
+        finally:
+            if original_proxy_env is None:
+                os.environ.pop("OPENCLAW_MODEL_PROXY_LOG", None)
+            else:
+                os.environ["OPENCLAW_MODEL_PROXY_LOG"] = original_proxy_env
+        assert code == 0
+        assert issue == ""
+        assert "supervisor-log-review-6" in helper.RESULTS.read_text(encoding="utf-8")
+        assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "profile-variant",
+                    "status": "ready",
+                    "target": "OPENCLAW_JANG_DRAFT_MODEL",
+                    "hypothesis": "paired no-drafter control",
+                    "guard_checks": ["restore_live_profile"],
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_profile_variant_guard(
+            7,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 2
+        assert "dedicated paired-control runner" in issue
+        assert "supervisor-profile-variant-7" in helper.RESULTS.read_text(encoding="utf-8")
+        assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
         synth_helper = Path(tmp) / "synthesize-helper.py"
         synth_marker = Path(tmp) / "synth-marker.txt"
         synth_helper.write_text(
@@ -318,6 +422,39 @@ def main() -> int:
         assert impl_summary["task_id"] == "impl"
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
         assert "implementation-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
+        bench_helper = Path(tmp) / "benchmark-helper.py"
+        bench_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(helper.RESULTS)!r}).write_text("
+            f"{helper.RESULTS_HEADER!r} + "
+            "'2026-05-05T00:00:00+0000\\tbenchmark-test\\tkeep\\tdecode-sample\\th\\t\\t\\t16.0\\t6.0\\t1.5\\tabc123\\tn\\n', "
+            "encoding='utf-8')\n"
+            "print(json.dumps({'ok': True, 'mode': 'decode-sample', 'decode_tps': 16.0}))\n",
+            encoding="utf-8",
+        )
+        bench_helper.chmod(0o700)
+        original_model_ready = helper.model_ready
+        helper.model_ready = lambda: True
+        try:
+            bench_args = Namespace(
+                research_helper_bin=str(bench_helper),
+                supervisor_benchmark_timeout_seconds=5,
+                model_start_timeout_seconds=5,
+            )
+            code, issue = helper.run_supervisor_benchmark_task(
+                bench_args,
+                9,
+                "bench-session",
+                {"id": "bench-task", "benchmark_mode": "decode-sample"},
+                Path(tmp) / "autopilot.log",
+            )
+        finally:
+            helper.model_ready = original_model_ready
+        assert code == 0
+        assert issue == ""
+        assert "benchmark-test" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "supervisor-benchmark" in helper.EXPERIMENTS.read_text(encoding="utf-8")
     return 0
 
 

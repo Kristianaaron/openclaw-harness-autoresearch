@@ -9,7 +9,9 @@ bounded `openclaw agent` turns against the same session.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -66,6 +68,21 @@ EARLY_FAILURE_PATTERNS = (
     ("rawError=Connection error", "model connection error"),
     ("Connection error.", "model connection error"),
 )
+BENCHMARK_MODES = {
+    "quick-health",
+    "streaming-ttft",
+    "tool-roundtrip",
+    "prompt-size",
+    "prompt-shape",
+    "decode-sample",
+    "prefill-reuse",
+}
+MALFORMED_OR_TOOL_ISSUES = (
+    "TOOL RESULT CAP",
+    "TOOL RESULT SYNTHESIS GRACE",
+    "malformed",
+    "no durable artifact",
+)
 
 
 def log(message: str) -> None:
@@ -89,6 +106,18 @@ def file_mtime(path: Path) -> float:
 
 def clean_tsv(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
+
+
+def parse_json_object(text: str) -> dict[str, object] | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        return None
+    try:
+        value = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def current_commit() -> str:
@@ -270,6 +299,46 @@ def append_supervisor_result(cycle: int, session: str, status: str, issue: str) 
     ]
     with RESULTS.open("a", encoding="utf-8") as file:
         file.write("\t".join(clean_tsv(item) for item in row) + "\n")
+
+
+def benchmark_mode_for_task(task: dict[str, object] | None) -> str:
+    if not task or task.get("task_type") == "implementation":
+        return ""
+    if requires_profile_variant_runner(task):
+        return ""
+    mode = str(task.get("benchmark_mode") or "").strip()
+    if mode in BENCHMARK_MODES:
+        return mode
+    action = str(task.get("next_action") or "")
+    if "benchmark --quick" in action:
+        return "quick-health"
+    match = re.search(r"openclaw-speed-research\s+benchmark\s+--mode\s+([a-z-]+)", action)
+    if match and match.group(1) in BENCHMARK_MODES:
+        return match.group(1)
+    return ""
+
+
+def is_supervisor_benchmark_task(task: dict[str, object] | None) -> bool:
+    return bool(benchmark_mode_for_task(task))
+
+
+def is_supervisor_log_review_task(task: dict[str, object] | None) -> bool:
+    if not task or task.get("task_type") == "implementation":
+        return False
+    action = str(task.get("next_action") or "").strip()
+    return action == "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
+
+
+def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    guard_checks = {str(item) for item in task.get("guard_checks", []) if item}
+    target = str(task.get("target", ""))
+    return (
+        "restore_live_profile" in guard_checks
+        or "same_prompt_set" in guard_checks
+        or target.startswith("OPENCLAW_JANG_DRAFT_")
+    )
 
 
 def recent_task_rejections(task_id: str, reason: str, limit: int = 3) -> int:
@@ -932,6 +1001,258 @@ def complete_implementation_task(
     return summary
 
 
+def complete_supervisor_task(
+    task: dict[str, object] | None,
+    *,
+    status: str,
+    summary: dict[str, object],
+    commit: str,
+) -> dict[str, object] | None:
+    if not task or task.get("status", "ready") not in {"ready", "rework"}:
+        return None
+    completed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    task_id = str(task.get("id", "unknown"))
+    tasks = read_jsonl(TASKS)
+    changed = False
+    for item in tasks:
+        if item.get("id") != task_id:
+            continue
+        item["status"] = "done" if status == "keep" else "blocked"
+        item["completed_at" if status == "keep" else "blocked_at"] = completed_at
+        item["completion_commit"] = commit
+        item["supervisor_summary"] = summary
+        changed = True
+        break
+    if not changed:
+        return None
+    write_jsonl(TASKS, tasks)
+    row = {
+        "timestamp": completed_at,
+        "task_id": task_id,
+        "status": "supervisor-task-done" if status == "keep" else "supervisor-task-blocked",
+        "target": str(task.get("target", "")),
+        "summary": summary,
+        "commit": commit,
+    }
+    append_jsonl(EXPERIMENTS, row)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": completed_at,
+            "task_id": task_id,
+            "finding": "supervisor executed deterministic task and advanced the queue without an LLM tool turn",
+            "evidence": row,
+            "next": "select_next_ready_task",
+        },
+    )
+    return row
+
+
+def start_model_for_supervisor_benchmark(log_file: Path, timeout_seconds: float) -> None:
+    if model_ready():
+        return
+    cmd = [
+        "/bin/zsh",
+        "-lc",
+        "fpath=(/Users/kristian/.zfunc $fpath); autoload -Uz openclaw; openclaw model-start",
+    ]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
+
+
+def run_supervisor_benchmark_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+    *,
+    fallback: bool = False,
+) -> tuple[int, str]:
+    mode = benchmark_mode_for_task(task) or "decode-sample"
+    cmd = [args.research_helper_bin, "benchmark"]
+    if mode == "quick-health":
+        cmd.append("--quick")
+    else:
+        cmd.extend(["--mode", mode])
+    cmd.extend(["--timeout", str(args.supervisor_benchmark_timeout_seconds)])
+    try:
+        start_model_for_supervisor_benchmark(log_file, args.model_start_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return 124, "supervisor model start timeout"
+    with log_file.open("a", encoding="utf-8") as file:
+        label = "supervisor fallback benchmark" if fallback else "supervisor benchmark"
+        file.write(f"\n===== cycle {cycle} session {session} {label} task={task.get('id', 'fallback')} =====\n")
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=args.supervisor_benchmark_timeout_seconds + 15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR BENCHMARK TIMEOUT\n")
+            return 124, "supervisor benchmark timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout)
+    if result.returncode != 0:
+        reason = str((parsed or {}).get("reason") or f"supervisor benchmark exit {result.returncode}")
+        return result.returncode, reason
+    if parsed and parsed.get("ok") is False:
+        return 2, str(parsed.get("reason") or "supervisor benchmark blocked")
+    if parsed:
+        append_jsonl(
+            EXPERIMENTS,
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": str(task.get("id", "fallback")),
+                "status": "supervisor-benchmark",
+                "mode": mode,
+                "fallback": fallback,
+                "result": parsed,
+            },
+        )
+    return 0, ""
+
+
+def parse_mtp_log_tail(text: str) -> dict[str, object]:
+    rows: list[dict[str, float]] = []
+    for line in text.splitlines():
+        if "mtp_rounds=" not in line and "tok_s=" not in line:
+            continue
+        tok_match = re.search(r"tok_s=([0-9.]+)", line)
+        rounds_match = re.search(r"mtp_rounds=([0-9]+)", line)
+        accept_match = re.search(r"mean_accept=([0-9.]+)", line)
+        if not tok_match and not rounds_match and not accept_match:
+            continue
+        rows.append(
+            {
+                "tok_s": float(tok_match.group(1)) if tok_match else 0.0,
+                "mtp_rounds": float(rounds_match.group(1)) if rounds_match else 0.0,
+                "mean_accept": float(accept_match.group(1)) if accept_match else 0.0,
+            }
+        )
+    if not rows:
+        return {"sample_count": 0}
+    tok_values = [row["tok_s"] for row in rows if row["tok_s"] > 0]
+    round_values = [row["mtp_rounds"] for row in rows if row["mtp_rounds"] > 0]
+    accept_values = [row["mean_accept"] for row in rows if row["mean_accept"] > 0]
+    return {
+        "sample_count": len(rows),
+        "mean_tok_s": round(sum(tok_values) / len(tok_values), 3) if tok_values else None,
+        "mean_mtp_rounds": round(sum(round_values) / len(round_values), 3) if round_values else None,
+        "mean_accept": round(sum(accept_values) / len(accept_values), 3) if accept_values else None,
+    }
+
+
+def run_supervisor_log_review_task(
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    source = Path(os.environ.get("OPENCLAW_MODEL_PROXY_LOG", "/Users/kristian/.openclaw/logs/openclaw-model-proxy.log"))
+    try:
+        text = "\n".join(source.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+    except OSError as error:
+        return 2, f"supervisor log review failed: {error}"
+    summary = parse_mtp_log_tail(text)
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\n===== cycle {cycle} session {session} supervisor log review task={task.get('id', 'unknown')} =====\n")
+        file.write(f"$ tail -n 80 {source}\n")
+        file.write(json.dumps(summary, indent=2) + "\n")
+    if int(summary.get("sample_count") or 0) <= 0:
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-log-review-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "openclaw-model-proxy.log")),
+            hypothesis=str(task.get("hypothesis", "parse recent MTP acceptance evidence")),
+            commit=current_commit(),
+            notes="no mtp/tok_s lines found in recent log tail",
+        )
+        return 2, "no MTP acceptance evidence in recent log tail"
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-log-review-{cycle}",
+        status="keep",
+        target=str(task.get("target", "openclaw-model-proxy.log")),
+        hypothesis=str(task.get("hypothesis", "parse recent MTP acceptance evidence")),
+        commit=current_commit(),
+        notes=(
+            f"samples={summary.get('sample_count')} mean_tok_s={summary.get('mean_tok_s')} "
+            f"mean_mtp_rounds={summary.get('mean_mtp_rounds')} mean_accept={summary.get('mean_accept')}"
+        ),
+    )
+    complete_supervisor_task(task, status="keep", summary=summary, commit=current_commit())
+    return 0, ""
+
+
+def run_supervisor_profile_variant_guard(
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    reason = "profile variant task requires a dedicated paired-control runner; raw benchmark would be invalid"
+    summary = {
+        "reason": reason,
+        "target": str(task.get("target", "")),
+        "guard_checks": task.get("guard_checks", []),
+        "next": "implement bounded profile-variant runner with restore-before/after and same-prompt comparison",
+    }
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor profile-variant guard "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write(json.dumps(summary, indent=2) + "\n")
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-profile-variant-{cycle}",
+        status="blocked",
+        target=str(task.get("target", "profile-variant")),
+        hypothesis=str(task.get("hypothesis", "profile variant requires paired benchmark control")),
+        commit=current_commit(),
+        notes=reason,
+    )
+    complete_supervisor_task(task, status="blocked", summary=summary, commit=current_commit())
+    return 2, reason
+
+
+def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
+    text = f"{issue} {quality.get('reason', '')}"
+    return any(pattern.lower() in text.lower() for pattern in MALFORMED_OR_TOOL_ISSUES)
+
+
+def run_deterministic_fallback(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    selected_task: dict[str, object] | None,
+    log_file: Path,
+) -> tuple[bool, str]:
+    if selected_task and selected_task.get("task_type") == "implementation":
+        ok, issue = run_supervisor_synthesis(args, cycle, session, log_file)
+        return ok, issue
+    fallback_task = {
+        "id": f"fallback-decode-sample-cycle-{cycle}",
+        "benchmark_mode": "decode-sample",
+        "target": "decode-sample",
+        "hypothesis": "deterministic fallback benchmark after malformed or stalled model/tool turn",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+    }
+    code, issue = run_supervisor_benchmark_task(args, cycle, session, fallback_task, log_file, fallback=True)
+    return code == 0, issue
+
+
 def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
     """Create ranked ideas without spending a model turn.
 
@@ -981,6 +1302,8 @@ def main() -> int:
     parser.add_argument("--turn-timeout-seconds", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_TURN_TIMEOUT", "1200")))
     parser.add_argument("--turn-timeout-grace-seconds", type=int, default=30)
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--supervisor-benchmark-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SUPERVISOR_BENCHMARK_TIMEOUT", "180")))
+    parser.add_argument("--model-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_START_TIMEOUT", "420")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
@@ -1095,11 +1418,37 @@ def main() -> int:
             continue
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
-        code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file, selected_task)
+        if requires_profile_variant_runner(selected_task):
+            code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
+        elif is_supervisor_benchmark_task(selected_task):
+            code, issue = run_supervisor_benchmark_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_log_review_task(selected_task):
+            code, issue = run_supervisor_log_review_task(cycle, current_session, selected_task, log_file)
+        else:
+            code, issue = run_turn(args, current_session, cycle, stalled_cycles, last_issue, log_file, selected_task)
         after = durable_snapshot()
         progress_reasons = durable_progress(before, after)
         quality = cycle_quality(WORKSPACE, before, after, progress_reasons, issue)
         progressed = int(quality["score"]) >= 2
+        if not progressed and should_run_deterministic_fallback(issue, quality):
+            fallback_ok, fallback_issue = run_deterministic_fallback(
+                args,
+                cycle,
+                current_session,
+                selected_task,
+                log_file,
+            )
+            fallback_after = durable_snapshot()
+            fallback_reasons = durable_progress(after, fallback_after)
+            fallback_quality = cycle_quality(WORKSPACE, after, fallback_after, fallback_reasons, fallback_issue)
+            if fallback_ok and int(fallback_quality["score"]) >= 2:
+                after = fallback_after
+                progress_reasons = progress_reasons + [f"fallback:{reason}" for reason in fallback_reasons]
+                quality = fallback_quality
+                issue = ""
+                progressed = True
+            elif fallback_issue:
+                issue = f"{issue or quality['reason']}; fallback={fallback_issue}"
         advancement = None
         if progressed:
             advancement = complete_task_from_evidence(
@@ -1139,7 +1488,7 @@ def main() -> int:
                     f"artifacts={','.join(str(item) for item in advancement.get('artifacts', []))}"
                 )
         if code not in {0, 124}:
-            log(f"agent turn returned nonzero exit={code}; continuing after a short pause")
+            log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
         if not progressed:
             record_rejection(
                 WORKSPACE,

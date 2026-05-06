@@ -387,7 +387,10 @@ def task_evidence_rows(root: Path, task: dict[str, Any]) -> list[dict[str, str]]
         return []
     start_line = int(task.get("evidence_start_line") or 0)
     rows = result_rows_since(root, start_line) if start_line else all_result_rows(root)
-    return [row for row in rows if row.get("status") == "keep" and row.get("target") == mode]
+    rows = [row for row in rows if row.get("status") == "keep" and row.get("target") == mode]
+    if mode == "decode-sample":
+        rows = [row for row in rows if "token_source=usage.completion_tokens" in row.get("notes", "")]
+    return rows
 
 
 def claim_task_evidence_window(root: Path, task: dict[str, Any] | None, start_line: int) -> dict[str, Any] | None:
