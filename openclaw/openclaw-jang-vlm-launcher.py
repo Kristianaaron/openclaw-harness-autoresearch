@@ -68,6 +68,11 @@ def ensure_jang_target() -> None:
 
 
 def ensure_mtp_runtime() -> None:
+    if (
+        os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "").strip().lower() == "dflash"
+        or os.environ.get("OPENCLAW_JANG_DFLASH_DRAFT_MODEL")
+    ):
+        return
     if not os.environ.get("OPENCLAW_JANG_DRAFT_MODEL"):
         return
     env = os.environ.copy()
@@ -100,6 +105,37 @@ def ensure_mtp_runtime() -> None:
     )
     if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         raise RuntimeError("mlx-vlm MTP runtime installed but Gemma4 assistant import still fails")
+
+
+def ensure_dflash_runtime() -> None:
+    if not (
+        os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "").strip().lower() == "dflash"
+        or os.environ.get("OPENCLAW_JANG_DFLASH_DRAFT_MODEL")
+    ):
+        return
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(JANG_TARGET)
+    check = [rapid_python(), "-c", "import dflash.model_mlx"]
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    package = os.environ.get("OPENCLAW_JANG_DFLASH_PACKAGE", "git+https://github.com/z-lab/dflash.git")
+    log(f"installing OpenClaw-managed DFlash runtime: {package}")
+    subprocess.check_call(
+        [
+            rapid_python(),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--target",
+            str(JANG_TARGET),
+            "--upgrade",
+            "--no-deps",
+            package,
+        ]
+    )
+    if subprocess.run(check, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        raise RuntimeError("DFlash runtime installed but import still fails")
 
 
 def ensure_quantized_mtp_draft_model() -> None:
@@ -199,6 +235,7 @@ def main() -> int:
     args = parse_args()
     ensure_jang_target()
     ensure_mtp_runtime()
+    ensure_dflash_runtime()
     ensure_quantized_mtp_draft_model()
     argv = [
         rapid_python(),

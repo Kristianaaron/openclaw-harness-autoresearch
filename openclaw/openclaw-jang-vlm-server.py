@@ -28,6 +28,8 @@ from typing import Any
 MODEL = None
 PROCESSOR = None
 DRAFT_MODEL = None
+DRAFT_BACKEND = ""
+DFLASH_ACCEPT_LENS: list[int] = []
 MODEL_PATH = ""
 MODEL_ID = ""
 GENERATION_LOCK = threading.Lock()
@@ -89,7 +91,7 @@ def configure_mlx_memory() -> None:
 
 
 def load_model(model_path: str) -> None:
-    global MODEL, PROCESSOR, DRAFT_MODEL, MODEL_PATH
+    global MODEL, PROCESSOR, DRAFT_MODEL, DRAFT_BACKEND, MODEL_PATH
     configure_mlx_memory()
     from jang_tools.loader import load_jang_vlm_model
 
@@ -97,17 +99,25 @@ def load_model(model_path: str) -> None:
     MODEL, PROCESSOR = load_jang_vlm_model(model_path)
     MODEL_PATH = model_path
     log(f"loaded JANG VLM model in {time.monotonic() - start:.2f}s: {model_path}")
-    draft_path = os.environ.get("OPENCLAW_JANG_DRAFT_MODEL")
+    draft_kind = os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "mtp").strip().lower()
+    dflash_path = os.environ.get("OPENCLAW_JANG_DFLASH_DRAFT_MODEL")
+    draft_path = dflash_path or os.environ.get("OPENCLAW_JANG_DRAFT_MODEL")
     if draft_path:
-        from mlx_vlm.speculative.drafters import load_drafter
-
-        draft_kind = os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "mtp")
         draft_start = time.monotonic()
-        DRAFT_MODEL = load_drafter(draft_path, kind=draft_kind)
+        if draft_kind == "dflash" or dflash_path:
+            from dflash.model_mlx import load_draft
+
+            DRAFT_MODEL = load_draft(draft_path)
+            DRAFT_BACKEND = "dflash"
+        else:
+            from mlx_vlm.speculative.drafters import load_drafter
+
+            DRAFT_MODEL = load_drafter(draft_path, kind=draft_kind)
+            DRAFT_BACKEND = "mtp"
         block = getattr(getattr(DRAFT_MODEL, "config", None), "block_size", "?")
         log(
             "loaded Gemma drafter "
-            f"kind={draft_kind} block={block} in {time.monotonic() - draft_start:.2f}s: {draft_path}"
+            f"backend={DRAFT_BACKEND or draft_kind} block={block} in {time.monotonic() - draft_start:.2f}s: {draft_path}"
         )
 
 
@@ -264,7 +274,7 @@ def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         max_kv_size = env_int("OPENCLAW_JANG_MAX_KV_SIZE", 0)
     if max_kv_size:
         kwargs["max_kv_size"] = max(1, int(max_kv_size))
-    if DRAFT_MODEL is not None:
+    if DRAFT_MODEL is not None and DRAFT_BACKEND != "dflash":
         kwargs["draft_model"] = DRAFT_MODEL
         kwargs["draft_kind"] = os.environ.get("OPENCLAW_JANG_DRAFT_KIND", "mtp")
         draft_block_size = payload.get("draft_block_size")
@@ -273,6 +283,52 @@ def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         if draft_block_size:
             kwargs["draft_block_size"] = max(1, int(draft_block_size))
     return kwargs
+
+
+def dflash_generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
+    kwargs = generation_kwargs(payload)
+    allowed = {
+        "max_tokens": kwargs["max_tokens"],
+        "temperature": kwargs["temperature"],
+    }
+    draft_block_size = payload.get("draft_block_size")
+    if draft_block_size is None:
+        draft_block_size = env_int("OPENCLAW_JANG_DFLASH_BLOCK_SIZE", 0) or env_int("OPENCLAW_JANG_DRAFT_BLOCK_SIZE", 0)
+    if draft_block_size:
+        allowed["block_size"] = max(1, int(draft_block_size))
+    return allowed
+
+
+class DFlashVLMTargetAdapter:
+    """Expose a JANG-loaded mlx_vlm Gemma4 target with mlx_lm-like semantics."""
+
+    def __init__(self, model: Any):
+        self._model = model
+        self.language_model = model.language_model
+
+    def make_cache(self) -> Any:
+        return self.language_model.make_cache()
+
+    def __call__(self, input_ids: Any, cache: Any = None, **kwargs: Any) -> Any:
+        output = self._model(input_ids, cache=cache, **kwargs)
+        return getattr(output, "logits", output)
+
+
+def dflash_tokenizer() -> Any:
+    tokenizer = getattr(PROCESSOR, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = getattr(PROCESSOR, "_tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("DFlash requires a tokenizer on the Gemma processor")
+    return tokenizer
+
+
+def record_dflash_acceptance(response: Any, *, first_response: bool) -> None:
+    if first_response:
+        return
+    accepted = int(getattr(response, "accepted", 0) or 0)
+    if accepted:
+        DFLASH_ACCEPT_LENS.append(accepted)
 
 
 def strip_reasoning_markers(text: str) -> tuple[str, str | None]:
@@ -416,7 +472,7 @@ def parse_tool_call(text: str) -> tuple[str, list[dict[str, Any]]]:
 def speculative_stats_since(start_index: int) -> str:
     if DRAFT_MODEL is None:
         return ""
-    accept_lens = getattr(DRAFT_MODEL, "accept_lens", None) or []
+    accept_lens = DFLASH_ACCEPT_LENS if DRAFT_BACKEND == "dflash" else (getattr(DRAFT_MODEL, "accept_lens", None) or [])
     if start_index > len(accept_lens):
         start_index = 0
     recent = accept_lens[start_index:]
@@ -429,6 +485,8 @@ def speculative_stats_since(start_index: int) -> str:
 def current_speculative_stat_index() -> int:
     if DRAFT_MODEL is None:
         return 0
+    if DRAFT_BACKEND == "dflash":
+        return len(DFLASH_ACCEPT_LENS)
     return len(getattr(DRAFT_MODEL, "accept_lens", None) or [])
 
 
@@ -461,15 +519,45 @@ def chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
     return run_model_task(lambda: _chat_completion_on_worker(payload))
 
 
+def dflash_stream(prompt: str, payload: dict[str, Any]) -> Any:
+    if DRAFT_MODEL is None:
+        raise RuntimeError("DFlash draft model is not loaded")
+    from dflash.model_mlx import stream_generate as dflash_stream_generate
+
+    target = DFlashVLMTargetAdapter(MODEL)
+    return dflash_stream_generate(
+        target,
+        DRAFT_MODEL,
+        dflash_tokenizer(),
+        prompt,
+        **dflash_generation_kwargs(payload),
+    )
+
+
 def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
     from mlx_vlm import generate
 
     prompt = build_prompt(payload)
-    kwargs = generation_kwargs(payload)
     start = time.monotonic()
     speculative_start = current_speculative_stat_index()
-    result = generate(MODEL, PROCESSOR, prompt, verbose=False, **kwargs)
-    raw_text = str(getattr(result, "text", result) or "")
+    if DRAFT_BACKEND == "dflash":
+        raw_text = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+        first_dflash_response = True
+        for response in dflash_stream(prompt, payload):
+            raw_text += str(getattr(response, "text", "") or "")
+            prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+            completion_tokens = int(getattr(response, "generation_tokens", completion_tokens) or completion_tokens)
+            record_dflash_acceptance(response, first_response=first_dflash_response)
+            first_dflash_response = False
+        result = None
+    else:
+        kwargs = generation_kwargs(payload)
+        result = generate(MODEL, PROCESSOR, prompt, verbose=False, **kwargs)
+        raw_text = str(getattr(result, "text", result) or "")
+        prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(result, "generation_tokens", 0) or 0)
     content, reasoning = strip_reasoning_markers(raw_text)
     content, tool_calls = parse_tool_call(content)
     finish_reason = "tool_calls" if tool_calls else "stop"
@@ -477,8 +565,6 @@ def _chat_completion_on_worker(payload: dict[str, Any]) -> dict[str, Any]:
         log(f"suppressed repeated-token loop in nonstream output: {content[:120]!r}")
         content = ""
         finish_reason = "content_filter"
-    prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(result, "generation_tokens", 0) or 0)
     elapsed = time.monotonic() - start
     tok_s = completion_tokens / elapsed if elapsed > 0 else 0
     speculative = speculative_stats_since(speculative_start)
@@ -509,10 +595,7 @@ def _stream_chat_completion_on_worker(
     payload: dict[str, Any],
     event_queue: "queue.Queue[tuple[str, Any]]",
 ) -> dict[str, Any]:
-    from mlx_vlm import stream_generate
-
     prompt = build_prompt(payload)
-    kwargs = generation_kwargs(payload)
     start = time.monotonic()
     speculative_start = current_speculative_stat_index()
     raw_text = ""
@@ -522,13 +605,23 @@ def _stream_chat_completion_on_worker(
     completion_tokens = 0
     finish_reason = "stop"
     try:
-        for response in stream_generate(MODEL, PROCESSOR, prompt, verbose=False, **kwargs):
+        if DRAFT_BACKEND == "dflash":
+            response_iter = dflash_stream(prompt, payload)
+        else:
+            from mlx_vlm import stream_generate
+
+            response_iter = stream_generate(MODEL, PROCESSOR, prompt, verbose=False, **generation_kwargs(payload))
+        first_dflash_response = True
+        for response in response_iter:
             last_response = response
             segment = str(getattr(response, "text", "") or "")
             if segment:
                 raw_text += segment
             prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
             completion_tokens = int(getattr(response, "generation_tokens", completion_tokens) or completion_tokens)
+            if DRAFT_BACKEND == "dflash":
+                record_dflash_acceptance(response, first_response=first_dflash_response)
+                first_dflash_response = False
             visible = stream_visible_text(raw_text)
             if has_repeated_token_loop(visible or raw_text):
                 log(f"suppressed repeated-token loop in stream output: {(visible or raw_text)[:120]!r}")

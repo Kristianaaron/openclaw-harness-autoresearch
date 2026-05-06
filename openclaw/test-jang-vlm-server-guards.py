@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -43,8 +45,65 @@ def test_reasoning_and_loop_guards() -> None:
     assert server.has_repeated_token_loop("thoughtthoughtthoughtthought")
 
 
+def test_dflash_adapter_and_kwargs() -> None:
+    class FakeLanguageModel:
+        def __init__(self) -> None:
+            self.layers = [object()]
+            self.model = SimpleNamespace(embed_tokens=SimpleNamespace(as_linear="lm-head"))
+
+        def make_cache(self):
+            return ["cache"]
+
+    class FakeTarget:
+        def __init__(self) -> None:
+            self.language_model = FakeLanguageModel()
+            self.calls = []
+
+        def __call__(self, input_ids, cache=None, **kwargs):
+            self.calls.append((input_ids, cache, kwargs))
+            return SimpleNamespace(logits="logits")
+
+    target = FakeTarget()
+    adapter = server.DFlashVLMTargetAdapter(target)
+    assert adapter.make_cache() == ["cache"]
+    assert adapter("tokens", cache=["cache"]) == "logits"
+    assert target.calls == [("tokens", ["cache"], {})]
+
+    old_draft = server.DRAFT_MODEL
+    old_backend = server.DRAFT_BACKEND
+    old_env = os.environ.get("OPENCLAW_JANG_DFLASH_BLOCK_SIZE")
+    try:
+        server.DRAFT_MODEL = object()
+        server.DRAFT_BACKEND = "dflash"
+        os.environ["OPENCLAW_JANG_DFLASH_BLOCK_SIZE"] = "16"
+        kwargs = server.generation_kwargs({"max_tokens": 32})
+        assert "draft_model" not in kwargs
+        assert "draft_kind" not in kwargs
+        assert server.dflash_generation_kwargs({"max_tokens": 32}) == {
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "block_size": 16,
+        }
+        server.DFLASH_ACCEPT_LENS[:] = [2, 8, 4]
+        assert server.current_speculative_stat_index() == 3
+        assert server.speculative_stats_since(1) == " mtp_rounds=2 mean_accept=6.00"
+        server.DFLASH_ACCEPT_LENS[:] = []
+        server.record_dflash_acceptance(SimpleNamespace(accepted=16), first_response=True)
+        server.record_dflash_acceptance(SimpleNamespace(accepted=8), first_response=False)
+        assert server.DFLASH_ACCEPT_LENS == [8]
+    finally:
+        server.DRAFT_MODEL = old_draft
+        server.DRAFT_BACKEND = old_backend
+        server.DFLASH_ACCEPT_LENS[:] = []
+        if old_env is None:
+            os.environ.pop("OPENCLAW_JANG_DFLASH_BLOCK_SIZE", None)
+        else:
+            os.environ["OPENCLAW_JANG_DFLASH_BLOCK_SIZE"] = old_env
+
+
 if __name__ == "__main__":
     test_native_gemma_tool_call()
     test_json_tool_call()
     test_reasoning_and_loop_guards()
+    test_dflash_adapter_and_kwargs()
     print("ok")
