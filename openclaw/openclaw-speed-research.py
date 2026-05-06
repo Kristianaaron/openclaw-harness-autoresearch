@@ -265,7 +265,7 @@ Use quick benchmarks before heavy ones. Prefer prompts that do not trigger broad
 - wall time
 - memory before/start/load/generate/stop
 
-Use `openclaw speed-research benchmark --quick` for a bounded probe. If the model is stopped and memory pressure is high, record the blocker instead of starting a 31B model.
+Use `openclaw speed-research-benchmark --quick` for a bounded probe. The nested form `openclaw speed-research benchmark --quick` is also accepted for convenience. If the model is stopped and memory pressure is high, record the blocker instead of starting a 31B model.
 
 ## Realistic Experiment Backlog
 

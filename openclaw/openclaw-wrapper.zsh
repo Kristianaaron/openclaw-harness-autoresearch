@@ -373,6 +373,19 @@ case "${1:-}" in
     return $?
     ;;
   speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
+    case "${2:-}" in
+      setup|prompt|benchmark|record|synthesize|compact)
+        local speed_research_subcommand="${2:-}"
+        shift 2
+        "$speed_research" "$speed_research_subcommand" "$@"
+        return $?
+        ;;
+      add-source)
+        shift 2
+        "$speed_research" add-source "$@"
+        return $?
+        ;;
+    esac
     if _openclaw_has_arg_prefix "--help" "${openclaw_args[@]}" || _openclaw_has_arg_prefix "-h" "${openclaw_args[@]}"; then
       shift
       OPENCLAW_REAL_BIN="$real_openclaw" "$speed_research_autopilot" "$@"
