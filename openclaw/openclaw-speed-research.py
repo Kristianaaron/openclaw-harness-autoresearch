@@ -509,7 +509,15 @@ Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`,
 def current_priority_section() -> str:
     return """## Current Priority
 
-Focus the overnight run on one metric: **real OpenClaw decode tokens/sec for Gemma 4 31B JANG/JANQ with the Gemma 4 MTP assistant drafter path**.
+Focus the overnight run on one user-facing metric first: **real OpenClaw TUI decode tokens/sec and visible response smoothness for Gemma 4 31B JANG/JANQ with the Gemma 4 MTP assistant drafter path**.
+
+The scope order is strict:
+
+1. Improve normal `openclaw tui` chat decode speed and perceived response quality.
+2. Preserve reliability: no reasoning-marker leaks, no tool-call loops, no silent stream stalls, no Python/Metal memory crashes.
+3. Improve autoresearch only where it helps the first two goals: better task selection, better implementation handoff, fewer wasted cycles, and safer overnight operation.
+
+Autoresearch self-improvement is not the primary benchmark. It is a support system for finding, testing, and safely implementing changes that make the regular TUI experience faster.
 
 The active production baseline is:
 
@@ -517,7 +525,7 @@ The active production baseline is:
 - Serving path: `openclaw/openclaw-jang-vlm-server.py` behind `openclaw/openclaw-model-proxy.py`.
 - Drafter path: quantized Gemma 4 assistant under `{openclawDir}/models/gemma-4-31B-it-assistant-mlx-4bit`.
 - Known measured baseline: about 14-15 decode tok/s on bounded decode prompts, with MTP `mean_accept` often below 1 on longer normal text.
-- Goal: improve measured decode TPS first; TTFT and prefill are secondary unless they block fair decode measurement.
+- Goal: improve measured TUI decode TPS first; TTFT and prefill are secondary unless they block fair decode measurement or make the TUI feel frozen before decode starts.
 
 Primary research questions:
 
@@ -534,9 +542,9 @@ In-scope source files and knobs:
 - `openclaw/openclaw-model-proxy.py` only when proxy streaming or shaping affects measured decode
 - Live profile env vars for `OPENCLAW_JANG_DRAFT_MODEL`, `OPENCLAW_JANG_DRAFT_BLOCK_SIZE`, drafter quantization, temperature, top-p, and repetition penalty
 
-Think broadly, but every useful idea must become one of: a decode benchmark result, MTP acceptance measurement, drafter calibration/quantization experiment, rejected experiment with evidence, or a small source patch with tests.
+Think broadly, but every useful idea must become one of: a TUI-relevant decode benchmark result, MTP acceptance measurement, drafter calibration/quantization experiment, rejected experiment with evidence, or a small source patch with tests.
 
-Do not spend rounds on generic prefill, prompt-shape, or tool UX unless decode benchmarking is blocked. Do not optimize for synthetic repeated-token prompts; use deterministic normal-text, code, shell-list, and agent-summary prompts.
+Do not spend rounds on generic prefill, prompt-shape, tool UX, or autoresearch meta-work unless it directly improves TUI decode experiments or prevents autoresearch from safely producing TUI decode improvements. Do not optimize for synthetic repeated-token prompts; use deterministic normal-text, code, shell-list, and agent-summary prompts.
 """
 
 
@@ -594,14 +602,17 @@ Treat these as directional targets, not promises:
 - Current-stack stretch target: realistic OpenClaw decode above 20 tok/s on normal deterministic prompts.
 - Frontier target: investigate paths that could reach 30+ tok/s, then 50-70 tok/s if drafter acceptance and runtime overhead evidence supports it.
 
-Primary metric is decode TPS from comparable normal-text/code prompts. Secondary metrics are MTP mean acceptance, MTP rounds, wall time, first visible token, and memory pressure.
+Primary metric is TUI-relevant decode TPS from comparable normal-text/code prompts. Secondary metrics are MTP mean acceptance, MTP rounds, wall time, first visible token, stream smoothness, and memory pressure.
+Autoresearch quality metrics are tertiary: fewer stalled cycles, higher-quality implementation candidates, and cleaner handoff artifacts. They matter only when they help produce safer TUI decode-speed improvements.
 """
 
 
 def strategy_decode_focus_section() -> str:
     return """## Decode MTP Focus
 
-Primary metric for the current overnight run: real OpenClaw decode tokens/sec for `mlx/Gemma-4-31B-JANG_4M-CRACK` with the Gemma 4 assistant drafter path.
+Primary metric for the current overnight run: real OpenClaw TUI decode tokens/sec and visible response smoothness for `mlx/Gemma-4-31B-JANG_4M-CRACK` with the Gemma 4 assistant drafter path.
+
+Autoresearch self-improvement is secondary. Improve the research loop only when it makes the TUI decode-speed loop more deterministic, safer, or more likely to produce a clean implementation.
 
 Current baseline:
 
@@ -618,7 +629,7 @@ Research order:
 4. Sweep drafter block size and quantization only with fixed prompts and rollback.
 5. Promote JANQ drafter calibration only if wall-clock decode TPS improves.
 
-TTFT, prefill, prompt-shape, and tool-roundtrip are secondary unless they block fair decode measurement.
+TTFT, prefill, prompt-shape, tool-roundtrip, and autoresearch workflow metrics are secondary unless they block fair TUI decode measurement or safe overnight execution.
 """
 
 
@@ -662,10 +673,18 @@ def refresh_strategy_objective(path: Path) -> None:
     if not path.exists():
         return
     text = path.read_text(encoding="utf-8", errors="replace")
-    old = "Objective: optimize raw speed for the current Gemma 4 31B JANG OpenClaw setup while treating crashes, loops, memory pressure, and tool failures as hard guards."
-    new = "Objective: improve real decode tokens/sec for the current Gemma 4 31B JANG/JANQ OpenClaw setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards."
-    if old in text:
-        path.write_text(text.replace(old, new), encoding="utf-8")
+    objective_lines = {
+        "Objective: optimize raw speed for the current Gemma 4 31B JANG OpenClaw setup while treating crashes, loops, memory pressure, and tool failures as hard guards.",
+        "Objective: improve real decode tokens/sec for the current Gemma 4 31B JANG/JANQ OpenClaw setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards.",
+        "Objective: improve real OpenClaw TUI decode tokens/sec and visible response smoothness for the current Gemma 4 31B JANG/JANQ setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards. Autoresearch self-improvement is secondary and exists to make that TUI decode loop safer and more productive.",
+    }
+    new = "Objective: improve real OpenClaw TUI decode tokens/sec and visible response smoothness for the current Gemma 4 31B JANG/JANQ setup with the Gemma 4 MTP assistant drafter, while treating crashes, loops, memory pressure, and tool failures as hard guards. Autoresearch self-improvement is secondary and exists to make that TUI decode loop safer and more productive."
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line in objective_lines:
+            lines[index] = new
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
 
 
 def implementation_gate_section() -> str:
@@ -706,6 +725,8 @@ def prompt_text(root: Path) -> str:
     return f"""OpenClaw Speed Autoresearch bootstrap.
 
 Workspace: {root}
+
+Primary scope: improve normal `openclaw tui` decode speed and visible response smoothness first. Improve autoresearch itself only when it helps produce safer, better TUI decode-speed changes.
 
 First assistant action: run exactly this narrow benchmark command:
 `/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`

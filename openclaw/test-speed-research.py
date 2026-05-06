@@ -83,6 +83,8 @@ def main() -> int:
             assert source_text.count("https://example.com/speed") == 1
             prompt = helper.prompt_text(root)
             assert "OpenClaw Speed Autoresearch" in prompt
+            assert "normal `openclaw tui` decode speed" in prompt
+            assert "Improve autoresearch itself only when it helps" in prompt
             assert "First assistant action" in prompt
             assert "benchmark --mode decode-sample" in prompt
             assert "Use one narrow tool call" in prompt
@@ -98,7 +100,9 @@ def main() -> int:
             assert "find /Users" in program
             assert "## Starting Point" not in program
             assert "## Current Priority" in program
-            assert "real OpenClaw decode tokens/sec" in program
+            assert "real OpenClaw TUI decode tokens/sec" in program
+            assert "Autoresearch self-improvement is not the primary benchmark" in program
+            assert "TUI-relevant decode benchmark result" in program
             assert "openclaw-mtp-drafter-calibrate.py" in program
             assert "MTP acceptance" in program
             assert "## Frontier Speed Track" in program
@@ -109,6 +113,7 @@ def main() -> int:
             assert "Drafter block sweep" in program
             assert "## Speed Targets" in program
             assert "Current live baseline" in program
+            assert "Autoresearch quality metrics are tertiary" in program
             assert "## Implementation Gate" in program
             assert "implementation-skill.md" in program
             implementation = (root / "implementation-skill.md").read_text(encoding="utf-8")

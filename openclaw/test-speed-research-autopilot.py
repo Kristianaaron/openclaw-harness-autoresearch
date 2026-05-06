@@ -28,11 +28,13 @@ def main() -> int:
     assert "do not read it this turn" in prompt
     assert "Do not touch opencode" in prompt
     assert "benchmark --mode decode-sample" in prompt
+    assert "Primary scope: improve normal `openclaw tui` decode speed" in prompt
+    assert "Autoresearch self-improvement is secondary" in prompt
     assert "MTP acceptance" in prompt
     assert "openclaw-model-proxy.log" in prompt
     assert "Do not run setup commands" in prompt
     assert "implementation-skill.md" in prompt
-    assert "Do not repeat quick-health, TTFT, prompt-size, or tool-roundtrip benchmarks" in prompt
+    assert "Do not repeat quick-health, TTFT, prompt-size, tool-roundtrip, or autoresearch meta-work" in prompt
     assert "do not append another" in prompt
     synthesis_prompt = helper.continuation_prompt(10, 0, "", helper.synthesis_task())
     assert "benchmark queue is exhausted" in synthesis_prompt
@@ -178,6 +180,7 @@ def main() -> int:
         assert seeded == 3
         recurring_tasks = helper.TASKS.read_text(encoding="utf-8")
         assert "decode-repeatability-cycle-042" in recurring_tasks
+        assert "TUI-relevant real decode TPS" in recurring_tasks
         assert "mtp-acceptance-review-cycle-042" in recurring_tasks
         assert "implementation-bridge-cycle-042" in recurring_tasks
         assert "autopilot-refill" in helper.RESULTS.read_text(encoding="utf-8")

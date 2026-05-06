@@ -566,8 +566,8 @@ def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
             "status": "ready",
             "priority": 88,
             "lane": "production-mtp",
-            "target": "decode-sample",
-            "hypothesis": "Each new research tranche starts by remeasuring real decode TPS on the live MTP setup.",
+            "target": "tui-decode-sample",
+            "hypothesis": "Each new research tranche starts by remeasuring TUI-relevant real decode TPS on the live MTP setup.",
             "metric": "decode_tps",
             "benchmark_mode": "decode-sample",
             "guard_checks": ["memory_ok", "no_reasoning_leak", "no_sse_timeout"],
@@ -592,7 +592,7 @@ def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
             "task_type": "implementation",
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-            "hypothesis": "When synthesis identifies a grounded decode/MTP improvement, convert exactly one insight into a minimal tested OpenClaw patch.",
+            "hypothesis": "When synthesis identifies a grounded TUI decode/MTP improvement, convert exactly one insight into a minimal tested OpenClaw patch.",
             "metric": "decode_tps_delta_or_guardrail",
             "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
             "acceptance": "Patch is minimal, focused tests pass, and results.tsv records keep/discard/blocked evidence.",
@@ -600,7 +600,7 @@ def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
             "next_action": (
                 "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
                 "Then read exactly /Users/kristian/.openclaw/research/speed/ideas.md. "
-                "Implement only the smallest currently evidenced OpenClaw decode/MTP improvement; do not touch opencode."
+                "Implement only the smallest currently evidenced OpenClaw TUI decode/MTP improvement; do not touch opencode."
             ),
         },
     ]
@@ -694,7 +694,9 @@ def continuation_prompt(
         f"Workspace: {WORKSPACE}\n"
         f"Program: {PROGRAM}\n\n"
         "Use program.md as the installed policy, but do not read it this turn. Do one bounded unit of useful work. "
-        "Prefer realistic decode work over toy prompts: "
+        "Primary scope: improve normal `openclaw tui` decode speed and visible response smoothness first. "
+        "Autoresearch self-improvement is secondary and should only be done when it makes the TUI decode-speed loop safer, more deterministic, or more likely to produce a clean implementation.\n\n"
+        "Prefer realistic TUI decode work over toy prompts: "
         "MTP acceptance, drafter block size, drafter quantization, JANQ calibration, MLX/VLM MTP loop overhead, "
         "Metal/KV/cache memory, or grounded frontier proposals toward 30+ and then 50-70 tok/s.\n\n"
         "Best next actions are: run a specific benchmark mode such as "
@@ -713,7 +715,7 @@ def continuation_prompt(
         "Benchmark commands already write results.tsv and benchmark JSON; after running one, do not append another "
         "results row by hand. Use a later cycle for synthesis or task updates. "
         "Task completion is supervisor-owned: do not manually mark tasks done. "
-        "Do not repeat quick-health, TTFT, prompt-size, or tool-roundtrip benchmarks unless they directly support a decode/MTP hypothesis. "
+        "Do not repeat quick-health, TTFT, prompt-size, tool-roundtrip, or autoresearch meta-work unless they directly support a TUI decode/MTP hypothesis. "
         "No quality artifact means the supervisor will narrow the next cycle automatically."
         f"{task_summary}"
         f"{task_contract}"
