@@ -285,6 +285,19 @@ def main() -> int:
             sweep_run = json.loads(sweep_run_paths[-1].read_text(encoding="utf-8"))
             assert sweep_run["decision"] in {"keep-current", "promotion-ready"}
             assert sweep_run["promotion_gate"]["must_restore_live_profile"] is True
+            with (root / "results.tsv").open("a", encoding="utf-8") as file:
+                for index in range(3):
+                    file.write(
+                        f"2026-05-05T00:10:0{index}+0000\tdrafter-sweep-run-review-{index}\tkeep\t"
+                        "OPENCLAW_JANG_DRAFT_BLOCK_SIZE\tpaired drafter block-size sweep\t\t\t14.2\t\t\tabc123\t"
+                        "decision=keep-current control_block=2 winner_block=2 delta_vs_control=0.0\n"
+                    )
+            assert helper.quality_review(Namespace(recent_rows=80, min_sweeps=3)) == 0
+            review_paths = list((root / "benchmarks").glob("quality-review-*.json"))
+            assert review_paths
+            review = json.loads(review_paths[-1].read_text(encoding="utf-8"))
+            assert review["repeated_block2_winner"] is True
+            assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas

@@ -1130,6 +1130,16 @@ def mean_value(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 3)
 
 
+def parse_note_fields(notes: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for token in notes.replace(",", " ").split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key] = value
+    return fields
+
+
 def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     path = root / "tasks.jsonl"
     existing = read_jsonl(path)
@@ -1154,6 +1164,126 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     if changed:
         write_jsonl(path, existing)
     return additions
+
+
+def quality_review(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    rows = result_rows(root)
+    recent = rows[-max(1, int(args.recent_rows)) :]
+    blocked = [row for row in recent if row.get("status") == "blocked"]
+    decode_by_block: dict[str, list[float]] = {}
+    for row in recent:
+        if row.get("status") != "keep" or row.get("target") != "decode-sample":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        block = fields.get("draft_block_size", "")
+        if not block:
+            continue
+        try:
+            decode_by_block.setdefault(block, []).append(float(row.get("decode_tps", "")))
+        except ValueError:
+            continue
+    block_summary = {
+        block: {
+            "samples": len(values),
+            "mean_decode_tps": mean_float(values),
+            "min_decode_tps": round(min(values), 3) if values else None,
+            "max_decode_tps": round(max(values), 3) if values else None,
+        }
+        for block, values in sorted(decode_by_block.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 999)
+    }
+    sweep_rows = [
+        row
+        for row in recent
+        if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
+    ]
+    sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
+    winner_blocks = [fields.get("winner_block", "") for fields in sweep_fields if fields.get("winner_block")]
+    repeated_block2 = len(winner_blocks) >= int(args.min_sweeps) and all(block == "2" for block in winner_blocks[-int(args.min_sweeps) :])
+    repeated_keep_current = len(sweep_fields) >= int(args.min_sweeps) and all(
+        fields.get("decision") == "keep-current" for fields in sweep_fields[-int(args.min_sweeps) :]
+    )
+    review_status = "keep"
+    recommendations: list[str] = []
+    seeded_tasks: list[dict[str, Any]] = []
+    if repeated_block2 and repeated_keep_current:
+        recommendations.append("block-size sweep has converged on block 2; move to acceptance, drafter-fit, DFlash, and MTP-loop overhead.")
+        seeded_tasks.extend(
+            [
+                {
+                    "id": "review-mtp-loop-overhead-next",
+                    "status": "ready",
+                    "priority": 94,
+                    "lane": "runtime-overhead",
+                    "target": "openclaw/openclaw-jang-vlm-server.py",
+                    "hypothesis": "Repeated block-2 wins mean the next plausible path to 30+ tok/s is reducing MTP verification/cache/rollback overhead.",
+                    "metric": "decode_tps_delta",
+                    "guard_checks": ["one_narrow_tool", "no_live_profile_change", "tests_before_patch"],
+                    "next_action": "read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-jang-vlm-server.py and map the MTP loop overhead boundaries",
+                },
+                {
+                    "id": "review-janq-drafter-fit-next",
+                    "status": "ready",
+                    "priority": 92,
+                    "lane": "drafter-alignment",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-fit-plan",
+                    "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+                    "hypothesis": "Block-size tuning is exhausted; the next speed ceiling requires JANQ-specific drafter fit or a safely rejected DFlash path.",
+                    "metric": "drafter_fit_gate",
+                    "guard_checks": ["no_model_load", "no_opencode_changes", "no_live_profile_change"],
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
+                },
+            ]
+        )
+    if blocked:
+        review_status = "blocked"
+        recommendations.append(f"recent run has {len(blocked)} blocked rows; inspect the last blocker before trusting speed conclusions.")
+    if not recommendations:
+        recommendations.append("research quality is acceptable; continue current queue.")
+    seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
+    timestamp = int(time.time())
+    artifact = {
+        "ok": True,
+        "kind": "quality-review",
+        "timestamp": timestamp,
+        "recent_rows": len(recent),
+        "blocked_rows": len(blocked),
+        "sweep_rows": len(sweep_rows),
+        "block_summary": block_summary,
+        "repeated_block2_winner": repeated_block2,
+        "repeated_keep_current": repeated_keep_current,
+        "recommendations": recommendations,
+        "seeded_tasks": seeded,
+    }
+    path = root / "benchmarks" / f"quality-review-{timestamp}.json"
+    path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "quality-review",
+            "finding": "supervisor quality reviewer scored recent autoresearch and fed next-step tasks back into the loop",
+            "evidence": artifact,
+            "next": "continue_autopilot_loop",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"quality-review-{timestamp}",
+        status=review_status,
+        target="autoresearch-quality",
+        hypothesis="sidecar review should detect convergence, noise, and next-step tasks without a human review turn",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"recent_rows={len(recent)} blocked={len(blocked)} sweeps={len(sweep_rows)} "
+            f"repeated_block2={repeated_block2} seeded_tasks={seeded} "
+            f"recommendation={recommendations[0]}"
+        ),
+    )
+    print(json.dumps({"ok": True, "path": str(path), **artifact}, indent=2))
+    return 0
 
 
 def synthesis_ideas(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -2460,6 +2590,11 @@ def main() -> int:
     synth = sub.add_parser("synthesize")
     synth.add_argument("--kind", choices=["frontier", "current-stack"], default="frontier")
     synth.set_defaults(func=synthesize)
+
+    review = sub.add_parser("quality-review")
+    review.add_argument("--recent-rows", type=int, default=120)
+    review.add_argument("--min-sweeps", type=int, default=3)
+    review.set_defaults(func=quality_review)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)

@@ -622,6 +622,25 @@ def main() -> int:
         assert ok
         assert issue == ""
         assert synth_marker.read_text(encoding="utf-8") == "synthesize --kind frontier"
+        review_helper = Path(tmp) / "review-helper.py"
+        review_marker = Path(tmp) / "review-marker.txt"
+        review_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(review_marker)!r}).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        review_helper.chmod(0o700)
+        review_args = Namespace(
+            research_helper_bin=str(review_helper),
+            review_recent_rows=120,
+            review_min_sweeps=3,
+            quality_review_timeout_seconds=5,
+        )
+        ok, issue = helper.run_supervisor_quality_review(review_args, 8, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert issue == ""
+        assert review_marker.read_text(encoding="utf-8") == "quality-review --recent-rows 120 --min-sweeps 3"
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
             9,

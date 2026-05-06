@@ -1936,6 +1936,35 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
     return True, ""
 
 
+def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
+    cmd = [
+        args.research_helper_bin,
+        "quality-review",
+        "--recent-rows",
+        str(args.review_recent_rows),
+        "--min-sweeps",
+        str(args.review_min_sweeps),
+    ]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\n===== cycle {cycle} session {session} supervisor quality review =====\n")
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=file,
+                stderr=subprocess.STDOUT,
+                timeout=args.quality_review_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "supervisor quality review timeout"
+    if result.returncode != 0:
+        return False, f"supervisor quality review exit {result.returncode}"
+    return True, ""
+
+
 def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
     cmd = [args.research_helper_bin, "compact", "--recent-rows", str(args.compact_recent_rows)]
     with log_file.open("a", encoding="utf-8") as file:
@@ -1989,6 +2018,10 @@ def main() -> int:
     parser.add_argument("--gateway-health-url", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_GATEWAY_HEALTH_URL", ""))
     parser.add_argument("--gateway-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_GATEWAY_START_TIMEOUT", "30")))
     parser.add_argument("--reflection-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REFLECTION_INTERVAL", "4")))
+    parser.add_argument("--quality-review-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_INTERVAL", "6")))
+    parser.add_argument("--quality-review-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TIMEOUT", "45")))
+    parser.add_argument("--review-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_RECENT_ROWS", "120")))
+    parser.add_argument("--review-min-sweeps", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SWEEPS", "3")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))
     parser.add_argument(
@@ -2206,6 +2239,19 @@ def main() -> int:
             log(
                 f"cycle={cycle} reflection ok={reflection_ok} issue={reflection_issue or 'none'}"
             )
+        if (
+            progressed
+            and args.quality_review_interval > 0
+            and progress_cycles > 0
+            and progress_cycles % args.quality_review_interval == 0
+        ):
+            review_ok, review_issue = run_supervisor_quality_review(
+                args,
+                cycle,
+                current_session,
+                log_file,
+            )
+            log(f"cycle={cycle} quality_review ok={review_ok} issue={review_issue or 'none'}")
         if code not in {0, 124}:
             log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
         if not progressed:
