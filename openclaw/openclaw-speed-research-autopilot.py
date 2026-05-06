@@ -518,6 +518,157 @@ def model_ready() -> bool:
         return False
 
 
+def gateway_health_url(args: argparse.Namespace) -> str:
+    configured = getattr(args, "gateway_health_url", "") or os.environ.get(
+        "OPENCLAW_SPEED_RESEARCH_GATEWAY_HEALTH_URL",
+        "",
+    )
+    return str(configured or f"http://127.0.0.1:{getattr(args, 'gateway_port', 18789)}/health")
+
+
+def gateway_ready(args: argparse.Namespace) -> bool:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/curl", "-fsS", "--max-time", "2", gateway_health_url(args)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def gateway_listener_pids(args: argparse.Namespace) -> list[int]:
+    try:
+        result = subprocess.run(
+            [
+                "/usr/sbin/lsof",
+                "-nP",
+                f"-tiTCP:{getattr(args, 'gateway_port', 18789)}",
+                "-sTCP:LISTEN",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def stop_gateway_listeners(args: argparse.Namespace, log_file: Path, *, reason: str) -> None:
+    pids = gateway_listener_pids(args)
+    if not pids:
+        return
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\nGateway recovery stopping listeners reason={reason} pids={pids}\n")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not gateway_listener_pids(args):
+            return
+        time.sleep(0.25)
+    for pid in gateway_listener_pids(args):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+
+
+def start_gateway(args: argparse.Namespace, log_file: Path, *, reason: str) -> tuple[bool, str]:
+    if gateway_ready(args):
+        return True, ""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    gateway_log = OPENCLAW_HOME / "logs" / "gateway-autoresearch.log"
+    gateway_err = OPENCLAW_HOME / "logs" / "gateway-autoresearch.err.log"
+    gateway_log.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        args.openclaw_bin,
+        "gateway",
+        "run",
+        "--port",
+        str(args.gateway_port),
+        "--token",
+        os.environ.get("OPENCLAW_GATEWAY_TOKEN", "local-dev-token"),
+    ]
+    env = os.environ.copy()
+    env.setdefault("OPENCLAW_GATEWAY_TOKEN", "local-dev-token")
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\nGateway recovery start reason={reason}\n")
+        file.write("$ " + " ".join(cmd[:-1] + ["<token>"]) + "\n")
+        file.write(f"stdout={gateway_log} stderr={gateway_err}\n")
+        file.flush()
+    try:
+        with gateway_log.open("a", encoding="utf-8") as out, gateway_err.open("a", encoding="utf-8") as err:
+            subprocess.Popen(cmd, env=env, text=True, stdout=out, stderr=err, start_new_session=True)
+    except Exception as error:
+        return False, f"gateway start failed: {error}"
+    deadline = time.monotonic() + args.gateway_start_timeout_seconds
+    while time.monotonic() < deadline:
+        if gateway_ready(args):
+            return True, ""
+        time.sleep(0.5)
+    return False, f"gateway did not become ready within {args.gateway_start_timeout_seconds:.0f}s"
+
+
+def recover_gateway(args: argparse.Namespace, log_file: Path, *, reason: str, force_restart: bool = False) -> tuple[bool, str]:
+    if gateway_ready(args) and not force_restart:
+        return True, ""
+    if force_restart or gateway_listener_pids(args):
+        stop_gateway_listeners(args, log_file, reason=reason)
+    ok, issue = start_gateway(args, log_file, reason=reason)
+    if ok:
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": "gateway-recovery",
+                "finding": "autoresearch recovered the OpenClaw gateway before continuing",
+                "reason": reason,
+                "health_url": gateway_health_url(args),
+            },
+        )
+        append_result(
+            WORKSPACE,
+            run_id=f"gateway-recovery-{int(time.time())}",
+            status="keep",
+            target="openclaw-gateway",
+            hypothesis="autoresearch must recover gateway failures instead of burning cycles",
+            commit=current_commit(),
+            notes=f"reason={clean_tsv(reason)} health_url={gateway_health_url(args)}",
+        )
+        return True, ""
+    return False, issue
+
+
+def ensure_gateway_for_agent(args: argparse.Namespace, log_file: Path) -> tuple[bool, str]:
+    if gateway_ready(args):
+        return True, ""
+    return recover_gateway(args, log_file, reason="pre-agent gateway health check")
+
+
+def is_gateway_issue(issue: str) -> bool:
+    text = issue.lower()
+    return "gateway" in text or "embedded fallback" in text or "websocket" in text
+
+
 def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready: bool) -> str:
     min_free_mb = args.ready_min_free_mb if ready else args.min_free_mb
     if snap["compressor_mb"] >= args.max_compressor_mb:
@@ -877,6 +1028,9 @@ def run_turn(
     tool_result_cap = args.max_tool_results_per_turn
     if selected_task and selected_task.get("task_type") == "implementation":
         tool_result_cap = args.max_implementation_tool_results_per_turn
+    gateway_ok, gateway_issue = ensure_gateway_for_agent(args, log_file)
+    if not gateway_ok:
+        return 124, f"gateway recovery failed before agent turn: {gateway_issue}"
     cmd = [
         args.openclaw_bin,
         "agent",
@@ -960,6 +1114,16 @@ def run_turn(
                         file.write(f"\nEARLY FAILURE after {now - started:.1f}s: {failure}\n")
                         file.flush()
                         stop_process_tree(process)
+                        if is_gateway_issue(failure):
+                            recovered, recovery_issue = recover_gateway(
+                                args,
+                                log_file,
+                                reason=failure,
+                                force_restart=True,
+                            )
+                            if recovered:
+                                return 124, "gateway recovered after early failure"
+                            return 124, f"{failure}; gateway recovery failed: {recovery_issue}"
                         return 124, failure
                     next_failure_check = now + 2
                 if args.active_memory_check_seconds > 0 and now >= next_memory_check:
@@ -1491,6 +1655,8 @@ def run_supervisor_focused_test_task(
 
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
+    if is_gateway_issue(text) and "recovered" not in text.lower():
+        return True
     return any(pattern.lower() in text.lower() for pattern in MALFORMED_OR_TOOL_ISSUES)
 
 
@@ -1630,6 +1796,9 @@ def main() -> int:
     parser.add_argument("--synthesis-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--supervisor-benchmark-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SUPERVISOR_BENCHMARK_TIMEOUT", "180")))
     parser.add_argument("--model-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_START_TIMEOUT", "420")))
+    parser.add_argument("--gateway-port", type=int, default=int(os.environ.get("OPENCLAW_GATEWAY_PORT", "18789")))
+    parser.add_argument("--gateway-health-url", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_GATEWAY_HEALTH_URL", ""))
+    parser.add_argument("--gateway-start-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_GATEWAY_START_TIMEOUT", "30")))
     parser.add_argument("--reflection-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REFLECTION_INTERVAL", "4")))
     parser.add_argument("--compact-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_COMPACT_ROWS", "24")))
     parser.add_argument("--max-tool-results-per-turn", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_TOOL_RESULTS", "1")))

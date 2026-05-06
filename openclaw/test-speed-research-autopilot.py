@@ -8,6 +8,7 @@ import os
 import tempfile
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 
 HELPER_PATH = Path(__file__).with_name("openclaw-speed-research-autopilot.py")
@@ -309,6 +310,43 @@ def main() -> int:
         assert text.startswith("timestamp\trun_id\tstatus")
         assert "autopilot-cycle-7" in text
         assert "session=nightly issue=memory gate still hot retry" in text
+        gateway_args = Namespace(
+            openclaw_bin="/opt/homebrew/bin/openclaw",
+            gateway_port=18789,
+            gateway_health_url="",
+            gateway_start_timeout_seconds=1,
+        )
+        with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_GATEWAY_HEALTH_URL": ""}, clear=False):
+            assert helper.gateway_health_url(gateway_args) == "http://127.0.0.1:18789/health"
+        assert helper.is_gateway_issue("gateway embedded fallback")
+        assert helper.should_run_deterministic_fallback(
+            "gateway recovery failed before agent turn",
+            {"reason": "no durable artifact"},
+        )
+        with patch.object(helper, "gateway_ready", return_value=False):
+            with patch.object(helper, "gateway_listener_pids", return_value=[]):
+                with patch.object(helper, "start_gateway", return_value=(True, "")):
+                    ok, issue = helper.recover_gateway(
+                        gateway_args,
+                        Path(tmp) / "autopilot.log",
+                        reason="gateway embedded fallback",
+                    )
+        assert ok
+        assert issue == ""
+        assert "gateway-recovery" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "autoresearch recovered the OpenClaw gateway" in helper.FINDINGS.read_text(encoding="utf-8")
+        before_failed_gateway_rows = helper.results_line_count()
+        with patch.object(helper, "gateway_ready", return_value=False):
+            with patch.object(helper, "gateway_listener_pids", return_value=[]):
+                with patch.object(helper, "start_gateway", return_value=(False, "gateway did not become ready")):
+                    ok, issue = helper.recover_gateway(
+                        gateway_args,
+                        Path(tmp) / "autopilot.log",
+                        reason="gateway embedded fallback",
+                    )
+        assert not ok
+        assert issue == "gateway did not become ready"
+        assert helper.results_line_count() == before_failed_gateway_rows
         repeated_task = {
             "id": "blocked-impl",
             "status": "ready",
