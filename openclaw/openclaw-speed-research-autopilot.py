@@ -61,6 +61,8 @@ BLOCKED_PATTERNS = (
     "TOOL RESULT CAP",
     "TOOL RESULT SYNTHESIS GRACE",
     "timed out",
+    "malformed hidden/tool output",
+    "proxy suppressed",
 )
 EARLY_FAILURE_PATTERNS = (
     ("EMBEDDED FALLBACK", "gateway embedded fallback"),
@@ -220,6 +222,21 @@ def ensure_task_queue() -> None:
 
 def next_task_summary(limit: int = 3) -> str:
     return task_summary(WORKSPACE, limit=limit)
+
+
+def ready_tasks(*, task_type: str | None = None) -> list[dict[str, object]]:
+    tasks = [
+        task
+        for task in read_jsonl(TASKS)
+        if task.get("status", "ready") in {"ready", "rework"}
+    ]
+    if task_type is not None:
+        tasks = [task for task in tasks if str(task.get("task_type", "research")) == task_type]
+    return sorted(tasks, key=lambda task: int(task.get("priority", 0)), reverse=True)
+
+
+def ready_implementation_tasks() -> list[dict[str, object]]:
+    return ready_tasks(task_type="implementation")
 
 
 def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
@@ -1239,16 +1256,55 @@ def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) ->
     return any(pattern.lower() in text.lower() for pattern in MALFORMED_OR_TOOL_ISSUES)
 
 
+def run_supervisor_implementation_guard(
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+    reason: str,
+) -> tuple[bool, str]:
+    clean_reason = clean_tsv(reason or "implementation task did not produce safe durable evidence")
+    summary = {
+        "reason": clean_reason,
+        "target": str(task.get("target", "")),
+        "task_type": "implementation",
+        "next": "move to the next ready task; implementation can be retried after the harness/model issue is fixed",
+    }
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor implementation guard "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write(json.dumps(summary, indent=2) + "\n")
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-implementation-guard-{cycle}",
+        status="blocked",
+        target=str(task.get("target", "implementation")),
+        hypothesis=str(task.get("hypothesis", "implementation task must produce a safe source patch plus evidence")),
+        commit=current_commit(),
+        notes=clean_reason,
+    )
+    complete_supervisor_task(task, status="blocked", summary=summary, commit=current_commit())
+    return True, ""
+
+
 def run_deterministic_fallback(
     args: argparse.Namespace,
     cycle: int,
     session: str,
     selected_task: dict[str, object] | None,
     log_file: Path,
+    reason: str = "",
 ) -> tuple[bool, str]:
     if selected_task and selected_task.get("task_type") == "implementation":
-        ok, issue = run_supervisor_synthesis(args, cycle, session, log_file)
-        return ok, issue
+        return run_supervisor_implementation_guard(
+            cycle,
+            session,
+            selected_task,
+            log_file,
+            reason or "implementation model/tool failure",
+        )
     fallback_task = {
         "id": f"fallback-decode-sample-cycle-{cycle}",
         "benchmark_mode": "decode-sample",
@@ -1298,6 +1354,7 @@ def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
 
 def run_supervisor_reflection(args: argparse.Namespace, cycle: int, session: str, log_file: Path, reason: str) -> tuple[bool, str]:
     replay_result = replay_checks(WORKSPACE)
+    ready_impl = ready_implementation_tasks()
     append_jsonl(
         FINDINGS,
         {
@@ -1306,10 +1363,13 @@ def run_supervisor_reflection(args: argparse.Namespace, cycle: int, session: str
             "finding": "reflection checkpoint ran replay guards before synthesis",
             "reason": reason,
             "replay": replay_result,
+            "ready_implementation_tasks": [str(task.get("id", "")) for task in ready_impl],
         },
     )
     if not replay_result["ok"]:
         return False, f"replay guards failed: {replay_result}"
+    if ready_impl:
+        return True, "synthesis deferred because ready implementation tasks exist"
     return run_supervisor_synthesis(args, cycle, session, log_file)
 
 
@@ -1467,6 +1527,7 @@ def main() -> int:
                 current_session,
                 selected_task,
                 log_file,
+                reason=issue or str(quality["reason"]),
             )
             fallback_after = durable_snapshot()
             fallback_reasons = durable_progress(after, fallback_after)

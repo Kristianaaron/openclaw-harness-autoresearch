@@ -111,6 +111,9 @@ def main() -> int:
     assert helper.summarize_issue("TOOL RESULT CAP after 2 tool results", "", 0) == "TOOL RESULT CAP"
     assert helper.summarize_issue("Warming up Metal shaders", "", 0) == ""
     assert helper.summarize_issue("Metal out of memory while compiling", "", 0) == "metal out of memory"
+    assert helper.summarize_issue("OpenClaw model emitted malformed hidden/tool output", "", 0) == (
+        "malformed hidden/tool output"
+    )
     assert helper.early_failure_reason("EMBEDDED FALLBACK: Gateway agent failed") == "gateway embedded fallback"
     assert helper.early_failure_reason("rawError=Connection error.") == "model connection error"
     assert helper.early_failure_reason("normal bounded result") == ""
@@ -417,6 +420,35 @@ def main() -> int:
         assert ok
         assert issue == ""
         assert "supervisor-reflection" in helper.FINDINGS.read_text(encoding="utf-8")
+        stalled_impl = {
+            "id": "stalled-impl",
+            "status": "ready",
+            "task_type": "implementation",
+            "target": "openclaw/example.py",
+        }
+        helper.write_jsonl(helper.TASKS, [stalled_impl])
+        ok, issue = helper.run_supervisor_reflection(
+            synth_args,
+            10,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+            reason="ready-implementation",
+        )
+        assert ok
+        assert issue == "synthesis deferred because ready implementation tasks exist"
+        assert "stalled-impl" in helper.FINDINGS.read_text(encoding="utf-8")
+        ok, issue = helper.run_deterministic_fallback(
+            synth_args,
+            11,
+            "nightly",
+            stalled_impl,
+            Path(tmp) / "autopilot.log",
+            reason="malformed hidden/tool output",
+        )
+        assert ok
+        assert issue == ""
+        assert "supervisor-implementation-guard-11" in helper.RESULTS.read_text(encoding="utf-8")
+        assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
         tasks = [
             {
                 "id": "impl",
