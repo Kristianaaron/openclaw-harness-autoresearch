@@ -110,6 +110,8 @@ def main() -> int:
             assert "50-70 tok/s" in program
             assert "Lane B: drafter alignment" in program
             assert "DFlash compatibility" in program
+            assert "## 30 Tok/S Investigation Ladder" in program
+            assert "stop repeating that sweep" in program
             assert "z-lab/gemma-4-31B-it-DFlash" in program
             assert "## Realistic Experiment Backlog" in program
             assert "No-drafter control" in program
@@ -130,6 +132,25 @@ def main() -> int:
             assert (root / "findings.jsonl").exists()
             assert (root / "experiments.jsonl").exists()
             assert (root / "rejections.jsonl").exists()
+            tasks = helper.read_jsonl(root / "tasks.jsonl")
+            assert any(task.get("id") == "mtp-loop-overhead-map" for task in tasks)
+            assert any(task.get("id") == "janq-dflash-drafter-fit-plan" and task.get("priority") == 86 for task in tasks)
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    {
+                        "id": "drafter-block-sweep-plan",
+                        "status": "done",
+                        "priority": 78,
+                        "supervisor_action": "drafter-sweep-run",
+                    }
+                ],
+            )
+            helper.ensure_research_state(root)
+            migrated_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            assert next(task for task in migrated_tasks if task.get("id") == "drafter-block-sweep-plan")[
+                "status"
+            ] == "done"
             assert "Pre-Implementation Gate" in implementation
             assert helper.benchmark(
                 Namespace(base_url="http://127.0.0.1:1/v1", model="", quick=False, mode="prompt-size", timeout=1.0)

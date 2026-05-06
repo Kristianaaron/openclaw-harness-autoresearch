@@ -120,7 +120,7 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
         "id": "no-drafter-control",
         "status": "ready",
-        "priority": 85,
+        "priority": 90,
         "lane": "mtp-decode",
         "target": "OPENCLAW_JANG_DRAFT_MODEL",
         "hypothesis": "A no-drafter control is required to prove the assistant drafter improves wall-clock decode TPS on normal prompts.",
@@ -132,7 +132,7 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
         "id": "drafter-block-sweep-plan",
         "status": "ready",
-        "priority": 80,
+        "priority": 78,
         "lane": "mtp-decode",
         "task_type": "supervisor",
         "supervisor_action": "drafter-sweep-run",
@@ -146,7 +146,7 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
         "id": "janq-dflash-drafter-fit-plan",
         "status": "ready",
-        "priority": 78,
+        "priority": 86,
         "lane": "drafter-alignment",
         "task_type": "supervisor",
         "supervisor_action": "drafter-fit-plan",
@@ -159,7 +159,7 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
     {
         "id": "drafter-calibration-review",
         "status": "ready",
-        "priority": 70,
+        "priority": 84,
         "lane": "drafter-alignment",
         "task_type": "supervisor",
         "supervisor_action": "focused-test",
@@ -168,6 +168,17 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "metric": "acceptance_delta",
         "guard_checks": ["tests_pass", "memory_ok", "no_model_change"],
         "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+    },
+    {
+        "id": "mtp-loop-overhead-map",
+        "status": "ready",
+        "priority": 76,
+        "lane": "runtime-overhead",
+        "target": "openclaw/openclaw-jang-vlm-server.py",
+        "hypothesis": "Reaching 30+ tok/s likely requires reducing MTP verification/cache/rollback overhead after block-size tuning converges.",
+        "metric": "decode_tps_delta",
+        "guard_checks": ["one_narrow_tool", "no_live_profile_change", "tests_before_patch"],
+        "next_action": "read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-jang-vlm-server.py and identify the MTP loop boundaries",
     },
 )
 
@@ -346,6 +357,8 @@ def ensure_research_state(root: Path) -> None:
             if not migration:
                 continue
             for key, value in migration.items():
+                if key == "status" and value == "ready" and task.get("status") not in {"ready", "rework"}:
+                    continue
                 if task.get(key) != value:
                     task[key] = value
                     changed = True
@@ -591,6 +604,15 @@ Objective: improve real decode tokens/sec for the current Gemma 4 31B JANG/JANQ 
 1. Decode TPS will improve only if MTP acceptance rises enough to beat drafter overhead on normal prompts.
 2. The best next experiments are no-drafter control, block-size sweep, drafter quantization/calibration, and log-based `mean_accept` analysis.
 3. Rapid-MLX or MLX/VLM loop changes matter only if they reduce verification/drafter overhead without changing the selected target model.
+
+## 30 Tok/S Ladder
+
+1. Lock the honest baseline: live MTP, no-drafter control, and block-size sweep on the same prompt set.
+2. Stop repeating exhausted block-size sweeps once block 2 remains the winner; move to acceptance and overhead diagnostics.
+3. Raise acceptance: JANQ-specific drafter fit, calibration, quantization, and prompt-class-specific rejection analysis.
+4. Reduce overhead: inspect MTP verify/cache/rollback loop boundaries and propose only small tested patches.
+5. Explore step-change paths: DFlash compatibility and Rapid/MLX upstream gaps, but only after structural checks and replay guards.
+6. Promote nothing to normal TUI chat unless paired benchmarks improve decode TPS and tool/thinking/stream/memory guards pass.
 
 ## Rejected Or Exhausted
 

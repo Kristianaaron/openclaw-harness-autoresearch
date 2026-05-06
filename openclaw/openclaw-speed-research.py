@@ -607,6 +607,20 @@ Frontier proposal areas include:
 - Benchmark design: separating decode wall time from prefill, extracting `mtp_rounds` and `mean_accept` from logs, and comparing against no-drafter baseline.
 
 For every frontier idea, record: expected decode TPS impact, expected acceptance impact, feasibility, reliability risk, files/upstream projects involved, smallest prototype, and rollback path. Promote only ideas with a plausible path to a tested OpenClaw patch.
+
+## 30 Tok/S Investigation Ladder
+
+The harness should climb this ladder autonomously instead of repeatedly proving the same block-size result:
+
+1. Baseline honestly: live MTP decode, no-drafter control, and block-size sweep on the same deterministic prompt set.
+2. Converge or reject easy knobs: if block size 2 remains the winner and block sizes 1/3/4 are slower or invalid, stop repeating that sweep except as an occasional regression check.
+3. Diagnose the bottleneck: decide whether the current limit is low acceptance, drafter cost, target verification cost, cache rollback, Python loop overhead, proxy buffering, or memory pressure.
+4. Raise acceptance: investigate JANQ-specific drafter fit, calibration targets beyond `pre_projection.weight`, quantization, logit/sampling settings, and prompt-class-specific rejection patterns.
+5. Reduce overhead: inspect the exact MLX/VLM MTP loop boundaries and propose only small patches that reduce verification/cache/rollback work while preserving streaming/tool/reasoning guards.
+6. Explore step-change paths: DFlash and Rapid/MLX compatibility are frontier lanes, not assumptions. Prove structural compatibility first, then canary, then benchmark, then promote only if normal TUI decode improves.
+7. Promote safely: no live TUI change is kept unless paired benchmarks beat the current block-2 baseline and replay checks pass for tool calls, reasoning separation, stream stalls, and memory.
+
+If a rung is exhausted, record the evidence and move upward. Do not spend overnight cycles re-running a settled rung unless a new source change makes the old evidence stale.
 """
 
 
