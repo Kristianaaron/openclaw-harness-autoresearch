@@ -74,9 +74,21 @@ DEFAULT_BENCHMARK_MANIFEST: dict[str, Any] = {
     },
 }
 DEFAULT_INSIGHT_RUBRIC: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "required_fields": ["cause", "evidence", "proposed_change", "expected_metric_delta", "risk", "rollback"],
     "min_score_for_candidate": 5,
+    "promotion_required_fields": [
+        "measurement_quality",
+        "server_decode_tps",
+        "wall_decode_tps",
+        "promotion_gate",
+    ],
+    "reviewer_rules": [
+        "Do not credit polluted wall-clock decode rows as model decode regressions.",
+        "Separate backend server_tok_s from user-visible wall decode TPS.",
+        "Treat repeated GEPA canaries as a signal to promote one narrow rubric change or suppress the lane.",
+        "Prefer deterministic source/log mappers over LLM-led broad inspection for runtime-overhead work.",
+    ],
 }
 DEFAULT_REPLAY_CASES: tuple[dict[str, Any], ...] = (
     {
@@ -98,6 +110,16 @@ DEFAULT_REPLAY_CASES: tuple[dict[str, Any], ...] = (
         "id": "memory-pressure-breaker",
         "failure": "Metal/Python crash risk during long local 31B turns",
         "guard": "active memory circuit breaker stops unsafe turns",
+    },
+    {
+        "id": "contaminated-decode-wall-clock",
+        "failure": "proxy/tool recovery wall time was misread as backend decode speed",
+        "guard": "reviewer separates server_tok_s from contaminated wall_decode_tps and routes runtime-overhead",
+    },
+    {
+        "id": "repeated-gepa-canary-promotion",
+        "failure": "GEPA canaries accumulated without improving the reviewer rubric",
+        "guard": "three matching canaries promote one deterministic rubric delta or suppress further canaries",
     },
 )
 
@@ -182,11 +204,13 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "status": "ready",
         "priority": 76,
         "lane": "runtime-overhead",
+        "task_type": "supervisor",
+        "supervisor_action": "runtime-overhead-map",
         "target": "openclaw/openclaw-jang-vlm-server.py",
         "hypothesis": "Reaching 30+ tok/s likely requires reducing MTP verification/cache/rollback overhead after block-size tuning converges.",
         "metric": "decode_tps_delta",
         "guard_checks": ["one_narrow_tool", "no_live_profile_change", "tests_before_patch"],
-        "next_action": "read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-jang-vlm-server.py and identify the MTP loop boundaries",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
     },
 )
 
@@ -284,11 +308,31 @@ TASK_MIGRATIONS: dict[str, dict[str, Any]] = {
         "status": "blocked",
         "blocked_reason": "superseded by live Gemma 4 assistant drafter baseline and decode/MTP tasks",
     },
+    "mtp-loop-overhead-map": {
+        "status": "ready",
+        "task_type": "supervisor",
+        "supervisor_action": "runtime-overhead-map",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+    },
+    "review-mtp-loop-overhead-next": {
+        "status": "ready",
+        "task_type": "supervisor",
+        "supervisor_action": "runtime-overhead-map",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+    },
 }
 
 
 def clean_tsv(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
+
+
+def string_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if str(item).strip()]
+    return []
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -339,6 +383,7 @@ def ensure_research_state(root: Path) -> None:
         "journal.jsonl",
         "trajectory-corpus.jsonl",
         "gepa-candidates.jsonl",
+        "gepa-promotions.jsonl",
         "hypothesis-rank.jsonl",
         "promotion-decisions.jsonl",
         "causal-reviews.jsonl",
@@ -705,6 +750,49 @@ def parse_note_fields(notes: str) -> dict[str, str]:
     return fields
 
 
+def decode_measurement_signal(row: dict[str, str]) -> dict[str, Any]:
+    fields = parse_note_fields(row.get("notes", ""))
+    wall_decode = parse_float(row.get("decode_tps"))
+    wall_s = parse_float(row.get("wall_s"))
+    server_decode = parse_float(fields.get("server_tok_s"))
+    server_elapsed = parse_float(fields.get("server_elapsed_s"))
+    explicit_quality = fields.get("measurement_quality", "")
+    contaminated_reasons: list[str] = []
+    if explicit_quality == "contaminated":
+        contaminated_reasons.append("explicit-contaminated")
+    if wall_decode is not None and server_decode is not None and wall_decode > 0 and server_decode / wall_decode >= 2.0:
+        contaminated_reasons.append("server-wall-tps-gap")
+    if wall_s is not None and server_elapsed is not None and server_elapsed > 0 and wall_s / server_elapsed >= 2.0:
+        contaminated_reasons.append("server-wall-time-gap")
+    if "fallback" in row.get("run_id", "") or "fallback" in row.get("hypothesis", ""):
+        contaminated_reasons.append("fallback-benchmark")
+    quality = "contaminated" if contaminated_reasons else "clean"
+    if explicit_quality == "clean":
+        quality = "clean"
+        contaminated_reasons = []
+    return {
+        "quality": quality,
+        "contaminated": quality == "contaminated",
+        "reasons": contaminated_reasons,
+        "wall_decode_tps": wall_decode,
+        "server_decode_tps": server_decode,
+        "server_elapsed_s": server_elapsed,
+        "wall_s": wall_s,
+        "draft_block_size": fields.get("draft_block_size", ""),
+        "mean_accept": parse_float(fields.get("mean_accept")),
+        "mtp_rounds": parse_float(fields.get("mtp_rounds")),
+    }
+
+
+def decode_metric_value(row: dict[str, str], *, prefer_server_for_contaminated: bool = True) -> float | None:
+    signal = decode_measurement_signal(row)
+    wall = signal.get("wall_decode_tps")
+    server = signal.get("server_decode_tps")
+    if signal.get("contaminated") and prefer_server_for_contaminated and server is not None:
+        return float(server)
+    return float(wall) if wall is not None else None
+
+
 def infer_journal_action(run_id: str, status: str, target: str, notes: str) -> str:
     text = f"{run_id} {status} {target} {notes}".lower()
     if "rework" in text:
@@ -876,7 +964,14 @@ def gepa_escalation_report(
         artifact_suspected=bool(artifact.get("artifact_suspected")),
         exhausted_count=len(exhausted),
     )
+    promoted_targets = {
+        str(row.get("target", ""))
+        for row in read_jsonl(root / "gepa-promotions.jsonl")[-5:]
+        if row.get("promoted")
+    }
     needed = bool(triggers)
+    if target in promoted_targets:
+        needed = False
     trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
     candidate_id = f"gepa-policy-canary-{slugify(target)}-{slugify(trigger_signature)}"
     candidate = {
@@ -915,7 +1010,11 @@ def gepa_escalation_report(
         "trajectory_cases": len(trajectory),
         "exhausted_lanes": sorted(exhausted),
         "measurement_artifact": artifact,
-        "next": "write_canary_candidate" if needed else "continue_default_supervisor_route",
+        "next": (
+            "continue_default_supervisor_route_after_recent_policy_promotion"
+            if target in promoted_targets
+            else ("write_canary_candidate" if needed else "continue_default_supervisor_route")
+        ),
     }
 
 
@@ -1010,6 +1109,116 @@ def write_gepa_policy_canary(root: Path, task: dict[str, Any]) -> dict[str, Any]
     return {"ok": True, "path": str(path), **payload}
 
 
+def gepa_policy_promotion_report(root: Path, *, min_candidates: int = 3) -> dict[str, Any]:
+    ensure_research_state(root)
+    candidates = read_jsonl(root / "gepa-candidates.jsonl")
+    promotions = read_jsonl(root / "gepa-promotions.jsonl")
+    promoted_candidate_paths = {
+        str(path)
+        for promotion in promotions
+        for path in promotion.get("candidate_paths", [])
+    }
+    by_target: dict[str, list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        path = str(candidate.get("path", ""))
+        if path in promoted_candidate_paths:
+            continue
+        target = str((candidate.get("candidate") or {}).get("target") or candidate.get("target") or "")
+        if target:
+            by_target.setdefault(target, []).append(candidate)
+    target = ""
+    target_candidates: list[dict[str, Any]] = []
+    for candidate_target, rows in sorted(by_target.items(), key=lambda item: len(item[1]), reverse=True):
+        if len(rows) >= min_candidates:
+            target = candidate_target
+            target_candidates = rows
+            break
+    if not target:
+        return {
+            "ok": True,
+            "kind": "gepa-policy-promotion",
+            "promoted": False,
+            "reason": f"waiting for {min_candidates} unpromoted GEPA candidates on one target",
+            "candidate_counts": {key: len(value) for key, value in sorted(by_target.items())},
+        }
+    if target != "insight-rubric.json":
+        return {
+            "ok": True,
+            "kind": "gepa-policy-promotion",
+            "promoted": False,
+            "target": target,
+            "reason": "only insight-rubric.json can be deterministically promoted without a source patch",
+            "candidate_count": len(target_candidates),
+        }
+    rubric_path = root / "insight-rubric.json"
+    try:
+        rubric = json.loads(rubric_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        rubric = dict(DEFAULT_INSIGHT_RUBRIC)
+    if not isinstance(rubric, dict):
+        rubric = dict(DEFAULT_INSIGHT_RUBRIC)
+    try:
+        current_version = int(rubric.get("version") or 1)
+    except (TypeError, ValueError):
+        current_version = 1
+    try:
+        current_min_score = int(rubric.get("min_score_for_candidate") or 5)
+    except (TypeError, ValueError):
+        current_min_score = 5
+    promoted_rubric = {
+        **rubric,
+        "version": max(current_version, 2),
+        "min_score_for_candidate": max(current_min_score, 5),
+        "required_fields": sorted(
+            set([*string_list(rubric.get("required_fields")), *DEFAULT_INSIGHT_RUBRIC["required_fields"]])
+        ),
+        "promotion_required_fields": DEFAULT_INSIGHT_RUBRIC["promotion_required_fields"],
+        "reviewer_rules": sorted(
+            set([*string_list(rubric.get("reviewer_rules")), *DEFAULT_INSIGHT_RUBRIC["reviewer_rules"]])
+        ),
+        "reject_if": sorted(
+            set(
+                [
+                    *string_list(rubric.get("reject_if")),
+                    "wall_decode_tps_only_when_measurement_quality_is_contaminated",
+                    "decode_claim_missing_server_tok_s",
+                    "repeated_gepa_canary_without_policy_delta",
+                    "runtime_overhead_task_without_source_map",
+                ]
+            )
+        ),
+    }
+    rubric_path.write_text(json.dumps(promoted_rubric, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "ok": True,
+        "kind": "gepa-policy-promotion",
+        "promoted": True,
+        "target": target,
+        "candidate_count": len(target_candidates),
+        "candidate_paths": [str(item.get("path", "")) for item in target_candidates],
+        "rubric_path": str(rubric_path),
+        "policy_delta": {
+            "measurement_quality_required_for_promotion": True,
+            "server_wall_decode_split": True,
+            "repeated_canary_suppression": True,
+            "runtime_overhead_source_map_required": True,
+        },
+    }
+    append_jsonl(root / "gepa-promotions.jsonl", payload)
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": payload["timestamp"],
+            "task_id": "gepa-policy-promotion",
+            "finding": "supervisor promoted repeated GEPA canaries into one deterministic reviewer rubric update",
+            "evidence": payload,
+            "next": "continue_ranked_queue",
+        },
+    )
+    return payload
+
+
 def stddev(values: list[float]) -> float:
     if len(values) < 2:
         return 0.0
@@ -1022,24 +1231,29 @@ def group_decode_samples(rows: list[dict[str, str]]) -> dict[str, list[float]]:
     for row in rows:
         if row.get("status") != "keep" or row.get("target") != "decode-sample":
             continue
-        value = parse_float(row.get("decode_tps"))
+        signal = decode_measurement_signal(row)
+        if signal["contaminated"]:
+            continue
+        value = signal["wall_decode_tps"]
         if value is None:
             continue
-        fields = parse_note_fields(row.get("notes", ""))
-        variant = fields.get("draft_block_size") or fields.get("variant") or "default"
+        variant = signal["draft_block_size"] or parse_note_fields(row.get("notes", "")).get("variant") or "default"
         groups.setdefault(variant, []).append(value)
     return groups
 
 
-def latest_decode_mean(root: Path, *, recent_rows: int = 80) -> float | None:
+def latest_decode_mean(root: Path, *, recent_rows: int = 80, include_contaminated: bool = False) -> float | None:
     rows = all_result_rows(root)[-max(1, recent_rows) :]
-    values = [
-        float(value)
-        for row in rows
-        if row.get("status") == "keep"
-        and row.get("target") == "decode-sample"
-        and (value := parse_float(row.get("decode_tps"))) is not None
-    ]
+    values: list[float] = []
+    for row in rows:
+        if row.get("status") != "keep" or row.get("target") != "decode-sample":
+            continue
+        signal = decode_measurement_signal(row)
+        if signal["contaminated"] and not include_contaminated:
+            continue
+        value = decode_metric_value(row, prefer_server_for_contaminated=True)
+        if value is not None:
+            values.append(value)
     return mean(values)
 
 
@@ -1211,15 +1425,28 @@ def causal_review_report(root: Path, *, recent_rows: int = 160) -> dict[str, Any
     rows = all_result_rows(root)
     recent = rows[-max(1, recent_rows) :]
     decisions = read_jsonl(root / "promotion-decisions.jsonl")[-40:]
-    decode_values = [
-        value
+    contaminated = [
+        row
         for row in recent
         if row.get("status") == "keep"
         and row.get("target") == "decode-sample"
-        and (value := parse_float(row.get("decode_tps"))) is not None
+        and decode_measurement_signal(row)["contaminated"]
     ]
+    decode_values: list[float] = []
+    server_values: list[float] = []
+    for row in recent:
+        if row.get("status") != "keep" or row.get("target") != "decode-sample":
+            continue
+        signal = decode_measurement_signal(row)
+        if signal["contaminated"]:
+            if signal["server_decode_tps"] is not None:
+                server_values.append(float(signal["server_decode_tps"]))
+            continue
+        if signal["wall_decode_tps"] is not None:
+            decode_values.append(float(signal["wall_decode_tps"]))
     current_mean = mean(decode_values[-5:])
     previous_mean = mean(decode_values[-10:-5]) if len(decode_values) >= 10 else None
+    current_server_mean = mean(server_values[-5:])
     delta = None
     if current_mean is not None and previous_mean is not None:
         delta = round(current_mean - previous_mean, 3)
@@ -1237,10 +1464,14 @@ def causal_review_report(root: Path, *, recent_rows: int = 160) -> dict[str, Any
         "decision_count": len(decisions),
         "current_decode_mean": current_mean,
         "previous_decode_mean": previous_mean,
+        "current_server_decode_mean": current_server_mean,
         "decode_delta": delta,
         "regression_suspected": regression,
+        "contaminated_decode_rows": len(contaminated),
         "low_confidence_kept": [str(item.get("task_id", "")) for item in risky_kept[-5:]],
-        "next": "route_rework_or_remeasure" if regression or risky_kept else "continue_ranked_queue",
+        "next": "route_rework_or_remeasure" if regression or risky_kept else (
+            "route_runtime_overhead" if contaminated else "continue_ranked_queue"
+        ),
     }
 
 
@@ -1290,16 +1521,33 @@ def measurement_artifact_analysis(root: Path, *, recent_rows: int = 160) -> dict
     blocked_or_discarded = [row for row in rows if row.get("status") in {"blocked", "discard"}]
     decode_notes = [parse_note_fields(row.get("notes", "")) for row in blocked_or_discarded]
     shared_winner_blocks = [fields.get("winner_block") for fields in decode_notes if fields.get("winner_block")]
+    decode_rows = [row for row in rows if row.get("status") == "keep" and row.get("target") == "decode-sample"]
+    signals = [decode_measurement_signal(row) for row in decode_rows]
+    contaminated = [signal for signal in signals if signal["contaminated"]]
+    server_values = [float(signal["server_decode_tps"]) for signal in signals if signal.get("server_decode_tps") is not None]
+    clean_wall_values = [
+        float(signal["wall_decode_tps"])
+        for signal in signals
+        if not signal["contaminated"] and signal.get("wall_decode_tps") is not None
+    ]
     artifact = False
     reason = ""
     if len(shared_winner_blocks) >= 3 and len(set(shared_winner_blocks[-3:])) == 1:
         artifact = True
         reason = "last three blocked/discarded experiments share the same winner; remeasure baseline before crediting a variant"
+    if len(contaminated) >= 3:
+        artifact = True
+        reason = "recent decode rows are contaminated by proxy/tool recovery; use server_tok_s for model speed and route wall delay to runtime-overhead"
     return {
         "ok": True,
         "artifact_suspected": artifact,
         "reason": reason,
         "shared_winner_blocks": shared_winner_blocks[-5:],
+        "contaminated_decode_rows": len(contaminated),
+        "clean_decode_rows": len(clean_wall_values),
+        "mean_clean_wall_decode_tps": mean(clean_wall_values),
+        "mean_server_decode_tps": mean(server_values),
+        "max_server_decode_tps": round(max(server_values), 3) if server_values else None,
     }
 
 

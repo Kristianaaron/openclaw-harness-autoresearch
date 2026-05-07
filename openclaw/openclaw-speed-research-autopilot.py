@@ -423,6 +423,15 @@ def is_supervisor_gepa_policy_canary_task(task: dict[str, object] | None) -> boo
     )
 
 
+def is_supervisor_runtime_overhead_map_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "runtime-overhead-map"
+        or "openclaw-speed-research runtime-overhead-map" in str(task.get("next_action", ""))
+    )
+
+
 def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -732,6 +741,7 @@ def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready:
 def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
     started = time.monotonic()
     last_reason = ""
+    stopped_model = False
     while True:
         snap = memory_snapshot()
         ready = model_ready()
@@ -740,6 +750,23 @@ def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
             return True, ""
         last_reason = f"memory gate waiting: {reason}"
         if args.max_memory_wait_seconds > 0 and time.monotonic() - started >= args.max_memory_wait_seconds:
+            if args.memory_stop_model_after_wait and ready and not stopped_model:
+                log(f"memory recovery stopping OpenClaw-owned model after wait budget: {last_reason}")
+                subprocess.run(
+                    [
+                        "/bin/zsh",
+                        "-lc",
+                        "fpath=(/Users/kristian/.zfunc $fpath); autoload -Uz openclaw; openclaw model-stop",
+                    ],
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                    check=False,
+                )
+                stopped_model = True
+                started = time.monotonic()
+                continue
             return False, f"{last_reason}; exceeded {args.max_memory_wait_seconds:.0f}s wait budget"
         log(
             last_reason
@@ -1957,6 +1984,44 @@ def run_supervisor_gepa_policy_canary_task(
     return 0, ""
 
 
+def run_supervisor_runtime_overhead_map_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "runtime-overhead-map", "--recent-rows", str(args.review_recent_rows)]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor runtime overhead map "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=45,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR RUNTIME OVERHEAD MAP TIMEOUT\n")
+            return 124, "supervisor runtime overhead map timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor runtime overhead map exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
     if is_gateway_issue(text) and "recovered" not in text.lower():
@@ -2077,6 +2142,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     )
     commands.append([args.research_helper_bin, "hypothesis-rank", "--limit", str(args.hypothesis_rank_limit)])
     commands.append([args.research_helper_bin, "causal-review", "--recent-rows", str(args.review_recent_rows)])
+    commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
     commands.append(
         [
             args.research_helper_bin,
@@ -2212,6 +2278,12 @@ def main() -> int:
         help="record a blocked row and continue recovery after memory remains unsafe for this long",
     )
     parser.add_argument(
+        "--memory-stop-model-after-wait",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_STOP_MODEL_AFTER_MEMORY_WAIT", "1") != "0",
+        help="stop the OpenClaw-owned local model once memory stays unsafe beyond the wait budget",
+    )
+    parser.add_argument(
         "--rotate-session-after-stalls",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_ROTATE_AFTER_STALLS", "3")),
@@ -2313,6 +2385,8 @@ def main() -> int:
             code, issue = run_supervisor_focused_test_task(cycle, current_session, selected_task, log_file)
         elif is_supervisor_gepa_policy_canary_task(selected_task):
             code, issue = run_supervisor_gepa_policy_canary_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_runtime_overhead_map_task(selected_task):
+            code, issue = run_supervisor_runtime_overhead_map_task(args, cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):
             code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
         elif is_supervisor_benchmark_task(selected_task):

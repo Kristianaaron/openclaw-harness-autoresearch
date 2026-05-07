@@ -288,7 +288,9 @@ def main() -> int:
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
             assert benchmark_data["mtp"]["mean_accept"] == 0.75
+            assert benchmark_data["measurement_quality"] == "clean"
             assert "mean_accept=0.75" in (root / "results.tsv").read_text(encoding="utf-8")
+            assert "server_elapsed_s=6.0" in (root / "results.tsv").read_text(encoding="utf-8")
             sweep_run_paths = list((root / "experiments").glob("mtp-drafter-sweep-run-*.json"))
             assert sweep_run_paths
             sweep_run = json.loads(sweep_run_paths[-1].read_text(encoding="utf-8"))
@@ -322,8 +324,29 @@ def main() -> int:
             assert review["target_tps"] == 30.0
             assert "variance" in review
             assert review["gates"]["no_measurement_artifact"] is True
+            assert review["gates"]["no_contaminated_wall_clock"] is True
             assert "mtp-decode" in (root / "exhausted-approaches.jsonl").read_text(encoding="utf-8")
             assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            with (root / "results.tsv").open("a", encoding="utf-8") as file:
+                for index in range(3):
+                    file.write(
+                        f"2026-05-05T00:12:0{index}+0000\tfallback-decode-{index}\tkeep\t"
+                        "decode-sample\tdeterministic fallback benchmark\t\t\t1.9\t50.0\t4.0\tabc123\t"
+                        "model=local completion_tokens=96 token_source=usage.completion_tokens "
+                        "server_tok_s=15.7 server_elapsed_s=6.1 measurement_quality=contaminated\n"
+                    )
+            assert helper.quality_review(
+                Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+            ) == 0
+            contaminated_review = json.loads(sorted((root / "benchmarks").glob("quality-review-*.json"))[-1].read_text())
+            assert contaminated_review["contaminated_decode_rows"] >= 3
+            assert contaminated_review["mean_server_decode_tps"] >= 15.7
+            assert contaminated_review["gates"]["no_contaminated_wall_clock"] is False
+            assert "runtime-overhead-map" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert helper.runtime_overhead_map(Namespace(recent_rows=80)) == 0
+            overhead = json.loads(sorted((root / "benchmarks").glob("runtime-overhead-map-*.json"))[-1].read_text())
+            assert overhead["contaminated_decode_rows"] >= 3
+            assert overhead["max_server_decode_tps"] >= 15.7
             assert helper.frontier_review(Namespace(recent_rows=80, min_samples=3)) == 0
             frontier_paths = list((root / "benchmarks").glob("frontier-review-*.json"))
             assert frontier_paths
@@ -348,6 +371,21 @@ def main() -> int:
             assert "GEPA policy candidates remain canary-only" in (root / "gepa-candidates.jsonl").read_text(
                 encoding="utf-8"
             )
+            assert helper.gepa_policy_promote(Namespace(min_candidates=99)) == 0
+            assert root.joinpath("results.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")[2] == "keep"
+            for index in range(3):
+                helper.append_jsonl(
+                    root / "gepa-candidates.jsonl",
+                    {
+                        "path": f"/tmp/gepa-{index}.json",
+                        "candidate": {"target": "insight-rubric.json"},
+                        "promotion": {"auto_promote": False},
+                    },
+                )
+            assert helper.gepa_policy_promote(Namespace(min_candidates=3)) == 0
+            promoted_rubric = json.loads((root / "insight-rubric.json").read_text(encoding="utf-8"))
+            assert "measurement_quality" in promoted_rubric["promotion_required_fields"]
+            assert "decode_claim_missing_server_tok_s" in promoted_rubric["reject_if"]
             assert helper.hypothesis_rank(Namespace(limit=5)) == 0
             rank_paths = list((root / "benchmarks").glob("hypothesis-rank-*.json"))
             assert rank_paths

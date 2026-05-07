@@ -28,9 +28,11 @@ from openclaw_speed_research_core import (
     benchmark_result_schema_ok,
     benchmark_spec,
     causal_review_report,
+    decode_measurement_signal,
     ensure_research_state,
     exhausted_lanes,
     gepa_escalation_report,
+    gepa_policy_promotion_report,
     mark_lane_exhausted,
     measurement_artifact_analysis,
     load_benchmark_manifest,
@@ -1195,18 +1197,30 @@ def quality_review(args: argparse.Namespace) -> int:
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     blocked = [row for row in recent if row.get("status") == "blocked"]
+    decode_signals = [
+        decode_measurement_signal(row)
+        for row in recent
+        if row.get("status") == "keep" and row.get("target") == "decode-sample"
+    ]
+    contaminated_signals = [signal for signal in decode_signals if signal["contaminated"]]
+    clean_signals = [signal for signal in decode_signals if not signal["contaminated"]]
+    server_decode_values = [
+        float(signal["server_decode_tps"])
+        for signal in decode_signals
+        if signal.get("server_decode_tps") is not None
+    ]
     decode_by_block: dict[str, list[float]] = {}
     for row in recent:
         if row.get("status") != "keep" or row.get("target") != "decode-sample":
             continue
-        fields = parse_note_fields(row.get("notes", ""))
-        block = fields.get("draft_block_size", "")
+        signal = decode_measurement_signal(row)
+        if signal["contaminated"]:
+            continue
+        block = signal["draft_block_size"]
         if not block:
             continue
-        try:
-            decode_by_block.setdefault(block, []).append(float(row.get("decode_tps", "")))
-        except ValueError:
-            continue
+        if signal["wall_decode_tps"] is not None:
+            decode_by_block.setdefault(block, []).append(float(signal["wall_decode_tps"]))
     block_summary = {
         block: {
             "samples": len(values),
@@ -1267,6 +1281,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
         "variance_significant_best": bool(variance.get("significant_best")),
         "no_measurement_artifact": not bool(artifact_check.get("artifact_suspected")),
+        "no_contaminated_wall_clock": not contaminated_signals,
     }
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
@@ -1284,6 +1299,26 @@ def quality_review(args: argparse.Namespace) -> int:
     if artifact_check.get("artifact_suspected"):
         quality_score -= 25
         recommendations.append(f"measurement artifact suspected: {artifact_check.get('reason')}; remeasure baseline before promotion.")
+    if contaminated_signals:
+        quality_score -= min(30, len(contaminated_signals) * 5)
+        recommendations.append(
+            "contaminated wall-clock decode rows detected; separate backend server_tok_s from proxy/tool recovery latency."
+        )
+        seeded_tasks.append(
+            {
+                "id": "runtime-overhead-contamination-map",
+                "status": "ready",
+                "priority": 95,
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "Server decode is healthy while wall-clock decode is polluted by proxy/tool recovery; map the exact runtime overhead boundary.",
+                "metric": "server_wall_decode_gap",
+                "guard_checks": ["no_live_profile_change", "no_model_turn_required", "no_opencode_changes"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+            }
+        )
     if variance.get("groups") and not variance.get("significant_best"):
         quality_score -= 10
         recommendations.append("variance gate: best decode result has not cleared the observed noise band; keep measuring or change hypothesis.")
@@ -1296,11 +1331,13 @@ def quality_review(args: argparse.Namespace) -> int:
                     "status": "ready",
                     "priority": 94,
                     "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
                     "target": "openclaw/openclaw-jang-vlm-server.py",
                     "hypothesis": "Repeated block-2 wins mean the next plausible path to 30+ tok/s is reducing MTP verification/cache/rollback overhead.",
                     "metric": "decode_tps_delta",
                     "guard_checks": ["one_narrow_tool", "no_live_profile_change", "tests_before_patch"],
-                    "next_action": "read exactly /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-jang-vlm-server.py and map the MTP loop overhead boundaries",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
                 },
                 {
                     "id": "review-janq-drafter-fit-next",
@@ -1331,6 +1368,8 @@ def quality_review(args: argparse.Namespace) -> int:
     if blocked:
         review_status = "blocked"
         recommendations.append(f"recent run has {len(blocked)} blocked rows; inspect the last blocker before trusting speed conclusions.")
+    if contaminated_signals and "runtime-overhead" in frontier_ready:
+        review_status = "blocked"
     if plateau_below_target and frontier_ready:
         recommendations.append(
             f"plateau detected below {args.target_tps} tok/s; prioritize frontier lanes={','.join(frontier_ready)} over more block sweeps."
@@ -1386,6 +1425,12 @@ def quality_review(args: argparse.Namespace) -> int:
         "best_block": best_block,
         "best_mean_decode_tps": best_mean,
         "best_max_decode_tps": best_max,
+        "mean_clean_wall_decode_tps": mean_float(
+            [float(signal["wall_decode_tps"]) for signal in clean_signals if signal.get("wall_decode_tps") is not None]
+        ),
+        "mean_server_decode_tps": mean_float(server_decode_values),
+        "max_server_decode_tps": round(max(server_decode_values), 3) if server_decode_values else None,
+        "contaminated_decode_rows": len(contaminated_signals),
         "target_tps": float(args.target_tps),
         "quality_score": max(0, quality_score),
         "verdict": verdict,
@@ -1424,6 +1469,8 @@ def quality_review(args: argparse.Namespace) -> int:
             f"recent_rows={len(recent)} blocked={len(blocked)} sweeps={len(sweep_rows)} "
             f"verdict={verdict} score={max(0, quality_score)} best_block={best_block} "
             f"best_mean_tps={best_mean if best_mean is not None else ''} "
+            f"mean_server_tps={artifact['mean_server_decode_tps'] if artifact['mean_server_decode_tps'] is not None else ''} "
+            f"contaminated={len(contaminated_signals)} "
             f"repeated_block2={repeated_block2} seeded_tasks={seeded} "
             f"recommendation={recommendations[0]}"
         ),
@@ -1584,6 +1631,100 @@ def gepa_policy_canary(args: argparse.Namespace) -> int:
     return 0
 
 
+def gepa_policy_promote(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    report = gepa_policy_promotion_report(root, min_candidates=args.min_candidates)
+    timestamp = int(time.time())
+    path = root / "benchmarks" / f"gepa-policy-promotion-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"gepa-policy-promotion-{timestamp}",
+        status="keep" if report.get("ok") else "blocked",
+        target="autoresearch-gepa-policy-promotion",
+        hypothesis="repeated GEPA canaries should become one deterministic reviewer rubric update instead of accumulating",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"promoted={report.get('promoted')} target={report.get('target', '')} "
+            f"candidate_count={report.get('candidate_count', '')} reason={report.get('reason', '')}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
+def runtime_overhead_map(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    repo = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))
+    source = repo / "openclaw" / "openclaw-jang-vlm-server.py"
+    try:
+        lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        print(json.dumps({"ok": False, "reason": f"source unavailable: {error}"}, indent=2))
+        return 2
+    keywords = ("mtp", "draft", "cache", "rollback", "stream", "tool", "generate", "max_tokens")
+    hits: list[dict[str, Any]] = []
+    for index, line in enumerate(lines, start=1):
+        lower = line.lower()
+        matched = [keyword for keyword in keywords if keyword in lower]
+        if matched:
+            hits.append({"line": index, "keywords": matched[:4], "text": line.strip()[:180]})
+    rows = result_rows(root)[-max(1, args.recent_rows) :]
+    decode_rows = [row for row in rows if row.get("status") == "keep" and row.get("target") == "decode-sample"]
+    signals = [decode_measurement_signal(row) for row in decode_rows]
+    contaminated = [signal for signal in signals if signal["contaminated"]]
+    clean_wall = [float(signal["wall_decode_tps"]) for signal in signals if not signal["contaminated"] and signal.get("wall_decode_tps") is not None]
+    server = [float(signal["server_decode_tps"]) for signal in signals if signal.get("server_decode_tps") is not None]
+    report = {
+        "ok": True,
+        "kind": "runtime-overhead-map",
+        "timestamp": int(time.time()),
+        "source": str(source),
+        "source_hits": hits[:80],
+        "hit_count": len(hits),
+        "decode_rows": len(decode_rows),
+        "contaminated_decode_rows": len(contaminated),
+        "mean_clean_wall_decode_tps": mean_float(clean_wall),
+        "mean_server_decode_tps": mean_float(server),
+        "max_server_decode_tps": round(max(server), 3) if server else None,
+        "diagnosis": (
+            "server decode is materially faster than user-visible wall decode; prioritize proxy/tool recovery, "
+            "stream guard, and MTP loop overhead boundaries before more block-size sweeps"
+            if contaminated
+            else "no recent contaminated decode rows; inspect MTP loop overhead only after a fresh paired benchmark"
+        ),
+        "next": "source_patch_only_if_specific_boundary_has_testable_overhead_reduction",
+    }
+    path = root / "benchmarks" / f"runtime-overhead-map-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "runtime-overhead-map",
+            "finding": "supervisor mapped source and metric boundaries for runtime overhead without an LLM-led broad inspection",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"runtime-overhead-map-{report['timestamp']}",
+        status="keep",
+        target="runtime-overhead-map",
+        hypothesis="deterministic source/log mapping should route contaminated wall-clock decode into the right implementation lane",
+        commit=current_commit(repo),
+        notes=(
+            f"contaminated={len(contaminated)} mean_server_tps={report['mean_server_decode_tps']} "
+            f"mean_clean_wall_tps={report['mean_clean_wall_decode_tps']} hit_count={len(hits)}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
 def hypothesis_rank(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -1643,6 +1784,22 @@ def causal_review(args: argparse.Namespace) -> int:
                 "benchmark_mode": "decode-sample",
                 "guard_checks": ["memory_ok", "no_reasoning_leak", "no_sse_timeout"],
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+            }
+        )
+    if int(report.get("contaminated_decode_rows") or 0) >= 3:
+        repair_tasks.append(
+            {
+                "id": f"causal-runtime-overhead-map-{timestamp}",
+                "status": "ready",
+                "priority": 96,
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "Repeated contaminated decode rows require a runtime/proxy overhead map before more speed conclusions.",
+                "metric": "server_wall_decode_gap",
+                "guard_checks": ["no_live_profile_change", "no_model_turn_required", "no_opencode_changes"],
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
             }
         )
     for task_id in report.get("low_confidence_kept", []):
@@ -2881,6 +3038,24 @@ def benchmark(args: argparse.Namespace) -> int:
     after_memory = memory_snapshot()
     mtp = parse_generation_log_metrics(read_since(active_log, log_offset))
     decode_tps = round(completion_tokens / wall_s, 3) if mode == "decode-sample" and wall_s > 0 else ""
+    server_elapsed = mtp.get("elapsed_s") if isinstance(mtp, dict) else ""
+    server_tok_s = mtp.get("server_tok_s") if isinstance(mtp, dict) else ""
+    measurement_quality = "clean"
+    contamination_reasons: list[str] = []
+    if mode == "decode-sample" and isinstance(decode_tps, (int, float)) and server_tok_s not in {"", None}:
+        try:
+            if float(server_tok_s) / max(float(decode_tps), 0.001) >= 2.0:
+                contamination_reasons.append("server-wall-tps-gap")
+        except (TypeError, ValueError):
+            pass
+    if mode == "decode-sample" and server_elapsed not in {"", None}:
+        try:
+            if float(wall_s) / max(float(server_elapsed), 0.001) >= 2.0:
+                contamination_reasons.append("server-wall-time-gap")
+        except (TypeError, ValueError):
+            pass
+    if contamination_reasons:
+        measurement_quality = "contaminated"
     result = {
         "ok": True,
         "model": model,
@@ -2898,6 +3073,8 @@ def benchmark(args: argparse.Namespace) -> int:
         "memory_after_mb": after_memory,
         "draft_block_size": args.draft_block_size if args.draft_block_size else "",
         "mtp": mtp,
+        "measurement_quality": measurement_quality,
+        "contamination_reasons": contamination_reasons,
         "content_preview": str(content)[:120],
         "timestamp": int(time.time()),
     }
@@ -2940,8 +3117,11 @@ def benchmark(args: argparse.Namespace) -> int:
             f"prompt_class={spec.get('prompt_class', 'unknown')} "
             f"draft_block_size={args.draft_block_size or ''} "
             f"server_tok_s={mtp.get('server_tok_s', '')} "
+            f"server_elapsed_s={mtp.get('elapsed_s', '')} "
             f"mtp_rounds={mtp.get('mtp_rounds', '')} "
             f"mean_accept={mtp.get('mean_accept', '')} "
+            f"measurement_quality={measurement_quality} "
+            f"contamination_reasons={','.join(contamination_reasons)} "
             f"preview={str(content)[:40].replace(chr(9), ' ').replace(chr(10), ' ')}"
         ),
     )
@@ -3065,6 +3245,14 @@ def main() -> int:
     gepa_canary = sub.add_parser("gepa-policy-canary")
     gepa_canary.add_argument("--task-id", default="")
     gepa_canary.set_defaults(func=gepa_policy_canary)
+
+    gepa_promote = sub.add_parser("gepa-policy-promote")
+    gepa_promote.add_argument("--min-candidates", type=int, default=3)
+    gepa_promote.set_defaults(func=gepa_policy_promote)
+
+    overhead = sub.add_parser("runtime-overhead-map")
+    overhead.add_argument("--recent-rows", type=int, default=160)
+    overhead.set_defaults(func=runtime_overhead_map)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)

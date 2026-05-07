@@ -118,6 +118,12 @@ def main() -> int:
     assert helper.is_supervisor_gepa_policy_canary_task(
         {"task_type": "supervisor", "supervisor_action": "gepa-policy-canary"}
     )
+    assert helper.is_supervisor_runtime_overhead_map_task(
+        {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"}
+    )
+    assert helper.is_supervisor_runtime_overhead_map_task(
+        {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map"}
+    )
     assert not helper.is_supervisor_benchmark_task(
         {
             "benchmark_mode": "decode-sample",
@@ -699,6 +705,7 @@ def main() -> int:
         assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
         assert "hypothesis-rank --limit 12" in review_log
         assert "causal-review --recent-rows 120" in review_log
+        assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
