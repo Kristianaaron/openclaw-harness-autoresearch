@@ -397,7 +397,7 @@ def memory_pressure_block_reason(snapshot: dict[str, int] | None = None) -> str 
     recovered_pressure_pct = int_env("OPENCLAW_MODEL_RECOVERED_PRESSURE_FREE_PCT", DEFAULT_RECOVERED_PRESSURE_FREE_PCT)
     if free_mb and free_mb < min_free_mb:
         return f"free_mb={free_mb}<{min_free_mb}"
-    recovered = free_mb >= recovered_free_mb and pressure_free_pct >= recovered_pressure_pct
+    recovered = pressure_free_pct >= recovered_pressure_pct and (free_mb >= min_free_mb or min_free_mb <= 0)
     if not recovered and compressor_mb >= max_compressor_mb:
         return f"compressor_mb={compressor_mb}>={max_compressor_mb}"
     if not recovered and swap_used_mb >= max_swap_mb:

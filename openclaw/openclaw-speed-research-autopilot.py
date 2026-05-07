@@ -905,8 +905,9 @@ def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready:
     min_free_mb = args.ready_min_free_mb if ready else args.min_free_mb
     min_pressure_free_pct = int(getattr(args, "min_pressure_free_pct", 0) or 0)
     recovered = bool(
-        snap.get("free_mb", 0) >= getattr(args, "recovered_free_mb", 12288)
+        ready
         and snap.get("pressure_free_pct", 0) >= getattr(args, "recovered_pressure_free_pct", 20)
+        and snap.get("free_mb", 0) >= min_free_mb
     )
     if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
         return (
@@ -972,8 +973,8 @@ def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int])
     swap_limit = args.active_max_swap_mb or args.max_swap_mb
     min_pressure_free_pct = int(getattr(args, "active_min_pressure_free_pct", 0) or 0)
     recovered = bool(
-        snap.get("free_mb", 0) >= getattr(args, "recovered_free_mb", 12288)
-        and snap.get("pressure_free_pct", 0) >= getattr(args, "recovered_pressure_free_pct", 20)
+        snap.get("pressure_free_pct", 0) >= getattr(args, "recovered_pressure_free_pct", 20)
+        and snap.get("free_mb", 0) >= args.active_min_free_mb
     )
     if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
         return (

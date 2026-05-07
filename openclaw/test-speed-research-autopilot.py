@@ -214,6 +214,9 @@ def check_memory_and_failure_guards(helper) -> None:
     assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=9000MB>=8192MB")
     recovered_snap = {"free_mb": 24000, "compressor_mb": 21000, "swap_used_mb": 10500, "pressure_free_pct": 62}
     assert helper.memory_gate_reason(args, recovered_snap, ready=True) == ""
+    resident_recovered_snap = {"free_mb": 450, "compressor_mb": 18942, "swap_used_mb": 12600, "pressure_free_pct": 65}
+    assert helper.memory_gate_reason(args, resident_recovered_snap, ready=True) == ""
+    assert helper.memory_gate_reason(args, resident_recovered_snap, ready=False).startswith("compressor=18942MB")
     low_free_resident = {"free_mb": 99, "compressor_mb": 2088, "swap_used_mb": 1559}
     assert helper.memory_gate_reason(args, low_free_resident, ready=True) == ""
     active_args = Namespace(
@@ -239,6 +242,7 @@ def check_memory_and_failure_guards(helper) -> None:
         {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 9000},
     ).startswith("swap=9000MB")
     assert helper.active_memory_circuit_reason(active_args, recovered_snap) == ""
+    assert helper.active_memory_circuit_reason(active_args, resident_recovered_snap) == ""
     assert helper.active_memory_circuit_reason(
         active_args,
         {"free_mb": 77, "compressor_mb": 1000, "swap_used_mb": 0},
