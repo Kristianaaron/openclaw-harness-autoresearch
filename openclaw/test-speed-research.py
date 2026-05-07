@@ -381,6 +381,17 @@ def main() -> int:
             assert clean_routed
             assert clean_routed[0]["id"].startswith("deliberate-drafter-fit-plan-")
             assert "openclaw-drafter-fit plan" in clean_routed[0]["next_action"]
+            with (root / "results.tsv").open("a", encoding="utf-8") as file:
+                file.write(
+                    "2026-05-05T00:12:00+0000\tsupervisor-drafter-fit-unit\tkeep\t"
+                    "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json\t"
+                    "unit drafter plan\t\t\t\t\t\tabc123\t"
+                    "decision=ready-for-target-generated-trace-data output=plan.json min_speedup=1.35 min_accept=2.25\n"
+                )
+            trace_routed = helper.synthesis_deliberate_action_tasks(root, helper.result_rows(root), 123457)
+            assert trace_routed
+            assert trace_routed[0]["id"].startswith("deliberate-drafter-trace-gate-")
+            assert "openclaw-speed-research drafter-trace-gate" in trace_routed[0]["next_action"]
             assert helper.quality_review(
                 Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
             ) == 0
@@ -514,14 +525,14 @@ def main() -> int:
             helper.write_jsonl(root / "tasks.jsonl", exhausted_tasks)
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "deliberate-drafter-fit-plan-" in deliberate_tasks
+            assert "deliberate-drafter-trace-gate-" in deliberate_tasks
             assert "deliberate_actions" in (root / "findings.jsonl").read_text(encoding="utf-8")
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
             assert eval_paths
             eval_report = json.loads(eval_paths[-1].read_text(encoding="utf-8"))
             assert eval_report["scores"]["karpathy_core_loop"] >= 8.0
-            assert "deliberate-drafter-fit-plan-" in "\n".join(eval_report["deterministic_ready_tasks"])
+            assert "deliberate-drafter-trace-gate-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "frontier-repair-measurement-artifact-" in repair_tasks

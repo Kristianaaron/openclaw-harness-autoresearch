@@ -111,6 +111,13 @@ def check_prompt_and_routing_guards(helper) -> None:
             "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
         }
     )
+    assert helper.is_supervisor_drafter_trace_gate_task(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-trace-gate",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-gate --plan plan.json",
+        }
+    )
     assert helper.is_supervisor_focused_test_task(
         {"task_type": "supervisor", "supervisor_action": "focused-test"}
     )
@@ -125,6 +132,9 @@ def check_prompt_and_routing_guards(helper) -> None:
     )
     assert helper.task_runs_without_model(
         {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"}
+    )
+    assert helper.task_runs_without_model(
+        {"task_type": "supervisor", "supervisor_action": "drafter-trace-gate"}
     )
     assert helper.task_runs_without_model({"benchmark_mode": "decode-sample"})
     assert not helper.task_runs_without_model(
@@ -673,6 +683,38 @@ def main() -> int:
         assert issue == ""
         assert fit_plan.exists()
         assert "supervisor-drafter-fit-9" in helper.RESULTS.read_text(encoding="utf-8")
+        trace_helper = Path(tmp) / "trace-helper.py"
+        trace_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok': True, 'status': 'blocked', 'reason': 'target-generated-trace-data-missing'}))\n",
+            encoding="utf-8",
+        )
+        trace_helper.chmod(0o700)
+        trace_args = Namespace(research_helper_bin=str(trace_helper))
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "trace-gate",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-trace-gate",
+                    "target": str(fit_plan),
+                    "hypothesis": "validate JANQ trace data",
+                }
+            ],
+        )
+        code, issue = helper.run_supervisor_drafter_trace_gate_task(
+            trace_args,
+            10,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == "target-generated-trace-data-missing"
+        assert helper.read_jsonl(helper.TASKS)[0]["status"] == "blocked"
         patch_helper = Path(tmp) / "patch-helper.py"
         patch_helper.write_text(
             "#!/usr/bin/env python3\n"

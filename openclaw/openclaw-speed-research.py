@@ -1273,6 +1273,50 @@ def drafter_fit_task(timestamp: int, *, task_id: str, priority: int = 95) -> dic
     }
 
 
+def drafter_trace_gate_task(timestamp: int, *, task_id: str, priority: int = 96) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-trace-gate",
+        "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+        "hypothesis": (
+            "The JANQ drafter-fit plan is complete; progress now depends on target-generated trace data "
+            "or a clear blocked handoff, not another planning pass."
+        ),
+        "metric": "drafter_fit_gate",
+        "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "The supervisor records whether target-generated trace data exists and names the next calibration gate.",
+        "rollback": "No runtime rollback needed; this is a read-only trace-data readiness gate.",
+        "next_action": (
+            "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-gate "
+            "--plan /Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json"
+        ),
+    }
+
+
+def recent_drafter_fit_plan_ready(root: Path, *, recent_rows: int = 160) -> bool:
+    for row in result_rows(root)[-max(1, recent_rows) :]:
+        if row.get("status") != "keep":
+            continue
+        run_id = row.get("run_id", "")
+        if not run_id.startswith("supervisor-drafter-fit-"):
+            continue
+        if parse_note_fields(row.get("notes", "")).get("decision") == "ready-for-target-generated-trace-data":
+            return True
+    return False
+
+
+def recent_drafter_trace_gate(root: Path, *, recent_rows: int = 80) -> bool:
+    return any(
+        row.get("run_id", "").startswith("drafter-trace-gate-")
+        or row.get("run_id", "").startswith("supervisor-drafter-trace-gate-")
+        for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
 def dflash_compatibility_task(timestamp: int, *, task_id: str, priority: int = 93) -> dict[str, Any]:
     return {
         "id": task_id,
@@ -1308,6 +1352,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     below_practical_floor = decode_mean is None or decode_mean < 20
     recent_mtp_report = recent_result_has_prefix(root, "mtp-report-", recent_rows=30)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=45)
+    drafter_plan_ready = recent_drafter_fit_plan_ready(root, recent_rows=160)
 
     if not recent_mtp_report and should_seed_action(root, "deliberate-mtp-report-", recent_rows=30):
         tasks.append(
@@ -1350,7 +1395,14 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
                 }
             )
             return tasks
-        if should_seed_action(root, "deliberate-drafter-fit-plan-", recent_rows=35):
+        if drafter_plan_ready:
+            if (
+                not active_task_has_prefix(root, "deliberate-drafter-trace-gate-")
+                and not recent_drafter_trace_gate(root, recent_rows=80)
+            ):
+                tasks.append(drafter_trace_gate_task(timestamp, task_id=f"deliberate-drafter-trace-gate-{timestamp}"))
+                return tasks
+        elif should_seed_action(root, "deliberate-drafter-fit-plan-", recent_rows=120):
             task = drafter_fit_task(timestamp, task_id=f"deliberate-drafter-fit-plan-{timestamp}")
             if clean_runtime_maps:
                 task["hypothesis"] = (
@@ -2254,6 +2306,90 @@ def runtime_overhead_map(args: argparse.Namespace) -> int:
         ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0
+
+
+def drafter_trace_gate(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    plan_path = Path(args.plan).expanduser()
+    trace_candidates = [Path(args.trace_data).expanduser()] if args.trace_data else []
+    env_trace = os.environ.get("OPENCLAW_DRAFTER_TRACE_DATA", "")
+    if env_trace and not trace_candidates:
+        trace_candidates.append(Path(env_trace).expanduser())
+    if not trace_candidates:
+        trace_candidates.append(home() / "drafter-fit" / "target-generated-traces.jsonl")
+    if not args.trace_data:
+        for path in (
+            home() / "drafter-fit" / "target-generated-trace-data.jsonl",
+            home() / "drafter-fit" / "janq-target-traces.jsonl",
+        ):
+            if path not in trace_candidates:
+                trace_candidates.append(path)
+    plan: dict[str, Any] = {}
+    errors: list[str] = []
+    if not plan_path.exists():
+        errors.append(f"missing_plan={plan_path}")
+    else:
+        try:
+            with plan_path.open("r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if isinstance(loaded, dict):
+                plan = loaded
+            else:
+                errors.append("plan_not_json_object")
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"plan_read_error={type(error).__name__}")
+    decision = str(plan.get("decision", ""))
+    traces = [path for path in trace_candidates if path.exists() and path.stat().st_size > 0]
+    status = "keep" if decision == "ready-for-target-generated-trace-data" and traces and not errors else "blocked"
+    if errors:
+        reason = ",".join(errors)
+    elif decision != "ready-for-target-generated-trace-data":
+        reason = f"plan_decision_not_ready:{decision or 'missing'}"
+    elif not traces:
+        reason = "target-generated-trace-data-missing"
+    else:
+        reason = "target-generated-trace-data-present"
+    report = {
+        "ok": True,
+        "status": status,
+        "reason": reason,
+        "plan": str(plan_path),
+        "plan_decision": decision,
+        "trace_candidates": [str(path) for path in trace_candidates],
+        "trace_data": [str(path) for path in traces],
+        "next_action": (
+            "collect_target_generated_trace_data"
+            if status == "blocked"
+            else "run_candidate_drafter_calibration_canary"
+        ),
+    }
+    timestamp = int(time.time())
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-trace-gate",
+            "status": status,
+            "artifact": str(plan_path),
+            "target": "janq-drafter-fit-trace-data",
+            "report": report,
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-trace-gate-{timestamp}",
+        status=status,
+        target="janq-drafter-fit-trace-data",
+        hypothesis="Drafter-fit planning must advance to trace data or block explicitly instead of repeating plan generation.",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"decision={reason} plan_decision={decision} "
+            f"trace_files={len(traces)} next={report['next_action']}"
+        ),
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
 
@@ -4095,6 +4231,14 @@ def main() -> int:
     overhead = sub.add_parser("runtime-overhead-map")
     overhead.add_argument("--recent-rows", type=int, default=160)
     overhead.set_defaults(func=runtime_overhead_map)
+
+    trace_gate = sub.add_parser("drafter-trace-gate")
+    trace_gate.add_argument(
+        "--plan",
+        default="/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+    )
+    trace_gate.add_argument("--trace-data", default="")
+    trace_gate.set_defaults(func=drafter_trace_gate)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)

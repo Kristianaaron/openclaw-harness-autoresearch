@@ -1460,6 +1460,7 @@ def task_risk_level(task: dict[str, Any]) -> str:
     if "no_live_profile_change" in guards or "canary_only" in guards or task.get("supervisor_action") in {
         "gepa-policy-canary",
         "drafter-fit-plan",
+        "drafter-trace-gate",
     }:
         return "low"
     if "restore_live_profile" in guards or "memory_gate" in guards or "tests_pass" in guards:

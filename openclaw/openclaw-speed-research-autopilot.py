@@ -491,6 +491,15 @@ def is_supervisor_drafter_fit_task(task: dict[str, object] | None) -> bool:
     )
 
 
+def is_supervisor_drafter_trace_gate_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-trace-gate"
+        or "openclaw-speed-research drafter-trace-gate" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_focused_test_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -541,6 +550,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_implementation_bridge_task,
             is_supervisor_patch_execute_task,
             is_supervisor_drafter_fit_task,
+            is_supervisor_drafter_trace_gate_task,
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
             is_supervisor_runtime_overhead_map_task,
@@ -2052,6 +2062,59 @@ def run_supervisor_drafter_fit_task(
     return 0, ""
 
 
+def run_supervisor_drafter_trace_gate_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    plan = str(task.get("target") or DEFAULT_DRAFTER_FIT_PLAN)
+    cmd = [args.research_helper_bin, "drafter-trace-gate", "--plan", plan]
+    trace_data = str(task.get("trace_data", ""))
+    if trace_data:
+        cmd.extend(["--trace-data", trace_data])
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter trace gate "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER TRACE GATE TIMEOUT\n")
+            return 124, "supervisor drafter trace gate timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor drafter trace gate exit {result.returncode}")
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-trace-gate-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-trace-gate")),
+            hypothesis=str(task.get("hypothesis", "validate JANQ target-generated trace data")),
+            commit=current_commit(),
+            notes=reason,
+        )
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    status = "keep" if parsed.get("status") == "keep" else "blocked"
+    reason = str(parsed.get("reason") or "trace gate completed")
+    complete_supervisor_task(task, status=status, summary=parsed, commit=current_commit())
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_focused_test_task(
     cycle: int,
     session: str,
@@ -2695,6 +2758,8 @@ def main() -> int:
             continue
         if is_supervisor_drafter_fit_task(selected_task):
             code, issue = run_supervisor_drafter_fit_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_trace_gate_task(selected_task):
+            code, issue = run_supervisor_drafter_trace_gate_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):
             code, issue = run_supervisor_drafter_sweep_plan(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_mtp_report_task(selected_task):
