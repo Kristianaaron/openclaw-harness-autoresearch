@@ -7,8 +7,11 @@ module owns the durable research memory that makes those turns purposeful.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import platform
 import re
 import time
 from pathlib import Path
@@ -21,6 +24,7 @@ RESULTS_HEADER = (
 )
 BENCHMARK_MANIFEST_VERSION = 1
 RESEARCH_PROFILE_VERSION = 2
+EVALUATOR_POLICY_VERSION = 1
 GEPA_POLICY_TARGETS = (
     "program.md",
     "STRATEGY.md",
@@ -28,6 +32,32 @@ GEPA_POLICY_TARGETS = (
     "implementation-skill.md",
     "tasks.jsonl",
 )
+IMMUTABLE_EVALUATOR_PATHS = (
+    "benchmark-manifest.json",
+    "replay-buffer.jsonl",
+)
+EVALUATOR_APPROVAL_REQUIRED_PATHS = (
+    "insight-rubric.json",
+    "research-profile.json",
+    "program.md",
+    "implementation-skill.md",
+)
+DEFAULT_EVALUATOR_POLICY: dict[str, Any] = {
+    "version": EVALUATOR_POLICY_VERSION,
+    "kind": "openclaw-autoresearch-evaluator-policy",
+    "principle": (
+        "Karpathy-style autoresearch keeps the evaluator honest: benchmarks and replay guards "
+        "are frozen by default; policy/rubric changes require canary, replay, and explicit promotion."
+    ),
+    "immutable_paths": list(IMMUTABLE_EVALUATOR_PATHS),
+    "approval_required_paths": list(EVALUATOR_APPROVAL_REQUIRED_PATHS),
+    "allowed_policy_paths": list(GEPA_POLICY_TARGETS),
+    "allowed_evaluator_mutation_routes": [
+        "gepa-policy-canary",
+        "gepa-policy-promote",
+        "patch-execute-with-architectural-approval",
+    ],
+}
 DEFAULT_BENCHMARK_MANIFEST: dict[str, Any] = {
     "version": BENCHMARK_MANIFEST_VERSION,
     "locked": True,
@@ -159,6 +189,16 @@ DEFAULT_REPLAY_CASES: tuple[dict[str, Any], ...] = (
         "id": "repeated-gepa-canary-promotion",
         "failure": "GEPA canaries accumulated without improving the reviewer rubric",
         "guard": "three matching canaries promote one deterministic rubric delta or suppress further canaries",
+    },
+    {
+        "id": "immutable-evaluator-policy",
+        "failure": "agent improves score by moving benchmark/replay goalposts instead of improving OpenClaw",
+        "guard": "benchmark manifest and replay buffer are hashed and immutable outside explicit policy routes",
+    },
+    {
+        "id": "plateau-pivot-state",
+        "failure": "overnight loop repeats settled measurements after easy knobs plateau below target",
+        "guard": "supervisor pivots from repeat measurement to drafter-fit, DFlash compatibility, runtime overhead, or exhaustion report",
     },
 )
 
@@ -404,11 +444,110 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def sha256_file(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def evaluator_hashes(root: Path) -> dict[str, str]:
+    paths = [*IMMUTABLE_EVALUATOR_PATHS, *EVALUATOR_APPROVAL_REQUIRED_PATHS]
+    return {name: sha256_file(root / name) for name in paths if (root / name).exists()}
+
+
+def write_evaluator_policy(root: Path) -> None:
+    policy_path = root / "evaluator-policy.json"
+    payload = {**DEFAULT_EVALUATOR_POLICY, "baseline_hashes": evaluator_hashes(root)}
+    if policy_path.exists():
+        try:
+            existing = json.loads(policy_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+        if isinstance(existing, dict) and existing.get("version") == payload["version"]:
+            baseline = existing.get("baseline_hashes")
+            if isinstance(baseline, dict) and all(baseline.get(path) for path in IMMUTABLE_EVALUATOR_PATHS):
+                return
+    policy_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def evaluator_integrity_report(root: Path) -> dict[str, Any]:
+    policy_path = root / "evaluator-policy.json"
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        policy = DEFAULT_EVALUATOR_POLICY
+    baseline = policy.get("baseline_hashes", {}) if isinstance(policy, dict) else {}
+    current = evaluator_hashes(root)
+    immutable_changes = []
+    for name in IMMUTABLE_EVALUATOR_PATHS:
+        old = str(baseline.get(name, ""))
+        new = str(current.get(name, ""))
+        if old and new and old != new:
+            immutable_changes.append(name)
+    approval_changes = []
+    for name in EVALUATOR_APPROVAL_REQUIRED_PATHS:
+        old = str(baseline.get(name, ""))
+        new = str(current.get(name, ""))
+        if old and new and old != new:
+            approval_changes.append(name)
+    return {
+        "ok": not immutable_changes,
+        "policy_path": str(policy_path),
+        "immutable_changes": immutable_changes,
+        "approval_required_changes": approval_changes,
+        "current_hashes": current,
+    }
+
+
+def selected_env() -> dict[str, str]:
+    prefixes = ("OPENCLAW_", "MLX_", "PYTHON", "HF_HOME")
+    denied = ("TOKEN", "SECRET", "PASSWORD", "KEY")
+    values: dict[str, str] = {}
+    for key, value in sorted(os.environ.items()):
+        if not key.startswith(prefixes):
+            continue
+        if any(term in key.upper() for term in denied):
+            values[key] = "<redacted>"
+        else:
+            values[key] = value[:240]
+    return values
+
+
+def environment_snapshot(root: Path, *, label: str = "cycle", commit: str = "unknown") -> dict[str, Any]:
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    snapshot = {
+        "ok": True,
+        "kind": "environment-snapshot",
+        "timestamp": timestamp,
+        "label": label,
+        "commit": commit,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "research_profile_hash": sha256_file(root / "research-profile.json"),
+        "benchmark_manifest_hash": sha256_file(root / "benchmark-manifest.json"),
+        "insight_rubric_hash": sha256_file(root / "insight-rubric.json"),
+        "evaluator_integrity": evaluator_integrity_report(root),
+        "env": selected_env(),
+    }
+    snapshot_dir = root / "snapshots"
+    snapshot_dir.mkdir(exist_ok=True)
+    path = snapshot_dir / f"environment-{timestamp}-{slugify(label) or 'cycle'}.json"
+    snapshot["path"] = str(path)
+    path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(root / "environment-snapshots.jsonl", snapshot)
+    return snapshot
+
+
 def ensure_research_state(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "benchmarks").mkdir(exist_ok=True)
     (root / "logs").mkdir(exist_ok=True)
     (root / "experiments").mkdir(exist_ok=True)
+    (root / "snapshots").mkdir(exist_ok=True)
     if not (root / "results.tsv").exists():
         (root / "results.tsv").write_text(RESULTS_HEADER, encoding="utf-8")
     else:
@@ -426,6 +565,7 @@ def ensure_research_state(root: Path) -> None:
         "hypothesis-rank.jsonl",
         "promotion-decisions.jsonl",
         "causal-reviews.jsonl",
+        "environment-snapshots.jsonl",
     ):
         path = root / name
         if not path.exists():
@@ -437,6 +577,7 @@ def ensure_research_state(root: Path) -> None:
     write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
     write_json_if_missing_or_stale(root / "research-profile.json", DEFAULT_RESEARCH_PROFILE, "version")
     ensure_replay_buffer(root / "replay-buffer.jsonl")
+    write_evaluator_policy(root)
     tasks_path = root / "tasks.jsonl"
     if not tasks_path.exists() or tasks_path.stat().st_size == 0:
         write_jsonl(tasks_path, [dict(task) for task in DEFAULT_TASKS])
@@ -639,13 +780,15 @@ def replay_checks(root: Path) -> dict[str, Any]:
         and str(task.get("target", "")).startswith("OPENCLAW_JANG_DRAFT_")
         and "restore_live_profile" not in {str(item) for item in task.get("guard_checks", [])}
     ]
-    passed = not bad_decode and not short_decode and not unsafe_profile_tasks
+    integrity = evaluator_integrity_report(root)
+    passed = not bad_decode and not short_decode and not unsafe_profile_tasks and integrity["ok"]
     return {
         "ok": passed,
         "bad_decode_rows": bad_decode,
         "short_decode_rows": short_decode,
         "legacy_decode_rows_ignored": legacy_decode,
         "unsafe_profile_tasks": unsafe_profile_tasks,
+        "evaluator_integrity": integrity,
         "cases": [row["id"] for row in DEFAULT_REPLAY_CASES],
     }
 
@@ -1353,6 +1496,15 @@ def task_contract_issues(root: Path, task: dict[str, Any]) -> dict[str, Any]:
 
     target = str(task.get("target", "")).lower()
     next_action = str(task.get("next_action", "")).lower()
+    route = f"{task.get('supervisor_action', '')} {next_action}".lower()
+    immutable_targets = {path.lower() for path in IMMUTABLE_EVALUATOR_PATHS}
+    approval_targets = {path.lower() for path in EVALUATOR_APPROVAL_REQUIRED_PATHS}
+    if any(path in target or path in next_action for path in immutable_targets):
+        if not any(term in route for term in ("gepa-policy", "patch-execute")):
+            blockers.append("immutable evaluator path requires explicit policy route")
+    if any(path in target or path in next_action for path in approval_targets):
+        if not any(term in route for term in ("gepa-policy", "patch-execute", "synthesize")):
+            warnings.append("evaluator policy path should use canary/promotion gates")
     scope = profile.get("scope", {})
     if not isinstance(scope, dict):
         scope = {}

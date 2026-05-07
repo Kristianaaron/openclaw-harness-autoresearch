@@ -30,6 +30,8 @@ from openclaw_speed_research_core import (
     causal_review_report,
     decode_measurement_signal,
     ensure_research_state,
+    environment_snapshot,
+    evaluator_integrity_report,
     exhausted_lanes,
     gepa_escalation_report,
     gepa_policy_promotion_report,
@@ -486,6 +488,7 @@ Before marking a change `keep`, verify:
 - The test would fail without the change.
 - The deployment path is explicit.
 - The benchmark or blocker is recorded.
+- The environment snapshot and evaluator-integrity gates pass.
 - A staged diff secret scan found no `.env`, tokens, passwords, keys, private config, or sensitive logs.
 
 ## Rollback
@@ -521,6 +524,12 @@ Each cycle follows one exact state transition:
 `select task -> source/evidence check -> baseline -> probe or patch -> focused test -> benchmark -> analyze -> keep/discard/rework`
 
 Progress requires a quality artifact: `STRATEGY.md`, `findings.jsonl`, `experiments.jsonl`, `rejections.jsonl`, `tasks.jsonl`, benchmark JSON with comparison, source patch with tests, or a blocker with evidence.
+
+The supervisor owns three non-negotiable honesty gates:
+
+- Environment snapshot: record commit, profile hashes, evaluator hashes, and redacted runtime env before autonomous work.
+- Immutable evaluator policy: benchmark definitions and replay guards are frozen unless a canary/promote route explicitly changes policy.
+- Plateau pivot: once a rung is settled below target, stop repeating it and move to drafter fit, DFlash compatibility, runtime overhead, or an exhaustion report.
 
 Do not ask the user to continue after each experiment. Do not ask the user to manually test unless permissions or hardware state make testing impossible.
 """
@@ -635,6 +644,16 @@ The harness should climb this ladder autonomously instead of repeatedly proving 
 7. Promote safely: no live TUI change is kept unless paired benchmarks beat the current block-2 baseline and replay checks pass for tool calls, reasoning separation, stream stalls, and memory.
 
 If a rung is exhausted, record the evidence and move upward. Do not spend overnight cycles re-running a settled rung unless a new source change makes the old evidence stale.
+
+## Karpathy Compatibility Layer
+
+This workspace keeps Karpathy's native loop structure while adapting it to OpenClaw:
+
+- Human-written policy remains in Markdown: `program.md`, `STRATEGY.md`, and `implementation-skill.md`.
+- The evaluator is frozen: `benchmark-manifest.json` and `replay-buffer.jsonl` define the scoring surface and must not drift during a run.
+- Experiments are fixed-budget and measurable: every kept or rejected change needs a bounded benchmark, test, or blocker row.
+- Keep/discard is mechanical: safe improvements can move forward, failures are recorded and rolled back, and architectural patches wait for explicit approval.
+- The supervisor may add deterministic structure around the loop, but it must not hide failures behind model narration.
 """
 
 
@@ -1778,6 +1797,15 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     handoff_audit_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
     ]
+    environment_snapshot_rows = [
+        row for row in active_recent if row.get("run_id", "").startswith("environment-snapshot-")
+    ]
+    evaluator_integrity_rows = [
+        row for row in active_recent if row.get("run_id", "").startswith("evaluator-integrity-")
+    ]
+    plateau_pivot_rows = [
+        row for row in active_recent if row.get("run_id", "").startswith("plateau-pivot-")
+    ]
     quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
     latest_quality_notes = quality_rows[-1].get("notes", "") if quality_rows else ""
     latest_quality_fields = parse_note_fields(latest_quality_notes)
@@ -1811,6 +1839,26 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         gaps.append("replay guards are failing")
     else:
         strengths.append("replay guards pass")
+    replay_integrity = replay.get("evaluator_integrity") if isinstance(replay, dict) else {}
+    if isinstance(replay_integrity, dict) and replay_integrity.get("ok") is False:
+        scores["karpathy_core_loop"] -= 1.4
+        scores["research_quality"] -= 1.0
+        gaps.append("immutable evaluator integrity failed")
+    if environment_snapshot_rows:
+        scores["crash_memory_safety"] += 0.2
+        scores["modularity"] += 0.1
+        strengths.append("environment snapshots record run context and evaluator hashes")
+    if evaluator_integrity_rows:
+        scores["karpathy_core_loop"] += 0.2
+        scores["crash_memory_safety"] += 0.2
+        strengths.append("frozen evaluator integrity is checked during review")
+    if plateau_pivot_rows:
+        latest_plateau = parse_note_fields(plateau_pivot_rows[-1].get("notes", ""))
+        if latest_plateau.get("state") == "pivot":
+            scores["karpathy_core_loop"] += 0.3
+            scores["research_quality"] += 0.3
+            scores["self_improvement"] += 0.2
+            strengths.append("plateau-pivot state machine routes settled sweeps to higher-upside lanes")
     if memory_blocks:
         scores["crash_memory_safety"] -= min(1.2, len(memory_blocks) * 0.25)
         gaps.append(f"recent memory/Metal blockers still present={len(memory_blocks)}")
@@ -1885,6 +1933,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_empty_synthesis_rows": len(empty_synthesis),
         "recent_bridge_zero_rows": len(bridge_zero),
         "recent_handoff_audit_rows": len(handoff_audit_rows),
+        "recent_environment_snapshots": len(environment_snapshot_rows),
+        "recent_evaluator_integrity_rows": len(evaluator_integrity_rows),
+        "recent_plateau_pivot_rows": len(plateau_pivot_rows),
         "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
         "historical_debt": {
@@ -2788,6 +2839,164 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
     return 0 if ok else 2
+
+
+def environment_snapshot_command(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    commit = current_commit(Path(args.repo or repo_root()))
+    snapshot = environment_snapshot(root, label=args.label, commit=commit)
+    append_result(
+        root,
+        run_id=f"environment-snapshot-{snapshot['timestamp']}",
+        status="keep" if snapshot["evaluator_integrity"]["ok"] else "blocked",
+        target="autoresearch-environment",
+        hypothesis="each autonomous run should record the exact evaluator, profile, env, and commit it used",
+        commit=commit,
+        notes=(
+            f"label={args.label} integrity_ok={snapshot['evaluator_integrity']['ok']} "
+            f"immutable_changes={len(snapshot['evaluator_integrity']['immutable_changes'])} "
+            f"path={snapshot['path']}"
+        ),
+    )
+    print(json.dumps(snapshot, indent=2, sort_keys=True))
+    return 0 if snapshot["evaluator_integrity"]["ok"] or args.allow_fail else 2
+
+
+def evaluator_integrity_command(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    report = evaluator_integrity_report(root)
+    timestamp = int(time.time())
+    path = root / "benchmarks" / f"evaluator-integrity-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "evaluator-integrity",
+            "finding": "supervisor checked that frozen evaluator files were not moved during autoresearch",
+            "evidence": report,
+            "next": "continue" if report["ok"] else "repair evaluator drift before research",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"evaluator-integrity-{timestamp}",
+        status="keep" if report["ok"] else "blocked",
+        target="autoresearch-evaluator-integrity",
+        hypothesis="the autoresearch evaluator should stay frozen unless a gated policy route changes it",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"ok={report['ok']} immutable_changes={len(report['immutable_changes'])} "
+            f"approval_required_changes={len(report['approval_required_changes'])} path={path}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if report["ok"] or args.allow_fail else 2
+
+
+def plateau_pivot(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    rows = result_rows(root)[-max(1, int(args.recent_rows)) :]
+    sweep_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
+    ]
+    sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
+    keep_current = [fields for fields in sweep_fields if fields.get("decision") == "keep-current"]
+    block2_wins = [fields for fields in sweep_fields if fields.get("winner_block") == "2"]
+    decode_mean = latest_decode_mean(root, recent_rows=int(args.recent_rows))
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready_lanes = {
+        str(task.get("lane", ""))
+        for task in tasks
+        if task.get("status", "ready") in {"ready", "rework"} and task.get("lane")
+    }
+    plateau = (
+        len(sweep_rows) >= int(args.min_sweeps)
+        and len(keep_current) >= int(args.min_sweeps)
+        and len(block2_wins) >= int(args.min_sweeps)
+        and decode_mean is not None
+        and decode_mean < float(args.target_tps)
+    )
+    timestamp = int(time.time())
+    seeded_tasks: list[dict[str, Any]] = []
+    if plateau:
+        if "drafter-alignment" not in ready_lanes and should_seed_action(root, "plateau-drafter-fit-", recent_rows=40):
+            seeded_tasks.append(drafter_fit_task(timestamp, task_id=f"plateau-drafter-fit-{timestamp}", priority=97))
+        if "frontier-dflash" not in ready_lanes and should_seed_action(root, "plateau-dflash-compat-", recent_rows=40):
+            seeded_tasks.append(
+                dflash_compatibility_task(timestamp, task_id=f"plateau-dflash-compat-{timestamp}", priority=95)
+            )
+        if "runtime-overhead" not in ready_lanes and should_seed_runtime_overhead_map(root, rows, recent_rows=45):
+            seeded_tasks.append(
+                {
+                    "id": f"plateau-runtime-overhead-map-{timestamp}",
+                    "status": "ready",
+                    "priority": 94,
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
+                    "target": "openclaw/openclaw-jang-vlm-server.py",
+                    "hypothesis": "Block-size tuning plateaued below target, so map MTP verification/cache/rollback overhead before more sweeps.",
+                    "metric": "decode_tps_delta",
+                    "guard_checks": ["no_live_profile_change", "tests_before_patch", "no_opencode_changes"],
+                    "acceptance": "A runtime-overhead artifact names whether overhead is in target eval, drafter eval, cache rollback, or proxy streaming.",
+                    "rollback": "No live profile change; this is a read-only source/log mapper.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+                }
+            )
+    seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
+    state = "pivot" if plateau else "continue-measurement"
+    report = {
+        "ok": True,
+        "kind": "plateau-pivot",
+        "timestamp": timestamp,
+        "state": state,
+        "plateau": plateau,
+        "recent_rows": len(rows),
+        "sweep_rows": len(sweep_rows),
+        "keep_current_sweeps": len(keep_current),
+        "block2_wins": len(block2_wins),
+        "decode_mean_tps": decode_mean,
+        "target_tps": float(args.target_tps),
+        "ready_lanes": sorted(ready_lanes),
+        "seeded_tasks": seeded,
+        "next": (
+            "route to drafter-fit, DFlash compatibility, or runtime-overhead instead of repeating block sweeps"
+            if plateau
+            else "continue bounded paired measurement until plateau evidence is strong enough"
+        ),
+    }
+    path = root / "benchmarks" / f"plateau-pivot-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "plateau-pivot",
+            "finding": "supervisor made the Karpathy keep/discard plateau decision explicit before selecting the next lane",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"plateau-pivot-{timestamp}",
+        status="keep",
+        target="autoresearch-plateau-pivot",
+        hypothesis="settled block-size evidence should pivot the loop to higher-upside lanes instead of repeating measurements",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"state={state} plateau={plateau} sweeps={len(sweep_rows)} "
+            f"block2_wins={len(block2_wins)} decode_mean_tps={decode_mean if decode_mean is not None else ''} "
+            f"seeded_tasks={seeded}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0
 
 
 def compact(args: argparse.Namespace) -> int:
@@ -3831,6 +4040,22 @@ def main() -> int:
     handoff = sub.add_parser("implementation-handoff-audit")
     handoff.add_argument("--min-score", type=int, default=90)
     handoff.set_defaults(func=implementation_handoff_audit)
+
+    snapshot = sub.add_parser("environment-snapshot")
+    snapshot.add_argument("--label", default="manual")
+    snapshot.add_argument("--repo", default=str(repo_root()))
+    snapshot.add_argument("--allow-fail", action="store_true")
+    snapshot.set_defaults(func=environment_snapshot_command)
+
+    integrity = sub.add_parser("evaluator-integrity")
+    integrity.add_argument("--allow-fail", action="store_true")
+    integrity.set_defaults(func=evaluator_integrity_command)
+
+    plateau = sub.add_parser("plateau-pivot")
+    plateau.add_argument("--recent-rows", type=int, default=120)
+    plateau.add_argument("--min-sweeps", type=int, default=3)
+    plateau.add_argument("--target-tps", type=float, default=30.0)
+    plateau.set_defaults(func=plateau_pivot)
 
     frontier = sub.add_parser("frontier-review")
     frontier.add_argument("--recent-rows", type=int, default=160)

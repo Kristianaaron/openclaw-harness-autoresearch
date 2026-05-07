@@ -817,9 +817,13 @@ def main() -> int:
         assert issue == ""
         review_log = (Path(tmp) / "autopilot.log").read_text(encoding="utf-8")
         assert "quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30.0" in review_log
+        assert "environment-snapshot --label review-cycle-8 --allow-fail" in review_log
         assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
         assert "hypothesis-rank --limit 12" in review_log
         assert "causal-review --recent-rows 120" in review_log
+        assert "plateau-pivot --recent-rows 120 --min-sweeps 3 --target-tps 30.0" in review_log
+        assert "evaluator-integrity" in review_log
+        assert "implementation-handoff-audit --min-score 90" in review_log
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log

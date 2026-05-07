@@ -2296,18 +2296,21 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
 
 
 def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
-    commands = [[
-        args.research_helper_bin,
-        "quality-review",
-        "--recent-rows",
-        str(args.review_recent_rows),
-        "--min-sweeps",
-        str(args.review_min_sweeps),
-        "--min-samples-per-block",
-        str(args.review_min_samples_per_block),
-        "--target-tps",
-        str(args.review_target_tps),
-    ]]
+    commands = [
+        [args.research_helper_bin, "environment-snapshot", "--label", f"review-cycle-{cycle}", "--allow-fail"],
+        [
+            args.research_helper_bin,
+            "quality-review",
+            "--recent-rows",
+            str(args.review_recent_rows),
+            "--min-sweeps",
+            str(args.review_min_sweeps),
+            "--min-samples-per-block",
+            str(args.review_min_samples_per_block),
+            "--target-tps",
+            str(args.review_target_tps),
+        ],
+    ]
     commands.append(
         [
             args.research_helper_bin,
@@ -2320,6 +2323,20 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     )
     commands.append([args.research_helper_bin, "hypothesis-rank", "--limit", str(args.hypothesis_rank_limit)])
     commands.append([args.research_helper_bin, "causal-review", "--recent-rows", str(args.review_recent_rows)])
+    commands.append(
+        [
+            args.research_helper_bin,
+            "plateau-pivot",
+            "--recent-rows",
+            str(args.review_recent_rows),
+            "--min-sweeps",
+            str(args.review_min_sweeps),
+            "--target-tps",
+            str(args.review_target_tps),
+        ]
+    )
+    commands.append([args.research_helper_bin, "evaluator-integrity"])
+    commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "frontier-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
     commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
     commands.append(
@@ -2361,6 +2378,14 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
 
 def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
     cmd = [args.research_helper_bin, "compact", "--recent-rows", str(args.compact_recent_rows)]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+
+
+def run_supervisor_environment_snapshot(args: argparse.Namespace, log_file: Path, label: str) -> None:
+    cmd = [args.research_helper_bin, "environment-snapshot", "--label", label, "--allow-fail"]
     with log_file.open("a", encoding="utf-8") as file:
         file.write("$ " + " ".join(cmd) + "\n")
         file.flush()
@@ -2526,6 +2551,7 @@ def main() -> int:
         f"auto_extend_cycles={args.auto_extend_cycles} extension_size={extension_size} log={log_file}"
     )
     run_supervisor_compaction(args, log_file)
+    run_supervisor_environment_snapshot(args, log_file, "autopilot-start")
     replay_start = replay_checks(WORKSPACE)
     if not replay_start["ok"]:
         append_supervisor_result(0, args.session, "blocked", f"startup replay failed: {replay_start}")

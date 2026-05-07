@@ -37,6 +37,7 @@ def main() -> int:
             assert (root / "benchmark-manifest.json").exists()
             assert (root / "insight-rubric.json").exists()
             assert (root / "research-profile.json").exists()
+            assert (root / "evaluator-policy.json").exists()
             assert (root / "replay-buffer.jsonl").exists()
             manifest = json.loads((root / "benchmark-manifest.json").read_text(encoding="utf-8"))
             assert manifest["locked"] is True
@@ -47,10 +48,19 @@ def main() -> int:
             profile = json.loads((root / "research-profile.json").read_text(encoding="utf-8"))
             assert profile["name"] == "openclaw-speed"
             assert "decode_tps" in profile["metrics"]["primary"]
+            policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
+            assert "benchmark-manifest.json" in policy["immutable_paths"]
+            assert "replay-buffer.jsonl" in policy["immutable_paths"]
             replay_cases = (root / "replay-buffer.jsonl").read_text(encoding="utf-8")
             assert "decode-token-source-required" in replay_cases
             assert "profile-variant-paired-control" in replay_cases
             assert helper.replay(Namespace(allow_fail=False)) == 0
+            assert helper.environment_snapshot_command(
+                Namespace(label="unit", repo="/Users/kristian/Documents/openclaw-harness-autoresearch", allow_fail=False)
+            ) == 0
+            assert (root / "snapshots").is_dir()
+            assert "environment-snapshot" in (root / "results.tsv").read_text(encoding="utf-8")
+            assert helper.evaluator_integrity_command(Namespace(allow_fail=False)) == 0
             assert helper.paired_plan(Namespace(task_id="no-drafter-control")) == 0
             paired_path = root / "experiments" / "paired-profile-plan-no-drafter-control.json"
             paired = json.loads(paired_path.read_text(encoding="utf-8"))
@@ -115,6 +125,8 @@ def main() -> int:
             assert "Lane B: drafter alignment" in program
             assert "DFlash compatibility" in program
             assert "## 30 Tok/S Investigation Ladder" in program
+            assert "## Karpathy Compatibility Layer" in program
+            assert "Immutable evaluator policy" in program
             assert "stop repeating that sweep" in program
             assert "z-lab/gemma-4-31B-it-DFlash" in program
             assert "## Realistic Experiment Backlog" in program
@@ -336,6 +348,7 @@ def main() -> int:
             assert helper.quality_review(
                 Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
             ) == 0
+            assert helper.plateau_pivot(Namespace(recent_rows=80, min_sweeps=3, target_tps=30.0)) == 0
             review_paths = list((root / "benchmarks").glob("quality-review-*.json"))
             assert review_paths
             review = json.loads(review_paths[-1].read_text(encoding="utf-8"))
@@ -349,6 +362,10 @@ def main() -> int:
             assert review["gates"]["no_contaminated_wall_clock"] is True
             assert "mtp-decode" in (root / "exhausted-approaches.jsonl").read_text(encoding="utf-8")
             assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            plateau_paths = list((root / "benchmarks").glob("plateau-pivot-*.json"))
+            assert plateau_paths
+            plateau = json.loads(plateau_paths[-1].read_text(encoding="utf-8"))
+            assert plateau["state"] == "pivot"
             with (root / "results.tsv").open("a", encoding="utf-8") as file:
                 file.write(
                     "2026-05-05T00:11:50+0000\tmtp-report-unit\tkeep\tmtp-acceptance-report\t"
