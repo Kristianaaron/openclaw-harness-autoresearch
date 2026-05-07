@@ -994,6 +994,42 @@ def main() -> int:
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
+        review_fail_helper = Path(tmp) / "review-fail-helper.py"
+        review_fail_log = Path(tmp) / "review-fail-marker.txt"
+        review_fail_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"path = pathlib.Path({str(review_fail_log)!r})\n"
+            "path.write_text(path.read_text(encoding='utf-8') + ' '.join(sys.argv[1:]) + '\\n' if path.exists() else ' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n"
+            "raise SystemExit(2 if len(sys.argv) > 1 and sys.argv[1] == 'implementation-handoff-audit' else 0)\n",
+            encoding="utf-8",
+        )
+        review_fail_helper.chmod(0o700)
+        review_fail_args = Namespace(**{**vars(review_args), "research_helper_bin": str(review_fail_helper)})
+        ok, issue = helper.run_supervisor_quality_review(
+            review_fail_args,
+            12,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+        )
+        assert not ok
+        assert issue == "implementation-handoff-audit exit 2"
+        review_fail_text = review_fail_log.read_text(encoding="utf-8")
+        assert "implementation-handoff-audit --min-score 90" in review_fail_text
+        assert "frontier-eval --recent-rows 120 --allow-fail" in review_fail_text
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "causal-review-unit",
+                    "status": "ready",
+                    "lane": "causal-repair",
+                    "next_action": "read exactly promotion-decisions.jsonl",
+                }
+            ],
+        )
+        assert helper.block_stale_model_bound_causal_tasks() == 1
+        assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
         ok, issue = helper.run_supervisor_reflection(
             synth_args,
             9,

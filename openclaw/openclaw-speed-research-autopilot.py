@@ -2551,6 +2551,12 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
 
 
 def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
+    tolerated_nonzero = {
+        "implementation-handoff-audit",
+        "frontier-eval",
+        "gepa-escalation",
+    }
+    first_issue = ""
     commands = [
         [args.research_helper_bin, "environment-snapshot", "--label", f"review-cycle-{cycle}", "--allow-fail"],
         [
@@ -2627,8 +2633,13 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
             except subprocess.TimeoutExpired:
                 return False, "supervisor quality/frontier review timeout"
             if result.returncode != 0:
-                return False, f"supervisor quality/frontier review exit {result.returncode}"
-    return True, ""
+                command_name = cmd[1] if len(cmd) > 1 else ""
+                issue = f"{command_name} exit {result.returncode}"
+                if command_name not in tolerated_nonzero:
+                    return False, f"supervisor quality/frontier review {issue}"
+                if not first_issue:
+                    first_issue = issue
+    return not first_issue, first_issue
 
 
 def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
@@ -2891,6 +2902,9 @@ def main() -> int:
                 review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
                 after_review = durable_snapshot()
                 review_progress = durable_progress(after, after_review)
+                stale_causal_blocked = block_stale_model_bound_causal_tasks()
+                if stale_causal_blocked:
+                    review_progress.append("stale causal tasks quarantined")
                 deterministic_ready = deterministic_ready_tasks()
                 if deterministic_ready:
                     progress_cycles += 1
@@ -2943,6 +2957,9 @@ def main() -> int:
             deterministic_ready = deterministic_ready_tasks()
             if not deterministic_ready:
                 review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
+                stale_causal_blocked = block_stale_model_bound_causal_tasks()
+                if stale_causal_blocked:
+                    log(f"cycle={cycle} deferred_task_review quarantined stale causal tasks count={stale_causal_blocked}")
                 deterministic_ready = deterministic_ready_tasks()
                 if deterministic_ready:
                     append_supervisor_result(cycle, current_session, "blocked", issue)
