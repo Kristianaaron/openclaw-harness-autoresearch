@@ -521,6 +521,16 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
     )
 
 
+def model_bound_defer_reason(args: argparse.Namespace, task: dict[str, object] | None) -> str:
+    if task_runs_without_model(task):
+        return ""
+    if not getattr(args, "allow_model_bound_research_turns", False):
+        return "model-bound research turn deferred for local 31B stability"
+    if not model_ready():
+        return "model endpoint offline after memory recovery"
+    return ""
+
+
 def recent_task_rejections(task_id: str, reason: str, limit: int = 3) -> int:
     if not task_id:
         return 0
@@ -2458,6 +2468,12 @@ def main() -> int:
         action="store_true",
         help="reuse one OpenClaw session instead of Ralph-style fresh sessions per cycle",
     )
+    parser.add_argument(
+        "--allow-model-bound-research-turns",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_MODEL_BOUND_TURNS", "0") == "1",
+        help="allow non-supervisor autoresearch turns to call the local model; disabled by default for 31B stability",
+    )
     args = parser.parse_args()
     if args.cycles <= 0:
         args.cycles = 1_000_000
@@ -2572,8 +2588,9 @@ def main() -> int:
             continue
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
-        if not task_runs_without_model(selected_task) and not model_ready():
-            issue = "model endpoint offline after memory recovery; deferring model-bound task to deterministic synthesis"
+        defer_reason = model_bound_defer_reason(args, selected_task)
+        if defer_reason:
+            issue = f"{defer_reason}; routing to deterministic synthesis"
             ok, synth_issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
             seeded = enqueue_recurring_decode_tasks(cycle, issue)
             append_supervisor_result(cycle, current_session, "blocked", issue)
@@ -2590,7 +2607,7 @@ def main() -> int:
                 last_issue = synth_issue or issue
             log(
                 f"cycle={cycle} skipped model-bound task={selected_task.get('id', 'unknown')} "
-                f"because model endpoint is offline; synthesis_ok={ok} seeded_tasks={seeded} "
+                f"because {defer_reason}; synthesis_ok={ok} seeded_tasks={seeded} "
                 f"progressed={progressed} issue={last_issue or 'none'}"
             )
             time.sleep(args.sleep_seconds)

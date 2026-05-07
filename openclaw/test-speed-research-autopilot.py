@@ -129,6 +129,19 @@ def check_prompt_and_routing_guards(helper) -> None:
     assert not helper.task_runs_without_model(
         {"id": "model-bound-research", "target": "notes.md", "next_action": "inspect and update notes"}
     )
+    assert helper.model_bound_defer_reason(
+        Namespace(allow_model_bound_research_turns=False),
+        {"id": "model-bound-research", "target": "notes.md", "next_action": "inspect and update notes"},
+    ) == "model-bound research turn deferred for local 31B stability"
+    assert helper.model_bound_defer_reason(
+        Namespace(allow_model_bound_research_turns=False),
+        {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"},
+    ) == ""
+    with patch.object(helper, "model_ready", return_value=False):
+        assert helper.model_bound_defer_reason(
+            Namespace(allow_model_bound_research_turns=True),
+            {"id": "model-bound-research", "target": "notes.md", "next_action": "inspect and update notes"},
+        ) == "model endpoint offline after memory recovery"
     assert not helper.is_supervisor_benchmark_task(
         {
             "benchmark_mode": "decode-sample",
