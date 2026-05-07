@@ -3446,6 +3446,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         or task.get("benchmark_mode")
         or "openclaw-speed-research" in str(task.get("next_action", ""))
     ]
+    timestamp = int(time.time())
     seeded_bridge = False
     if not deterministic_ready:
         seeded_bridge = bool(
@@ -3453,7 +3454,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
                 root,
                 [
                     {
-                        "id": "handoff-audit-deterministic-bridge",
+                        "id": f"handoff-audit-deterministic-bridge-{timestamp}",
                         "status": "ready",
                         "priority": 98,
                         "lane": "implementation-gate",
@@ -3519,7 +3520,6 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     gaps = [name for name, ok in gates.items() if not ok]
     score = max(0, min(100, 100 - len(gaps) * 18 - min(30, len(contract_blockers) * 10)))
     ok = score >= int(args.min_score)
-    timestamp = int(time.time())
     report = {
         "ok": ok,
         "kind": "implementation-handoff-audit",

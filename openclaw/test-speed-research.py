@@ -697,7 +697,7 @@ def main() -> int:
             assert handoff_report["seeded_bridge"] is True
             assert "handoff-audit-deterministic-bridge" in "\n".join(handoff_report["ready_deterministic_tasks"])
             bridge_tasks = helper.read_jsonl(root / "tasks.jsonl")
-            bridge = next(task for task in bridge_tasks if task["id"] == "handoff-audit-deterministic-bridge")
+            bridge = next(task for task in bridge_tasks if str(task["id"]).startswith("handoff-audit-deterministic-bridge-"))
             assert "canary_only" in bridge["guard_checks"]
             assert bridge["acceptance"]
             assert bridge["rollback"]

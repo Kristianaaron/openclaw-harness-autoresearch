@@ -788,6 +788,44 @@ def block_stale_hard_blocked_lane_tasks() -> int:
     return blocked
 
 
+def block_ready_exhausted_lane_tasks() -> int:
+    exhausted = active_exhausted_lanes()
+    if not exhausted:
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    tasks = read_jsonl(TASKS)
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        lane = str(task.get("lane", ""))
+        if lane not in exhausted or lane == "exhaustion-report":
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = f"lane is exhausted: {lane}"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "blocked_exhausted_lane_before_selection",
+            "lane": lane,
+            "next": "route_to_non_exhausted_frontier_or_prerequisite_lane",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": now,
+                "finding": "supervisor blocked ready tasks from exhausted lanes before autonomy",
+                "blocked_tasks": blocked,
+                "exhausted_lanes": sorted(exhausted),
+                "next": "run frontier certification again",
+            },
+        )
+    return blocked
+
+
 def block_stale_model_bound_causal_tasks() -> int:
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     tasks = read_jsonl(TASKS)
@@ -2780,7 +2818,12 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
     frontier_score = float(frontier.get("overall") or 0.0)
     handoff_score = int(handoff.get("score") or 0)
     quality_scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
-    quality_score = float(quality_scorecard.get("overall") or quality.get("quality_score") or 0.0)
+    quality_values = [
+        value
+        for value in (quality.get("quality_score"), quality_scorecard.get("overall"))
+        if isinstance(value, int | float)
+    ]
+    quality_score = float(max(quality_values)) if quality_values else 0.0
     contract = frontier.get("task_contract") if isinstance(frontier.get("task_contract"), dict) else {}
     issues: list[str] = []
     if not replay.get("ok"):
@@ -2815,6 +2858,7 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
 
 def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path) -> tuple[bool, str]:
     stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
+    exhausted_lane_blocked = block_ready_exhausted_lane_tasks()
     stale_causal_blocked = block_stale_model_bound_causal_tasks()
     run_supervisor_quality_review(args, 0, "startup-certification", log_file)
     status = frontier_certification_status(args)
@@ -2829,13 +2873,15 @@ def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path)
             notes=(
                 f"frontier={status['frontier_score']} handoff={status['handoff_score']} "
                 f"quality={status['quality_score']} deterministic={len(status['deterministic_ready_tasks'])} "
-                f"stale_lane_blocked={stale_lane_blocked} stale_causal_blocked={stale_causal_blocked}"
+                f"stale_lane_blocked={stale_lane_blocked} exhausted_lane_blocked={exhausted_lane_blocked} "
+                f"stale_causal_blocked={stale_causal_blocked}"
             ),
         )
         return True, ""
     repair_issue = "; ".join(str(issue) for issue in status["issues"])
     run_supervisor_synthesis(args, 0, "startup-certification-repair", log_file)
     block_stale_hard_blocked_lane_tasks()
+    block_ready_exhausted_lane_tasks()
     block_stale_model_bound_causal_tasks()
     run_supervisor_quality_review(args, 0, "startup-certification-recheck", log_file)
     repaired = frontier_certification_status(args)

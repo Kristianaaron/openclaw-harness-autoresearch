@@ -361,7 +361,7 @@ def main() -> int:
             encoding="utf-8",
         )
         (helper.BENCHMARKS / "quality-review-1.json").write_text(
-            json.dumps({"scorecard": {"overall": 94.0}}),
+            json.dumps({"quality_score": 90, "scorecard": {"overall": 89.8}}),
             encoding="utf-8",
         )
         certification_args = Namespace(
@@ -390,6 +390,8 @@ def main() -> int:
         uncertified = helper.frontier_certification_status(certification_args)
         assert uncertified["ok"] is False
         assert any("exhausted lanes" in issue for issue in uncertified["issues"])
+        assert helper.block_ready_exhausted_lane_tasks() == 1
+        assert helper.frontier_certification_status(certification_args)["ok"] is True
         helper.append_quality_pause(43, "nightly", "unit-test exhausted synthesis")
         assert "quality-pause-43" in helper.RESULTS.read_text(encoding="utf-8")
         assert "autopilot-quality-pause" in helper.FINDINGS.read_text(encoding="utf-8")
