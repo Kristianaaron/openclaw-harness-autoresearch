@@ -775,6 +775,71 @@ def main() -> int:
         assert code == 0
         assert issue == ""
         assert helper.read_jsonl(helper.TASKS)[0]["status"] == "done"
+        dflash_blocked_report = helper.WORKSPACE / "experiments" / "dflash-compatibility-gate-123.json"
+        dflash_blocked_report.parent.mkdir(parents=True, exist_ok=True)
+        dflash_blocked_report.write_text(
+            '{"status":"blocked","blockers":["draft_model_type_mismatch=qwen3"]}',
+            encoding="utf-8",
+        )
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="dflash-compatibility-gate-123",
+            status="blocked",
+            target="frontier-dflash",
+            hypothesis="DFlash gate blocks a mismatched draft model",
+            commit="abc123",
+            notes="decision=blocked",
+        )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "deliberate-dflash-compatibility-stale",
+                    "status": "ready",
+                    "lane": "frontier-dflash",
+                    "task_type": "supervisor",
+                    "supervisor_action": "dflash-compatibility-gate",
+                    "priority": 99,
+                },
+                {
+                    "id": "safe-runtime-map",
+                    "status": "ready",
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
+                    "priority": 50,
+                },
+            ],
+        )
+        assert helper.recent_hard_dflash_blocker() == "draft_model_type_mismatch=qwen3"
+        assert helper.block_stale_hard_blocked_lane_tasks() == 1
+        quarantined_tasks = helper.read_jsonl(helper.TASKS)
+        assert quarantined_tasks[0]["status"] == "blocked"
+        assert quarantined_tasks[1]["status"] == "ready"
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "causal-review-old",
+                    "status": "ready",
+                    "lane": "causal-repair",
+                    "priority": 99,
+                    "next_action": "read exactly promotion-decisions.jsonl",
+                },
+                {
+                    "id": "supervisor-mtp-report",
+                    "status": "ready",
+                    "lane": "production-mtp",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "priority": 50,
+                },
+            ],
+        )
+        assert helper.block_stale_model_bound_causal_tasks() == 1
+        causal_tasks = helper.read_jsonl(helper.TASKS)
+        assert causal_tasks[0]["status"] == "blocked"
+        assert causal_tasks[1]["status"] == "ready"
         patch_helper = Path(tmp) / "patch-helper.py"
         patch_helper.write_text(
             "#!/usr/bin/env python3\n"

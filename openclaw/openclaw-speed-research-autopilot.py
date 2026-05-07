@@ -19,6 +19,7 @@ from pathlib import Path
 
 from openclaw_speed_research_core import (
     RESULTS_HEADER,
+    all_result_rows,
     append_jsonl,
     append_result,
     claim_task_evidence_window,
@@ -669,6 +670,106 @@ def block_stale_rejected_implementation_tasks() -> int:
         else:
             if block_task_after_repeated_guard(task, "OpenClaw blocked a broad local tool command", threshold=3):
                 blocked += 1
+    return blocked
+
+
+def recent_hard_dflash_blocker(limit: int = 120) -> str:
+    rows = all_result_rows(WORKSPACE)[-max(1, limit) :]
+    for row in reversed(rows):
+        if row.get("status") != "blocked" or not row.get("run_id", "").startswith("dflash-compatibility-gate-"):
+            continue
+        run_id = row.get("run_id", "")
+        timestamp = run_id.rsplit("-", 1)[-1]
+        artifact = WORKSPACE / "experiments" / f"dflash-compatibility-gate-{timestamp}.json"
+        blockers: list[str] = []
+        if artifact.exists():
+            try:
+                loaded = json.loads(artifact.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    blockers = [str(item) for item in loaded.get("blockers", []) if item]
+            except (OSError, json.JSONDecodeError):
+                blockers = []
+        for blocker in blockers:
+            if blocker.startswith("draft_model_type_mismatch=") or blocker in {
+                "dflash_draft_config_missing",
+                "draft_target_layer_ids_missing",
+            }:
+                return blocker
+    return ""
+
+
+def block_stale_hard_blocked_lane_tasks() -> int:
+    dflash_blocker = recent_hard_dflash_blocker()
+    if not dflash_blocker:
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    tasks = read_jsonl(TASKS)
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        task_id = str(task.get("id", ""))
+        lane = str(task.get("lane", ""))
+        action = str(task.get("supervisor_action", ""))
+        if lane != "frontier-dflash" and "dflash-compatibility" not in task_id and action != "dflash-compatibility-gate":
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = f"stale hard-blocked DFlash lane: {dflash_blocker}"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "quarantined_before_selection",
+            "blocker": dflash_blocker,
+            "next": "change_dflash_candidate_or_collect_janq_target_trace_data",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": now,
+                "finding": "supervisor quarantined stale DFlash tasks before selection",
+                "reason": dflash_blocker,
+                "blocked_tasks": blocked,
+                "next": "select_next_ready_task",
+            },
+        )
+    return blocked
+
+
+def block_stale_model_bound_causal_tasks() -> int:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    tasks = read_jsonl(TASKS)
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        task_id = str(task.get("id", ""))
+        if str(task.get("lane", "")) != "causal-repair" and not task_id.startswith("causal-review-"):
+            continue
+        if task_runs_without_model(task):
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = "stale model-bound causal review; deterministic causal-review command supersedes this task"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "quarantined_before_selection",
+            "next": "run supervisor causal-review instead of a model-bound read task",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": now,
+                "finding": "supervisor quarantined stale model-bound causal review tasks before selection",
+                "blocked_tasks": blocked,
+                "next": "run deterministic quality review or select next ready task",
+            },
+        )
     return blocked
 
 
@@ -2751,6 +2852,12 @@ def main() -> int:
         stale_blocked = block_stale_rejected_implementation_tasks()
         if stale_blocked:
             log(f"supervisor blocked stale rejected implementation tasks count={stale_blocked}")
+        stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
+        if stale_lane_blocked:
+            log(f"supervisor quarantined stale hard-blocked lane tasks count={stale_lane_blocked}")
+        stale_causal_blocked = block_stale_model_bound_causal_tasks()
+        if stale_causal_blocked:
+            log(f"supervisor quarantined stale model-bound causal tasks count={stale_causal_blocked}")
         memory_ok, memory_issue = wait_for_memory(args)
         if not memory_ok:
             stalled_cycles += 1
@@ -2781,8 +2888,22 @@ def main() -> int:
             progress_reasons = durable_progress(before, after)
             deterministic_ready = deterministic_ready_tasks()
             if ok and not deterministic_ready:
+                review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
+                after_review = durable_snapshot()
+                review_progress = durable_progress(after, after_review)
+                deterministic_ready = deterministic_ready_tasks()
+                if deterministic_ready:
+                    progress_cycles += 1
+                    log(
+                        f"cycle={cycle} synthesis_empty_review ok={review_ok} "
+                        f"deterministic_ready={len(deterministic_ready)} "
+                        f"artifact={','.join(review_progress) if review_progress else 'none'}"
+                    )
+                    time.sleep(args.sleep_seconds)
+                    continue
                 pause_reason = (
                     "synthesis produced no new deterministic ready tasks; "
+                    f"review also found no ready deterministic task ({review_issue or 'no issue'}); "
                     "pausing to avoid low-quality repeated measurement"
                 )
                 append_quality_pause(cycle, current_session, pause_reason)
@@ -2821,8 +2942,19 @@ def main() -> int:
             )
             deterministic_ready = deterministic_ready_tasks()
             if not deterministic_ready:
+                review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
+                deterministic_ready = deterministic_ready_tasks()
+                if deterministic_ready:
+                    append_supervisor_result(cycle, current_session, "blocked", issue)
+                    log(
+                        f"cycle={cycle} deferred_task_review ok={review_ok} "
+                        f"deterministic_ready={len(deterministic_ready)} issue={review_issue or 'none'}"
+                    )
+                    time.sleep(args.sleep_seconds)
+                    continue
                 pause_reason = (
                     f"{defer_reason}; no deterministic ready tasks remained after synthesis, "
+                    f"and review found no ready deterministic task ({review_issue or 'no issue'}), "
                     "so autoresearch paused instead of refilling generic cycles"
                 )
                 append_quality_pause(cycle, current_session, pause_reason)

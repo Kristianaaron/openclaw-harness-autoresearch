@@ -1607,6 +1607,27 @@ def quality_review(args: argparse.Namespace) -> int:
     if len(sweep_rows) < int(args.min_sweeps):
         quality_score -= 15
         recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
+        if should_seed_action(root, "review-drafter-sweep-next", recent_rows=20):
+            seeded_tasks.append(
+                {
+                    "id": "review-drafter-sweep-next",
+                    "status": "ready",
+                    "priority": 96,
+                    "lane": "mtp-decode",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-sweep-run",
+                    "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+                    "hypothesis": "The queue is empty but sweep evidence is still below the reviewer threshold, so run one bounded block-size sweep before concluding exhaustion.",
+                    "metric": "decode_tps",
+                    "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile"],
+                    "acceptance": "A paired sweep artifact records control and variant decode TPS with a keep/discard decision.",
+                    "rollback": "Restore live profile after every variant and keep current settings unless the promotion gate passes.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
+                    "blocks": "1,2,3,4",
+                    "samples": 3,
+                    "retries": 2,
+                }
+            )
     if artifact_check.get("artifact_suspected"):
         quality_score -= 25
         recommendations.append(f"measurement artifact suspected: {artifact_check.get('reason')}; remeasure baseline before promotion.")

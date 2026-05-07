@@ -198,6 +198,20 @@ def main() -> int:
             assert migrated["supervisor_action"] == "dflash-compatibility-gate"
             assert "openclaw-speed-research dflash-compatibility-gate" in migrated["next_action"]
             helper.write_jsonl(root / "tasks.jsonl", tasks)
+            helper.write_jsonl(root / "tasks.jsonl", [{"id": "old-blocked", "status": "blocked"}])
+            with (root / "results.tsv").open("a", encoding="utf-8") as file:
+                for index in range(2):
+                    file.write(
+                        f"2026-05-05T00:09:0{index}+0000\tdrafter-sweep-run-seed-{index}\tkeep\t"
+                        "OPENCLAW_JANG_DRAFT_BLOCK_SIZE\tpaired drafter block-size sweep\t\t\t14.2\t\t\tabc123\t"
+                        "decision=keep-current control_block=2 winner_block=2 delta_vs_control=0.0\n"
+                    )
+            assert helper.quality_review(
+                Namespace(recent_rows=20, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+            ) == 0
+            seeded_review_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert "review-drafter-sweep-next" in seeded_review_tasks
+            helper.write_jsonl(root / "tasks.jsonl", tasks)
             helper.write_jsonl(
                 root / "tasks.jsonl",
                 [
@@ -371,7 +385,7 @@ def main() -> int:
             assert helper.plateau_pivot(Namespace(recent_rows=80, min_sweeps=3, target_tps=30.0)) == 0
             review_paths = list((root / "benchmarks").glob("quality-review-*.json"))
             assert review_paths
-            review = json.loads(review_paths[-1].read_text(encoding="utf-8"))
+            review = json.loads(max(review_paths, key=lambda path: path.stat().st_mtime_ns).read_text(encoding="utf-8"))
             assert review["repeated_block2_winner"] is True
             assert review["verdict"] == "converged-below-target"
             assert review["gates"]["required_block_coverage"] is True
@@ -415,7 +429,9 @@ def main() -> int:
             assert helper.quality_review(
                 Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
             ) == 0
-            clean_review = json.loads(sorted((root / "benchmarks").glob("quality-review-*.json"))[-1].read_text())
+            clean_review = json.loads(
+                max((root / "benchmarks").glob("quality-review-*.json"), key=lambda path: path.stat().st_mtime_ns).read_text()
+            )
             assert clean_review["clean_runtime_overhead_maps"] >= 2
             assert clean_review["gates"]["runtime_overhead_not_repeated"] is False
             assert "review-janq-drafter-fit-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
@@ -430,7 +446,9 @@ def main() -> int:
             assert helper.quality_review(
                 Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
             ) == 0
-            contaminated_review = json.loads(sorted((root / "benchmarks").glob("quality-review-*.json"))[-1].read_text())
+            contaminated_review = json.loads(
+                max((root / "benchmarks").glob("quality-review-*.json"), key=lambda path: path.stat().st_mtime_ns).read_text()
+            )
             assert contaminated_review["contaminated_decode_rows"] >= 3
             assert contaminated_review["mean_server_decode_tps"] >= 15.7
             assert contaminated_review["gates"]["no_contaminated_wall_clock"] is False
