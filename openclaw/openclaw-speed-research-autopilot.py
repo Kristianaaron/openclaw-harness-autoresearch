@@ -2735,6 +2735,147 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     return not first_issue, first_issue
 
 
+def latest_json_artifact(pattern: str) -> dict[str, object]:
+    paths = list(BENCHMARKS.glob(pattern))
+    if not paths:
+        return {}
+    path = max(paths, key=lambda item: item.stat().st_mtime_ns)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"path": str(path), "ok": False, "error": "unreadable artifact"}
+    return loaded if isinstance(loaded, dict) else {"path": str(path), "ok": False, "error": "non-object artifact"}
+
+
+def active_exhausted_lanes() -> set[str]:
+    return {
+        str(row.get("lane", ""))
+        for row in read_jsonl(WORKSPACE / "exhausted-approaches.jsonl")
+        if row.get("lane") and not row.get("reopened")
+    }
+
+
+def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]:
+    frontier = latest_json_artifact("frontier-system-eval-*.json")
+    handoff = latest_json_artifact("implementation-handoff-audit-*.json")
+    quality = latest_json_artifact("quality-review-*.json")
+    replay = replay_checks(WORKSPACE)
+    deterministic = deterministic_ready_tasks()
+    exhausted = active_exhausted_lanes()
+    ready = ready_tasks()
+    exhausted_ready = [
+        str(task.get("id", ""))
+        for task in ready
+        if str(task.get("lane", "")) in exhausted and str(task.get("lane", "")) != "exhaustion-report"
+    ]
+    model_bound_causal = [
+        str(task.get("id", ""))
+        for task in ready
+        if (
+            str(task.get("lane", "")) == "causal-repair"
+            or str(task.get("id", "")).startswith("causal-review-")
+        )
+        and not task_runs_without_model(task)
+    ]
+    frontier_score = float(frontier.get("overall") or 0.0)
+    handoff_score = int(handoff.get("score") or 0)
+    quality_scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    quality_score = float(quality_scorecard.get("overall") or quality.get("quality_score") or 0.0)
+    contract = frontier.get("task_contract") if isinstance(frontier.get("task_contract"), dict) else {}
+    issues: list[str] = []
+    if not replay.get("ok"):
+        issues.append("replay guards failed")
+    if frontier_score < float(args.frontier_certification_min_score):
+        issues.append(f"frontier score {frontier_score}<min {args.frontier_certification_min_score}")
+    if handoff_score < int(args.frontier_certification_min_handoff):
+        issues.append(f"handoff score {handoff_score}<min {args.frontier_certification_min_handoff}")
+    if quality_score < float(args.frontier_certification_min_quality):
+        issues.append(f"quality score {quality_score}<min {args.frontier_certification_min_quality}")
+    if not deterministic:
+        issues.append("no deterministic ready task")
+    if exhausted_ready:
+        issues.append("ready tasks remain in exhausted lanes: " + ",".join(exhausted_ready[:6]))
+    if model_bound_causal:
+        issues.append("model-bound causal tasks remain ready: " + ",".join(model_bound_causal[:6]))
+    if contract and not contract.get("ok"):
+        issues.append("task contract is not clean")
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "frontier_score": frontier_score,
+        "handoff_score": handoff_score,
+        "quality_score": quality_score,
+        "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic[:8]],
+        "exhausted_lanes": sorted(exhausted),
+        "frontier": frontier,
+        "handoff": handoff,
+        "quality": quality,
+    }
+
+
+def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path) -> tuple[bool, str]:
+    stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
+    stale_causal_blocked = block_stale_model_bound_causal_tasks()
+    run_supervisor_quality_review(args, 0, "startup-certification", log_file)
+    status = frontier_certification_status(args)
+    if status["ok"]:
+        append_result(
+            WORKSPACE,
+            run_id=f"frontier-certification-{int(time.time())}",
+            status="keep",
+            target="autoresearch-frontier-certification",
+            hypothesis="overnight autoresearch must certify deterministic quality before autonomous cycles",
+            commit=current_commit(),
+            notes=(
+                f"frontier={status['frontier_score']} handoff={status['handoff_score']} "
+                f"quality={status['quality_score']} deterministic={len(status['deterministic_ready_tasks'])} "
+                f"stale_lane_blocked={stale_lane_blocked} stale_causal_blocked={stale_causal_blocked}"
+            ),
+        )
+        return True, ""
+    repair_issue = "; ".join(str(issue) for issue in status["issues"])
+    run_supervisor_synthesis(args, 0, "startup-certification-repair", log_file)
+    block_stale_hard_blocked_lane_tasks()
+    block_stale_model_bound_causal_tasks()
+    run_supervisor_quality_review(args, 0, "startup-certification-recheck", log_file)
+    repaired = frontier_certification_status(args)
+    if repaired["ok"]:
+        append_result(
+            WORKSPACE,
+            run_id=f"frontier-certification-{int(time.time())}",
+            status="keep",
+            target="autoresearch-frontier-certification",
+            hypothesis="overnight autoresearch repaired startup quality before autonomous cycles",
+            commit=current_commit(),
+            notes=(
+                f"repaired=True frontier={repaired['frontier_score']} handoff={repaired['handoff_score']} "
+                f"quality={repaired['quality_score']} deterministic={len(repaired['deterministic_ready_tasks'])}"
+            ),
+        )
+        return True, ""
+    reason = "; ".join(str(issue) for issue in repaired["issues"]) or repair_issue or "unknown certification failure"
+    append_result(
+        WORKSPACE,
+        run_id=f"frontier-certification-{int(time.time())}",
+        status="blocked",
+        target="autoresearch-frontier-certification",
+        hypothesis="overnight autoresearch should not start below frontier-quality threshold",
+        commit=current_commit(),
+        notes=f"startup certification failed after deterministic repair: {clean_tsv(reason)}",
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "frontier-certification",
+            "finding": "autopilot refused to start a low-quality autonomous loop",
+            "evidence": repaired,
+            "next": "inspect certification issues and add a deterministic task or source patch before restarting",
+        },
+    )
+    return False, reason
+
+
 def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
     cmd = [args.research_helper_bin, "compact", "--recent-rows", str(args.compact_recent_rows)]
     with log_file.open("a", encoding="utf-8") as file:
@@ -2888,6 +3029,30 @@ def main() -> int:
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_MODEL_BOUND_TURNS", "0") == "1",
         help="allow non-supervisor autoresearch turns to call the local model; disabled by default for 31B stability",
     )
+    parser.add_argument(
+        "--certify-startup",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_CERTIFY_STARTUP", "1") != "0",
+        help="run deterministic frontier-quality certification before autonomous cycles",
+    )
+    parser.add_argument(
+        "--frontier-certification-min-score",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_CERT_MIN_FRONTIER", "9.0")),
+        help="minimum frontier eval score required before starting autonomous cycles",
+    )
+    parser.add_argument(
+        "--frontier-certification-min-handoff",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_CERT_MIN_HANDOFF", "90")),
+        help="minimum implementation handoff audit score required before starting autonomous cycles",
+    )
+    parser.add_argument(
+        "--frontier-certification-min-quality",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_CERT_MIN_QUALITY", "90")),
+        help="minimum quality-review scorecard required before starting autonomous cycles",
+    )
     args = parser.parse_args()
     if args.cycles <= 0:
         args.cycles = 1_000_000
@@ -2920,6 +3085,11 @@ def main() -> int:
         append_supervisor_result(0, args.session, "blocked", f"startup replay failed: {replay_start}")
         log(f"startup replay guards failed: {replay_start}")
         return 2
+    if args.certify_startup:
+        certified, certification_issue = run_frontier_startup_certification(args, log_file)
+        if not certified:
+            log(f"startup frontier certification failed: {certification_issue}")
+            return 2
     cycle = 0
     while True:
         if cycle >= cycle_limit:

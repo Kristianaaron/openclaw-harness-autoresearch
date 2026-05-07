@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import tempfile
 from argparse import Namespace
@@ -350,6 +351,45 @@ def main() -> int:
         )
         deterministic = helper.deterministic_ready_tasks()
         assert [task["id"] for task in deterministic] == ["bounded-benchmark"]
+        (helper.BENCHMARKS).mkdir(parents=True, exist_ok=True)
+        (helper.BENCHMARKS / "frontier-system-eval-1.json").write_text(
+            json.dumps({"overall": 9.4, "task_contract": {"ok": True}}),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "implementation-handoff-audit-1.json").write_text(
+            json.dumps({"score": 100}),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "quality-review-1.json").write_text(
+            json.dumps({"scorecard": {"overall": 94.0}}),
+            encoding="utf-8",
+        )
+        certification_args = Namespace(
+            frontier_certification_min_score=9.0,
+            frontier_certification_min_handoff=90,
+            frontier_certification_min_quality=90,
+        )
+        certified = helper.frontier_certification_status(certification_args)
+        assert certified["ok"] is True
+        helper.append_jsonl(
+            helper.WORKSPACE / "exhausted-approaches.jsonl",
+            {"lane": "frontier-dflash", "reason": "unit-test"},
+        )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "stale-dflash",
+                    "status": "ready",
+                    "lane": "frontier-dflash",
+                    "task_type": "supervisor",
+                    "supervisor_action": "dflash-compatibility-gate",
+                }
+            ],
+        )
+        uncertified = helper.frontier_certification_status(certification_args)
+        assert uncertified["ok"] is False
+        assert any("exhausted lanes" in issue for issue in uncertified["issues"])
         helper.append_quality_pause(43, "nightly", "unit-test exhausted synthesis")
         assert "quality-pause-43" in helper.RESULTS.read_text(encoding="utf-8")
         assert "autopilot-quality-pause" in helper.FINDINGS.read_text(encoding="utf-8")
