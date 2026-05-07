@@ -43,6 +43,7 @@ from openclaw_speed_research_core import (
     replay_checks,
     score_insight,
     seed_gepa_canary_task,
+    task_contract_issues,
     task_contract_report,
     variance_analysis,
     write_gepa_policy_canary,
@@ -1774,6 +1775,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         if task.get("task_type") == "supervisor" or task.get("benchmark_mode") or "openclaw-speed-research" in str(task.get("next_action", ""))
     ]
     patch_rows = [row for row in active_recent if row.get("run_id", "").startswith("patch-executor-")]
+    handoff_audit_rows = [
+        row for row in active_recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
+    ]
     quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
     latest_quality_notes = quality_rows[-1].get("notes", "") if quality_rows else ""
     latest_quality_fields = parse_note_fields(latest_quality_notes)
@@ -1831,6 +1835,16 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if patch_rows:
         scores["implementation_handoff"] += 0.4
         strengths.append("patch executor has recent canary evidence")
+    if handoff_audit_rows:
+        latest_handoff = parse_note_fields(handoff_audit_rows[-1].get("notes", ""))
+        audit_ok = latest_handoff.get("ok") == "True" or latest_handoff.get("ok") == "true"
+        handoff_score = latest_handoff.get("score")
+        if audit_ok:
+            scores["implementation_handoff"] += 0.7
+            strengths.append("implementation handoff audit passed with canary and rollback gates")
+        else:
+            scores["implementation_handoff"] -= 0.8
+            gaps.append(f"implementation handoff audit needs repair score={handoff_score or 'unknown'}")
     if latest_quality_score is not None:
         scores["research_quality"] += max(-1.2, min(0.6, (latest_quality_score - 75.0) / 100.0))
     if not contract.get("ok"):
@@ -1870,6 +1884,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "deliberate_ready_tasks": [str(task.get("id", "")) for task in deliberate_ready[:8]],
         "recent_empty_synthesis_rows": len(empty_synthesis),
         "recent_bridge_zero_rows": len(bridge_zero),
+        "recent_handoff_audit_rows": len(handoff_audit_rows),
         "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
         "historical_debt": {
@@ -2402,7 +2417,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "target": "openclaw-model-proxy.log",
             "hypothesis": "Decode tuning needs a compact report of MTP rounds, mean acceptance, block size, and drafter path from recent runs.",
             "metric": "mean_accept",
-            "guard_checks": ["one_narrow_tool", "no_loop"],
+            "guard_checks": ["one_narrow_tool", "no_loop", "no_opencode_changes"],
             "next_action": "tail -n 80 /Users/kristian/.openclaw/logs/openclaw-model-proxy.log",
         },
         {
@@ -2433,7 +2448,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
             "hypothesis": "A bounded drafter block sweep can search decode speed safely without manual overnight babysitting.",
             "metric": "decode_tps",
-            "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile"],
+            "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile", "no_opencode_changes"],
             "acceptance": "A paired sweep artifact records control and variant decode TPS, MTP acceptance, promotion decision, and rollback policy.",
             "rollback": "Keep the current live block size unless a variant beats the promotion gate.",
             "evidence": speed_gap,
@@ -2450,7 +2465,13 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "source_files": ["openclaw/openclaw-drafter-fit.py", "openclaw/test-drafter-fit.py"],
             "hypothesis": "DFlash speedups require a drafter fitted to the exact JANQ target distribution, not a generic standard-Gemma drafter.",
             "metric": "drafter_fit_gate",
-            "guard_checks": ["no_model_load", "target_config_match", "tool_thinking_replay_required", "no_live_profile_change"],
+            "guard_checks": [
+                "no_model_load",
+                "target_config_match",
+                "tool_thinking_replay_required",
+                "no_live_profile_change",
+                "no_opencode_changes",
+            ],
             "acceptance": "A fit plan exists and requires target-generated JANQ traces plus promotion gates before DFlash can become TUI default.",
             "rollback": "Keep normal MTP as default unless a candidate beats the promotion gate.",
             "evidence": speed_gap,
@@ -2467,7 +2488,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/test-speed-research.py"],
             "hypothesis": "JANQ drafter calibration must be gated by decode TPS and acceptance improvements, not loss-only improvements.",
             "metric": "decode_tps_delta",
-            "guard_checks": ["same_tokenizer", "no_reasoning_leak", "no_model_change", "tests_pass"],
+            "guard_checks": ["same_tokenizer", "no_reasoning_leak", "no_model_change", "tests_pass", "no_opencode_changes"],
             "acceptance": "The calibrator records pass/fail evidence against the official q4 drafter and refuses promotion unless wall-clock decode TPS improves.",
             "rollback": "Remove the gate if it blocks valid calibration or cannot compare against baseline safely.",
             "evidence": speed_gap,
@@ -2483,7 +2504,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "source_files": ["openclaw/openclaw-jang-vlm-server.py", "openclaw/test-speed-research.py"],
             "hypothesis": "DFlash can only improve TUI decode speed if its MLX draft loop can wrap the JANQ-loaded mlx_vlm Gemma4 target without bypassing OpenClaw guardrails.",
             "metric": "compatibility_decision_then_decode_tps",
-            "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_reasoning_leak"],
+            "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_reasoning_leak", "no_opencode_changes"],
             "acceptance": "Record a keep/discard/blocked decision with exact compatibility evidence before any DFlash install or live model benchmark.",
             "rollback": "No live rollback needed; this task must not change the active model profile or server path.",
             "evidence": speed_gap,
@@ -2666,6 +2687,107 @@ def synthesize(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def implementation_handoff_audit(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    rows = result_rows(root)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    candidates = [
+        task
+        for task in implementation_candidate_tasks(rows)
+        if task.get("task_type") in {"implementation", "supervisor"}
+    ]
+    deterministic_ready = [
+        task
+        for task in ready
+        if task.get("task_type") == "supervisor"
+        or task.get("benchmark_mode")
+        or "openclaw-speed-research" in str(task.get("next_action", ""))
+    ]
+    scoped_candidates = [
+        task
+        for task in candidates
+        if task.get("source_files")
+        and task.get("acceptance")
+        and task.get("rollback")
+        and "no_opencode_changes" in {str(item) for item in task.get("guard_checks", [])}
+    ]
+    contract_blockers = {
+        str(task.get("id", "")): issues["blockers"]
+        for task in [*ready, *candidates]
+        if (issues := task_contract_issues(root, task)).get("blockers")
+    }
+    patch_template = {
+        "id": "handoff-audit-patch-template",
+        "status": "ready",
+        "task_type": "supervisor",
+        "supervisor_action": "patch-execute",
+        "target": "openclaw/openclaw-speed-research.py",
+        "hypothesis": "Patch executor must canary-test allowlisted source changes before promotion.",
+        "metric": "decode_tps_delta",
+        "patch_file": "/tmp/openclaw-audit.patch",
+        "source_files": ["openclaw/openclaw-speed-research.py"],
+        "tests": list(DEFAULT_PATCH_TESTS),
+        "guard_checks": ["tests_pass", "no_opencode_changes", "rollback_path"],
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research patch-execute --patch-file /tmp/openclaw-audit.patch",
+    }
+    patch_template_contract = task_contract_issues(root, patch_template)
+    gates = {
+        "deterministic_ready_task": bool(deterministic_ready),
+        "implementation_candidates_present": len(candidates) >= 3,
+        "scoped_candidates_have_guards": len(scoped_candidates) >= 3,
+        "ready_contracts_clean": not contract_blockers,
+        "patch_executor_contract_ready": not patch_template_contract.get("blockers"),
+        "safe_patch_tests_allowlisted": all(command in set(DEFAULT_PATCH_TESTS) for command in DEFAULT_PATCH_TESTS),
+    }
+    gaps = [name for name, ok in gates.items() if not ok]
+    score = max(0, min(100, 100 - len(gaps) * 18 - min(30, len(contract_blockers) * 10)))
+    ok = score >= int(args.min_score)
+    timestamp = int(time.time())
+    report = {
+        "ok": ok,
+        "kind": "implementation-handoff-audit",
+        "timestamp": timestamp,
+        "score": score,
+        "min_score": int(args.min_score),
+        "gates": gates,
+        "gaps": gaps,
+        "ready_deterministic_tasks": [str(task.get("id", "")) for task in deterministic_ready[:12]],
+        "implementation_candidates": [str(task.get("id", "")) for task in candidates],
+        "scoped_candidates": [str(task.get("id", "")) for task in scoped_candidates],
+        "contract_blockers": contract_blockers,
+        "patch_template_contract": patch_template_contract,
+        "next": "continue_autopilot_loop" if ok else "run implementation bridge or repair task contracts before research",
+    }
+    path = root / "benchmarks" / f"implementation-handoff-audit-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "implementation-handoff-audit",
+            "finding": "supervisor audited implementation handoff gates before allowing another research loop",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"implementation-handoff-audit-{timestamp}",
+        status="keep" if ok else "blocked",
+        target="autoresearch-implementation-handoff",
+        hypothesis="Research findings should hand off into deterministic, scoped, canary-tested implementation tasks.",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"ok={ok} score={score} candidates={len(candidates)} scoped={len(scoped_candidates)} "
+            f"ready_deterministic={len(deterministic_ready)} blockers={len(contract_blockers)}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0 if ok else 2
 
 
 def compact(args: argparse.Namespace) -> int:
@@ -3705,6 +3827,10 @@ def main() -> int:
     review.add_argument("--min-samples-per-block", type=int, default=3)
     review.add_argument("--target-tps", type=float, default=30.0)
     review.set_defaults(func=quality_review)
+
+    handoff = sub.add_parser("implementation-handoff-audit")
+    handoff.add_argument("--min-score", type=int, default=90)
+    handoff.set_defaults(func=implementation_handoff_audit)
 
     frontier = sub.add_parser("frontier-review")
     frontier.add_argument("--recent-rows", type=int, default=160)

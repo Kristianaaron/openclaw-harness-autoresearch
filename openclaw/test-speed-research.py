@@ -484,6 +484,13 @@ def main() -> int:
             assert '"quality"' in findings
             assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
+            assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
+            assert handoff_paths
+            handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))
+            assert handoff["score"] >= 90
+            assert handoff["gates"]["patch_executor_contract_ready"] is True
+            assert handoff["gates"]["scoped_candidates_have_guards"] is True
             exhausted_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in exhausted_tasks:
                 task["status"] = "done"
