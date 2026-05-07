@@ -1317,6 +1317,46 @@ def recent_drafter_trace_gate(root: Path, *, recent_rows: int = 80) -> bool:
     )
 
 
+def recent_blocked_dflash_gate(root: Path, *, recent_rows: int = 80) -> dict[str, Any] | None:
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    for row in reversed(rows):
+        if row.get("status") != "blocked" or not row.get("run_id", "").startswith("dflash-compatibility-gate-"):
+            continue
+        run_id = row.get("run_id", "")
+        timestamp = run_id.rsplit("-", 1)[-1]
+        artifact = root / "experiments" / f"dflash-compatibility-gate-{timestamp}.json"
+        blockers: list[str] = []
+        if artifact.exists():
+            try:
+                with artifact.open("r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                if isinstance(loaded, dict):
+                    blockers = [str(item) for item in loaded.get("blockers", []) if item]
+            except (OSError, json.JSONDecodeError):
+                blockers = []
+        return {
+            "run_id": run_id,
+            "artifact": str(artifact),
+            "blockers": blockers,
+            "notes": row.get("notes", ""),
+        }
+    return None
+
+
+def dflash_lane_is_blocked(root: Path, *, recent_rows: int = 80) -> bool:
+    blocked = recent_blocked_dflash_gate(root, recent_rows=recent_rows)
+    if not blocked:
+        return False
+    blockers = {str(item) for item in blocked.get("blockers", [])}
+    hard_blockers = {
+        blocker
+        for blocker in blockers
+        if blocker.startswith("draft_model_type_mismatch=")
+        or blocker in {"dflash_draft_config_missing", "draft_target_layer_ids_missing"}
+    }
+    return bool(hard_blockers)
+
+
 def dflash_compatibility_task(timestamp: int, *, task_id: str, priority: int = 93) -> dict[str, Any]:
     return {
         "id": task_id,
@@ -1371,6 +1411,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     recent_mtp_report = recent_result_has_prefix(root, "mtp-report-", recent_rows=30)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=45)
     drafter_plan_ready = recent_drafter_fit_plan_ready(root, recent_rows=160)
+    dflash_blocked = dflash_lane_is_blocked(root, recent_rows=80)
 
     if not recent_mtp_report and should_seed_action(root, "deliberate-mtp-report-", recent_rows=30):
         tasks.append(
@@ -1429,7 +1470,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
                 )
             tasks.append(task)
             return tasks
-        if should_seed_action(root, "deliberate-dflash-compatibility-", recent_rows=55):
+        if not dflash_blocked and should_seed_action(root, "deliberate-dflash-compatibility-", recent_rows=55):
             tasks.append(dflash_compatibility_task(timestamp, task_id=f"deliberate-dflash-compatibility-{timestamp}"))
             return tasks
 
@@ -1608,7 +1649,7 @@ def quality_review(args: argparse.Namespace) -> int:
         )
         if should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
             seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=96))
-        if should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10):
+        if not dflash_lane_is_blocked(root, recent_rows=80) and should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10):
             seeded_tasks.append(
                 dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=94)
             )
@@ -1631,7 +1672,10 @@ def quality_review(args: argparse.Namespace) -> int:
                 },
             )
         seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
-        seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
+        if not dflash_lane_is_blocked(root, recent_rows=80):
+            seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
+        else:
+            recommendations.append("DFlash compatibility is already blocked by a hard draft mismatch; do not re-seed that lane until the draft candidate changes.")
     if blocked:
         review_status = "blocked"
         recommendations.append(f"recent run has {len(blocked)} blocked rows; inspect the last blocker before trusting speed conclusions.")
@@ -3231,7 +3275,11 @@ def plateau_pivot(args: argparse.Namespace) -> int:
     if plateau:
         if "drafter-alignment" not in ready_lanes and should_seed_action(root, "plateau-drafter-fit-", recent_rows=40):
             seeded_tasks.append(drafter_fit_task(timestamp, task_id=f"plateau-drafter-fit-{timestamp}", priority=97))
-        if "frontier-dflash" not in ready_lanes and should_seed_action(root, "plateau-dflash-compat-", recent_rows=40):
+        if (
+            "frontier-dflash" not in ready_lanes
+            and not dflash_lane_is_blocked(root, recent_rows=80)
+            and should_seed_action(root, "plateau-dflash-compat-", recent_rows=40)
+        ):
             seeded_tasks.append(
                 dflash_compatibility_task(timestamp, task_id=f"plateau-dflash-compat-{timestamp}", priority=95)
             )

@@ -593,6 +593,13 @@ def main() -> int:
             mismatch_report = json.loads(sorted((root / "experiments").glob("dflash-compatibility-gate-*.json"))[-1].read_text())
             assert mismatch_report["status"] == "blocked"
             assert "draft_model_type_mismatch=qwen3" in mismatch_report["blockers"]
+            assert helper.dflash_lane_is_blocked(root, recent_rows=20) is True
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [task for task in helper.read_jsonl(root / "tasks.jsonl") if "dflash" not in str(task.get("id", ""))],
+            )
+            no_dflash = helper.synthesis_deliberate_action_tasks(root, helper.result_rows(root), 123458)
+            assert not any("dflash" in str(task.get("id", "")) for task in no_dflash)
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths
             handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))
@@ -605,7 +612,13 @@ def main() -> int:
             helper.write_jsonl(root / "tasks.jsonl", exhausted_tasks)
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "deliberate-drafter-trace-gate-" in deliberate_tasks
+            assert "deliberate-dflash-compatibility-" not in deliberate_tasks
+            if "deliberate-drafter-trace-gate-" not in deliberate_tasks:
+                helper.write_jsonl(
+                    root / "tasks.jsonl",
+                    [helper.drafter_trace_gate_task(123459, task_id="deliberate-drafter-trace-gate-test")],
+                )
+                deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "deliberate_actions" in (root / "findings.jsonl").read_text(encoding="utf-8")
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
