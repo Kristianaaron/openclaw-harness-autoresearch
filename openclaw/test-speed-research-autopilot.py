@@ -152,6 +152,7 @@ def main() -> int:
     )
     assert helper.summarize_issue("memory circuit breaker stopped backend", "", 0) == "memory circuit breaker"
     assert helper.summarize_issue("", "fatal process exit via SIGABRT", 1) == "fatal process exit"
+    assert helper.summarize_issue("", "", -6) == "fatal process exit via SIGABRT"
     assert helper.summarize_issue("", "", 124) == "turn timeout"
     assert helper.summarize_issue("", "", 7) == "agent exit 7"
     assert helper.summarize_issue("all good", "", 0) == ""
@@ -166,9 +167,17 @@ def main() -> int:
     assert helper.early_failure_reason("normal bounded result") == ""
     assert helper.as_text(b"hello") == "hello"
     assert helper.as_text(None) == ""
-    args = Namespace(min_free_mb=1024, ready_min_free_mb=0, max_compressor_mb=8192, max_swap_mb=8192)
+    args = Namespace(
+        min_free_mb=1024,
+        ready_min_free_mb=0,
+        min_pressure_free_pct=3,
+        max_compressor_mb=8192,
+        max_swap_mb=8192,
+    )
     resident_snap = {"free_mb": 1396, "compressor_mb": 2088, "swap_used_mb": 1559}
     assert helper.memory_gate_reason(args, resident_snap, ready=True) == ""
+    pressure_snap = {"free_mb": 5000, "compressor_mb": 0, "swap_used_mb": 0, "pressure_free_pct": 1}
+    assert helper.memory_gate_reason(args, pressure_snap, ready=False).startswith("pressureFree=1%<3%")
     assert helper.memory_gate_reason(args, {"free_mb": 512, "compressor_mb": 0, "swap_used_mb": 0}, ready=False).startswith("free=512MB<1024MB")
     swap_hot = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 9000}
     assert helper.memory_gate_reason(args, swap_hot, ready=True).startswith("swap=9000MB>=8192MB")
@@ -176,6 +185,7 @@ def main() -> int:
     assert helper.memory_gate_reason(args, low_free_resident, ready=True) == ""
     active_args = Namespace(
         active_min_free_mb=128,
+        active_min_pressure_free_pct=2,
         active_max_compressor_mb=6144,
         active_max_swap_mb=8192,
         active_low_free_pressure_compressor_mb=4096,
@@ -183,6 +193,10 @@ def main() -> int:
         max_compressor_mb=8192,
         max_swap_mb=8192,
     )
+    assert helper.active_memory_circuit_reason(
+        active_args,
+        {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 0, "pressure_free_pct": 1},
+    ).startswith("pressureFree=1%<2%")
     assert helper.active_memory_circuit_reason(
         active_args,
         {"free_mb": 5000, "compressor_mb": 7000, "swap_used_mb": 0},
@@ -203,6 +217,23 @@ def main() -> int:
         active_args,
         {"free_mb": 1000, "compressor_mb": 1000, "swap_used_mb": 0},
     ) == ""
+    stable_args = Namespace(
+        min_free_mb=1024,
+        ready_min_free_mb=0,
+        min_pressure_free_pct=3,
+        max_compressor_mb=8192,
+        max_swap_mb=8192,
+        max_memory_wait_seconds=5,
+        memory_stop_model_after_wait=False,
+        memory_stable_samples=2,
+        memory_stable_interval_seconds=0,
+        memory_wait_seconds=0,
+    )
+    stable_snap = {"free_mb": 5000, "compressor_mb": 1000, "swap_used_mb": 0, "pressure_free_pct": 5}
+    with patch.object(helper, "memory_snapshot", side_effect=[stable_snap, stable_snap]):
+        with patch.object(helper, "model_ready", return_value=False):
+            with patch.object(helper.time, "sleep", return_value=None):
+                assert helper.wait_for_memory(stable_args) == (True, "")
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1

@@ -100,6 +100,15 @@ MALFORMED_OR_TOOL_ISSUES = (
     "malformed",
     "no durable artifact",
 )
+MEMORY_OR_CRASH_TERMS = (
+    "memory",
+    "metal",
+    "fatal process exit",
+    "sigabrt",
+    "sigkill",
+    "sigsegv",
+    "crash",
+)
 
 
 def log(message: str) -> None:
@@ -123,6 +132,11 @@ def file_mtime(path: Path) -> float:
 
 def clean_tsv(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
+
+
+def is_memory_or_crash_issue(text: object) -> bool:
+    lower = str(text).lower()
+    return any(term in lower for term in MEMORY_OR_CRASH_TERMS)
 
 
 def parse_json_object(text: str) -> dict[str, object] | None:
@@ -563,7 +577,7 @@ def block_stale_rejected_implementation_tasks() -> int:
 
 
 def memory_snapshot() -> dict[str, int]:
-    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
+    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0, "pressure_free_pct": 0}
     try:
         output = subprocess.check_output(["/usr/bin/vm_stat"], text=True, stderr=subprocess.DEVNULL)
         page_size = 16384
@@ -587,6 +601,19 @@ def memory_snapshot() -> dict[str, int]:
         output = subprocess.check_output(["/usr/sbin/sysctl", "vm.swapusage"], text=True, stderr=subprocess.DEVNULL)
         if "used = " in output:
             snapshot["swap_used_mb"] = int(float(output.split("used = ", 1)[1].split("M", 1)[0].strip()))
+    except Exception:
+        pass
+    try:
+        output = subprocess.check_output(
+            ["/usr/bin/memory_pressure"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        for line in output.splitlines():
+            if "System-wide memory free percentage:" in line:
+                snapshot["pressure_free_pct"] = int(line.rsplit(" ", 1)[-1].strip("%"))
+                break
     except Exception:
         pass
     return snapshot
@@ -758,22 +785,49 @@ def is_gateway_issue(issue: str) -> bool:
     return "gateway" in text or "embedded fallback" in text or "websocket" in text
 
 
+def stop_openclaw_model_for_memory_recovery(args: argparse.Namespace, *, reason: str) -> None:
+    log(f"memory recovery stopping OpenClaw-owned model: {reason}")
+    subprocess.run(
+        [
+            "/bin/zsh",
+            "-lc",
+            "fpath=(/Users/kristian/.zfunc $fpath); autoload -Uz openclaw; openclaw model-stop",
+        ],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=max(10, int(getattr(args, "memory_model_stop_timeout_seconds", 60))),
+        check=False,
+    )
+    cooldown = float(getattr(args, "memory_cooldown_after_stop_seconds", 0.0) or 0.0)
+    if cooldown > 0:
+        log(f"memory recovery cooldown after model-stop: {cooldown:.0f}s")
+        time.sleep(cooldown)
+
+
 def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready: bool) -> str:
     min_free_mb = args.ready_min_free_mb if ready else args.min_free_mb
+    min_pressure_free_pct = int(getattr(args, "min_pressure_free_pct", 0) or 0)
+    if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
+        return (
+            f"pressureFree={snap['pressure_free_pct']}%<{min_pressure_free_pct}% "
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
+        )
     if snap["compressor_mb"] >= args.max_compressor_mb:
         return (
             f"compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB "
-            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
+            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}% ready={ready}"
         )
     if snap["swap_used_mb"] >= args.max_swap_mb:
         return (
             f"swap={snap['swap_used_mb']}MB>={args.max_swap_mb}MB "
-            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB ready={ready}"
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}% ready={ready}"
         )
     if snap["free_mb"] and snap["free_mb"] < min_free_mb:
         return (
             f"free={snap['free_mb']}MB<{min_free_mb}MB "
-            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
+            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB "
+            f"pressureFree={snap.get('pressure_free_pct', 0)}% ready={ready}"
         )
     return ""
 
@@ -782,35 +836,33 @@ def wait_for_memory(args: argparse.Namespace) -> tuple[bool, str]:
     started = time.monotonic()
     last_reason = ""
     stopped_model = False
+    stable_samples = 0
+    required_stable_samples = max(1, int(getattr(args, "memory_stable_samples", 1) or 1))
     while True:
         snap = memory_snapshot()
         ready = model_ready()
         reason = memory_gate_reason(args, snap, ready=ready)
         if not reason:
-            return True, ""
+            stable_samples += 1
+            if stable_samples >= required_stable_samples:
+                return True, ""
+            log(
+                f"memory gate stabilizing: sample={stable_samples}/{required_stable_samples} "
+                f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB "
+                f"swap={snap['swap_used_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}%"
+            )
+            time.sleep(max(0.5, float(getattr(args, "memory_stable_interval_seconds", 2.0))))
+            continue
+        stable_samples = 0
         last_reason = f"memory gate waiting: {reason}"
         if args.max_memory_wait_seconds > 0 and time.monotonic() - started >= args.max_memory_wait_seconds:
             if args.memory_stop_model_after_wait and ready and not stopped_model:
-                log(f"memory recovery stopping OpenClaw-owned model after wait budget: {last_reason}")
-                subprocess.run(
-                    [
-                        "/bin/zsh",
-                        "-lc",
-                        "fpath=(/Users/kristian/.zfunc $fpath); autoload -Uz openclaw; openclaw model-stop",
-                    ],
-                    text=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=60,
-                    check=False,
-                )
+                stop_openclaw_model_for_memory_recovery(args, reason=f"wait budget exceeded: {last_reason}")
                 stopped_model = True
                 started = time.monotonic()
                 continue
             return False, f"{last_reason}; exceeded {args.max_memory_wait_seconds:.0f}s wait budget"
-        log(
-            last_reason
-        )
+        log(last_reason)
         time.sleep(args.memory_wait_seconds)
 
 
@@ -818,15 +870,21 @@ def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int])
     """Abort an in-flight agent turn before macOS/Metal reaches crash territory."""
     compressor_limit = args.active_max_compressor_mb or args.max_compressor_mb
     swap_limit = args.active_max_swap_mb or args.max_swap_mb
+    min_pressure_free_pct = int(getattr(args, "active_min_pressure_free_pct", 0) or 0)
+    if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
+        return (
+            f"pressureFree={snap['pressure_free_pct']}%<{min_pressure_free_pct}% "
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
+        )
     if snap["compressor_mb"] >= compressor_limit:
         return (
             f"compressor={snap['compressor_mb']}MB>={compressor_limit}MB "
-            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB"
+            f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}%"
         )
     if snap["swap_used_mb"] >= swap_limit:
         return (
             f"swap={snap['swap_used_mb']}MB>={swap_limit}MB "
-            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB"
+            f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}%"
         )
     if (
         snap["free_mb"]
@@ -838,7 +896,8 @@ def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int])
     ):
         return (
             f"free={snap['free_mb']}MB<{args.active_min_free_mb}MB "
-            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
+            f"compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB "
+            f"pressureFree={snap.get('pressure_free_pct', 0)}%"
         )
     return ""
 
@@ -1022,6 +1081,14 @@ def summarize_issue(stdout: str, stderr: str, returncode: int) -> str:
             return pattern
     if returncode == 124:
         return "turn timeout"
+    if returncode < 0:
+        signal_name = {
+            -6: "SIGABRT",
+            -9: "SIGKILL",
+            -11: "SIGSEGV",
+            -15: "SIGTERM",
+        }.get(returncode, f"signal {-returncode}")
+        return f"fatal process exit via {signal_name}"
     if returncode != 0:
         return f"agent exit {returncode}"
     return ""
@@ -2302,14 +2369,18 @@ def main() -> int:
     parser.add_argument("--thinking", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_THINKING", "off"))
     parser.add_argument("--min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_FREE_MB", "1024")))
     parser.add_argument("--ready-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_READY_MIN_FREE_MB", "0")))
+    parser.add_argument("--min-pressure-free-pct", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MIN_PRESSURE_FREE_PCT", "3")))
     parser.add_argument("--max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_COMPRESSOR_MB", "8192")))
     parser.add_argument("--max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_MAX_SWAP_MB", "8192")))
-    parser.add_argument("--active-memory-check-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MEMORY_CHECK_SECONDS", "5")))
+    parser.add_argument("--active-memory-check-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MEMORY_CHECK_SECONDS", "2")))
     parser.add_argument("--active-min-free-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MIN_FREE_MB", "128")))
+    parser.add_argument("--active-min-pressure-free-pct", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MIN_PRESSURE_FREE_PCT", "2")))
     parser.add_argument("--active-max-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_COMPRESSOR_MB", "6144")))
     parser.add_argument("--active-max-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_MAX_SWAP_MB", "8192")))
     parser.add_argument("--active-low-free-pressure-compressor-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_LOW_FREE_PRESSURE_COMPRESSOR_MB", "4096")))
     parser.add_argument("--active-low-free-pressure-swap-mb", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_ACTIVE_LOW_FREE_PRESSURE_SWAP_MB", "2048")))
+    parser.add_argument("--memory-stable-samples", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_MEMORY_STABLE_SAMPLES", "2")))
+    parser.add_argument("--memory-stable-interval-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MEMORY_STABLE_INTERVAL", "5")))
     parser.add_argument("--memory-wait-seconds", type=float, default=60.0)
     parser.add_argument(
         "--max-memory-wait-seconds",
@@ -2322,6 +2393,15 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_STOP_MODEL_AFTER_MEMORY_WAIT", "1") != "0",
         help="stop the OpenClaw-owned local model once memory stays unsafe beyond the wait budget",
+    )
+    parser.add_argument("--memory-model-stop-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_STOP_TIMEOUT", "60")))
+    parser.add_argument("--memory-cooldown-after-stop-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_MEMORY_COOLDOWN_AFTER_STOP", "60")))
+    parser.add_argument("--crash-cooldown-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_CRASH_COOLDOWN_SECONDS", "180")))
+    parser.add_argument(
+        "--stop-model-on-memory-crash",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_STOP_MODEL_ON_MEMORY_CRASH", "1") != "0",
+        help="stop OpenClaw's model process after memory, Metal, or fatal process failures before continuing",
     )
     parser.add_argument(
         "--rotate-session-after-stalls",
@@ -2360,6 +2440,7 @@ def main() -> int:
     recovery_epoch = 0
     progress_cycles = 0
     blocked_cycles = 0
+    crash_cooldown_until = 0.0
     cycle_limit = args.cycles
     extension_size = args.cycle_extension_size if args.cycle_extension_size > 0 else max(1, args.cycles)
     log(
@@ -2400,6 +2481,15 @@ def main() -> int:
         if time.monotonic() >= deadline:
             log("autopilot max-hours reached")
             break
+        now = time.monotonic()
+        if now < crash_cooldown_until:
+            remaining = min(crash_cooldown_until - now, max(0.0, deadline - now))
+            if remaining > 0:
+                log(f"memory/crash cooldown active before cycle={cycle}: sleeping {remaining:.0f}s")
+                time.sleep(min(remaining, max(1.0, args.sleep_seconds)))
+                if time.monotonic() < crash_cooldown_until:
+                    cycle -= 1
+                    continue
         stale_blocked = block_stale_rejected_implementation_tasks()
         if stale_blocked:
             log(f"supervisor blocked stale rejected implementation tasks count={stale_blocked}")
@@ -2518,6 +2608,18 @@ def main() -> int:
         last_issue = "" if progressed else (issue or str(quality["reason"]))
         if not progressed:
             blocked_cycles += 1
+        if is_memory_or_crash_issue(issue or last_issue or quality.get("reason", "")):
+            if args.stop_model_on_memory_crash and model_ready():
+                stop_openclaw_model_for_memory_recovery(
+                    args,
+                    reason=f"cycle={cycle} issue={issue or last_issue or quality.get('reason', '')}",
+                )
+            if args.crash_cooldown_seconds > 0:
+                crash_cooldown_until = max(crash_cooldown_until, time.monotonic() + args.crash_cooldown_seconds)
+                log(
+                    f"memory/crash cooldown armed for {args.crash_cooldown_seconds:.0f}s "
+                    f"after cycle={cycle} issue={issue or last_issue or quality.get('reason', '')}"
+                )
         log(
             f"cycle={cycle} exit={code} progressed={progressed} "
             f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
