@@ -1446,10 +1446,32 @@ def default_dflash_draft_path() -> Path:
     ).expanduser()
 
 
+def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop tasks from retired lanes before they enter the durable queue."""
+    exhausted = exhausted_lanes(root)
+    dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
+    seedable: list[dict[str, Any]] = []
+    for task in tasks:
+        lane = str(task.get("lane", ""))
+        task_id = str(task.get("id", ""))
+        action = str(task.get("supervisor_action", ""))
+        if lane in exhausted and lane != "exhaustion-report":
+            continue
+        if dflash_blocked and (
+            lane == "frontier-dflash"
+            or action == "dflash-compatibility-gate"
+            or "dflash-compatibility" in task_id
+        ):
+            continue
+        seedable.append(task)
+    return seedable
+
+
 def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
     """Create one high-signal next action when static synthesis candidates are exhausted."""
     recent = rows[-120:]
     tasks: list[dict[str, Any]] = []
+    exhausted = exhausted_lanes(root)
     sweep_rows = completed_drafter_sweep_rows(root, recent_rows=120, min_sweeps=3)
     sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
     last_sweeps = sweep_fields[-3:]
@@ -1464,7 +1486,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=45)
     drafter_plan_ready = recent_drafter_fit_plan_ready(root, recent_rows=160)
     dflash_suppressed = suppress_hard_blocked_dflash_lane(root, recent_rows=160)
-    dflash_blocked = dflash_suppressed or dflash_lane_is_blocked(root, recent_rows=160)
+    dflash_blocked = dflash_suppressed or dflash_lane_is_blocked(root, recent_rows=160) or "frontier-dflash" in exhausted
 
     if block_sweep_converged and below_practical_floor:
         mark_lane_exhausted(
@@ -1536,7 +1558,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
             return tasks
         if not dflash_blocked and should_seed_action(root, "deliberate-dflash-compatibility-", recent_rows=55):
             tasks.append(dflash_compatibility_task(timestamp, task_id=f"deliberate-dflash-compatibility-{timestamp}"))
-            return tasks
+            return filter_seedable_tasks(root, tasks)
 
     if not block_sweep_converged and len(sweep_rows) < 2 and should_seed_action(root, "deliberate-drafter-sweep-", recent_rows=40):
         tasks.append(
@@ -1559,7 +1581,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
                 "retries": 2,
             }
         )
-    return tasks
+    return filter_seedable_tasks(root, tasks)
 
 
 def research_quality_scorecard(
@@ -3005,19 +3027,10 @@ def causal_review(args: argparse.Namespace) -> int:
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
             }
         )
-    for task_id in report.get("low_confidence_kept", []):
-        repair_tasks.append(
-            {
-                "id": f"causal-review-{task_id}-{timestamp}",
-                "status": "ready",
-                "priority": 93,
-                "lane": "causal-repair",
-                "target": "promotion-decisions.jsonl",
-                "hypothesis": f"Low-confidence kept decision `{task_id}` needs review before related changes are promoted.",
-                "metric": "promotion_confidence",
-                "guard_checks": ["no_live_profile_change", "evidence_required", "no_opencode_changes"],
-                "next_action": "read exactly /Users/kristian/.openclaw/research/speed/promotion-decisions.jsonl and record a keep/discard/blocked note for the named task",
-            }
+    if report.get("low_confidence_kept"):
+        report["low_confidence_action"] = (
+            "recorded_in_causal_review_only; no model-bound repair task seeded because "
+            "the deterministic causal-review command is the source of truth"
         )
     seeded = upsert_tasks(root, repair_tasks) if repair_tasks else 0
     report["seeded_repair_tasks"] = seeded
@@ -3278,7 +3291,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 "",
             ]
         )
-    implementation_tasks = implementation_candidate_tasks(rows)
+    implementation_tasks = filter_seedable_tasks(root, implementation_candidate_tasks(rows))
     idea_lines.extend(
         [
             "## Implementation Candidates",
@@ -3363,7 +3376,7 @@ def synthesize(args: argparse.Namespace) -> int:
     )
     deliberate_tasks: list[dict[str, Any]] = []
     if seeded == 0:
-        deliberate_tasks = synthesis_deliberate_action_tasks(root, rows, int(time.time()))
+        deliberate_tasks = filter_seedable_tasks(root, synthesis_deliberate_action_tasks(root, rows, int(time.time())))
         seeded = upsert_tasks(root, deliberate_tasks) if deliberate_tasks else 0
     append_jsonl(
         root / "findings.jsonl",

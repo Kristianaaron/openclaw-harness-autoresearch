@@ -2134,7 +2134,7 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
         if non_runtime_map:
             filtered = non_runtime_map
     if not filtered:
-        filtered = tasks
+        return None
     contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]
     if contract_clean:
         filtered = contract_clean

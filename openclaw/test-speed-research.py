@@ -522,8 +522,13 @@ def main() -> int:
             assert causal_paths
             causal = json.loads(causal_paths[-1].read_text(encoding="utf-8"))
             assert "low-confidence" in causal["low_confidence_kept"]
-            assert causal["seeded_repair_tasks"] >= 1
-            assert "causal-repair" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert causal["low_confidence_action"].startswith("recorded_in_causal_review_only")
+            causal_task_ids = [
+                str(task.get("id", ""))
+                for task in helper.read_jsonl(root / "tasks.jsonl")
+                if str(task.get("lane", "")) == "causal-repair"
+            ]
+            assert not any(task_id.startswith("causal-review-low-confidence") for task_id in causal_task_ids)
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             ideas = (root / "ideas.md").read_text(encoding="utf-8")
             assert "mtp-acceptance-bottleneck" in ideas
@@ -634,6 +639,18 @@ def main() -> int:
             )
             no_dflash = helper.synthesis_deliberate_action_tasks(root, helper.result_rows(root), 123458)
             assert not any("dflash" in str(task.get("id", "")) for task in no_dflash)
+            helper.write_jsonl(root / "tasks.jsonl", [])
+            assert helper.mark_lane_exhausted(
+                root,
+                lane="frontier-dflash",
+                reason="regression-test exhausted lane",
+                evidence={"source": "unit-test"},
+            ) is False
+            exhausted_only = helper.filter_seedable_tasks(
+                root,
+                [helper.dflash_compatibility_task(123460, task_id="deliberate-dflash-compatibility-exhausted")],
+            )
+            assert exhausted_only == []
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths
             handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))
