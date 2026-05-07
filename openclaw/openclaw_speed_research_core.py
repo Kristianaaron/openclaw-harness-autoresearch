@@ -443,6 +443,9 @@ def ensure_research_state(root: Path) -> None:
         changed = False
         for task in existing:
             task_id = str(task.get("id", ""))
+            if task.get("metric") in {"decode_tps_delta_or_guardrail", "ready_deterministic_tasks"}:
+                task["metric"] = "decode_tps_delta"
+                changed = True
             if task_id.startswith("implementation-bridge-") and task.get("status", "ready") in {"ready", "rework"}:
                 bridge_update = {
                     "task_type": "supervisor",

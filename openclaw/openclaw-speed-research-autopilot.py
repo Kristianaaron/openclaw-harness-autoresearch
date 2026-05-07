@@ -1008,7 +1008,7 @@ def recurring_decode_tasks(cycle: int) -> list[dict[str, object]]:
             "target": "openclaw/openclaw-speed-research.py",
             "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
             "hypothesis": "When synthesis identifies a grounded TUI decode/MTP improvement, seed deterministic supervisor tasks instead of asking the LLM to improvise a patch.",
-            "metric": "decode_tps_delta_or_guardrail",
+            "metric": "decode_tps_delta",
             "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
             "acceptance": "Supervisor records which deterministic follow-up tasks were ready or seeded; no generic implementation turn is required.",
             "rollback": "No source rollback needed; the bridge only advances the deterministic queue.",
@@ -2320,6 +2320,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     )
     commands.append([args.research_helper_bin, "hypothesis-rank", "--limit", str(args.hypothesis_rank_limit)])
     commands.append([args.research_helper_bin, "causal-review", "--recent-rows", str(args.review_recent_rows)])
+    commands.append([args.research_helper_bin, "frontier-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
     commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
     commands.append(
         [

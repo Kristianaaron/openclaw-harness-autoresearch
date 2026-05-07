@@ -820,6 +820,7 @@ def main() -> int:
         assert "frontier-review --recent-rows 120 --min-samples 3" in review_log
         assert "hypothesis-rank --limit 12" in review_log
         assert "causal-review --recent-rows 120" in review_log
+        assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
         ok, issue = helper.run_supervisor_reflection(

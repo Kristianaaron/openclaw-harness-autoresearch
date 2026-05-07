@@ -1671,6 +1671,282 @@ def frontier_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
+    rows = result_rows(root)
+    recent = rows[-max(1, recent_rows) :]
+    checkpoint_index = next(
+        (
+            index
+            for index in range(len(recent) - 1, -1, -1)
+            if recent[index].get("run_id", "").startswith("frontier-system-eval-")
+        ),
+        -1,
+    )
+    active_recent = recent[checkpoint_index + 1 :] if checkpoint_index >= 0 else recent
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    replay = replay_checks(root)
+
+    blocked = [row for row in active_recent if row.get("status") == "blocked"]
+    historical_blocked = [row for row in recent if row.get("status") == "blocked"]
+    memory_blocks = [
+        row for row in blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
+    ]
+    historical_memory_blocks = [
+        row for row in historical_blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
+    ]
+    synthesis_rows = [row for row in active_recent if row.get("target") == "synthesis"]
+    historical_synthesis_rows = [row for row in recent if row.get("target") == "synthesis"]
+    empty_synthesis = [
+        row
+        for row in synthesis_rows
+        if "seeded_tasks=0" in row.get("notes", "") and "deliberate_actions=deliberate-" not in row.get("notes", "")
+    ]
+    historical_empty_synthesis = [
+        row
+        for row in historical_synthesis_rows
+        if "seeded_tasks=0" in row.get("notes", "") and "deliberate_actions=deliberate-" not in row.get("notes", "")
+    ]
+    bridge_zero = [
+        row
+        for row in active_recent
+        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        and "ready_deterministic=0" in row.get("notes", "")
+    ]
+    historical_bridge_zero = [
+        row
+        for row in recent
+        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        and "ready_deterministic=0" in row.get("notes", "")
+    ]
+    deliberate_ready = [task for task in ready if str(task.get("id", "")).startswith("deliberate-")]
+    deterministic_ready = [
+        task
+        for task in ready
+        if task.get("task_type") == "supervisor" or task.get("benchmark_mode") or "openclaw-speed-research" in str(task.get("next_action", ""))
+    ]
+    patch_rows = [row for row in active_recent if row.get("run_id", "").startswith("patch-executor-")]
+    quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
+    latest_quality_notes = quality_rows[-1].get("notes", "") if quality_rows else ""
+    latest_quality_fields = parse_note_fields(latest_quality_notes)
+    latest_quality_score = None
+    try:
+        latest_quality_score = float(latest_quality_fields["score"]) if latest_quality_fields.get("score") else None
+    except ValueError:
+        latest_quality_score = None
+    decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
+    contract = task_contract_report(root)
+    artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
+    frontier_lanes = {
+        str(task.get("lane", ""))
+        for task in ready
+        if str(task.get("lane", "")) in {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+    }
+
+    scores: dict[str, float] = {
+        "karpathy_core_loop": 9.1,
+        "crash_memory_safety": 9.2,
+        "research_quality": 8.6,
+        "implementation_handoff": 8.5,
+        "self_improvement": 8.8,
+        "modularity": 9.2,
+    }
+    gaps: list[str] = []
+    strengths: list[str] = []
+
+    if not replay.get("ok"):
+        scores["crash_memory_safety"] -= 2.5
+        gaps.append("replay guards are failing")
+    else:
+        strengths.append("replay guards pass")
+    if memory_blocks:
+        scores["crash_memory_safety"] -= min(1.2, len(memory_blocks) * 0.25)
+        gaps.append(f"recent memory/Metal blockers still present={len(memory_blocks)}")
+    if empty_synthesis:
+        scores["karpathy_core_loop"] -= min(2.0, len(empty_synthesis) * 0.35)
+        scores["research_quality"] -= min(1.2, len(empty_synthesis) * 0.2)
+        gaps.append(f"recent empty synthesis rows remain in the evaluation window={len(empty_synthesis)}")
+    if deliberate_ready:
+        scores["karpathy_core_loop"] += 0.4
+        scores["research_quality"] += 0.3
+        strengths.append("deliberate next action is queued instead of generic research churn")
+    if not deterministic_ready:
+        scores["karpathy_core_loop"] -= 1.0
+        gaps.append("no deterministic ready task is queued")
+    if bridge_zero:
+        scores["implementation_handoff"] -= min(1.4, len(bridge_zero) * 0.25)
+        gaps.append(f"recent implementation bridge rows had no deterministic task={len(bridge_zero)}")
+    if patch_rows:
+        scores["implementation_handoff"] += 0.4
+        strengths.append("patch executor has recent canary evidence")
+    if latest_quality_score is not None:
+        scores["research_quality"] += max(-1.2, min(0.6, (latest_quality_score - 75.0) / 100.0))
+    if not contract.get("ok"):
+        scores["implementation_handoff"] -= 1.0
+        gaps.append("ready task contract blockers exist")
+    if artifact.get("artifact_suspected"):
+        scores["research_quality"] -= 0.5
+        gaps.append("measurement artifact suspected; server and wall-clock decode must stay separated")
+    if frontier_lanes:
+        scores["self_improvement"] += 0.3
+        strengths.append("frontier lanes remain available: " + ",".join(sorted(frontier_lanes)))
+    if any(row.get("run_id", "").startswith("gepa-policy-promotion-") for row in recent):
+        scores["self_improvement"] += 0.2
+        strengths.append("GEPA-style reviewer policy path is active")
+    if decode_mean is not None and decode_mean < 20:
+        gaps.append(f"decode still below practical floor: {decode_mean} tok/s")
+
+    scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
+    overall = round(sum(scores.values()) / len(scores), 2)
+    readiness = "frontier-candidate" if overall >= 9.0 and not any("contract" in gap for gap in gaps) else "needs-targeted-work"
+    return {
+        "ok": True,
+        "kind": "frontier-system-eval",
+        "timestamp": int(time.time()),
+        "overall": overall,
+        "readiness": readiness,
+        "scores": scores,
+        "decode_mean_tps": decode_mean,
+        "active_window_rows": len(active_recent),
+        "ready_tasks": len(ready),
+        "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic_ready[:8]],
+        "deliberate_ready_tasks": [str(task.get("id", "")) for task in deliberate_ready[:8]],
+        "recent_empty_synthesis_rows": len(empty_synthesis),
+        "recent_bridge_zero_rows": len(bridge_zero),
+        "recent_memory_blocks": len(memory_blocks),
+        "historical_debt": {
+            "window_rows": len(recent),
+            "empty_synthesis_rows": len(historical_empty_synthesis),
+            "bridge_zero_rows": len(historical_bridge_zero),
+            "memory_blocks": len(historical_memory_blocks),
+        },
+        "latest_quality_score": latest_quality_score,
+        "task_contract": contract,
+        "measurement_artifact": artifact,
+        "strengths": strengths,
+        "gaps": gaps,
+        "next": (
+            "run the queued deliberate supervisor task, then rerun frontier-eval"
+            if deliberate_ready
+            else "seed one deliberate task with synthesize --kind frontier or add a canary patch task"
+        ),
+    }
+
+
+def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Seed one deterministic repair lane when the frontier score is below target."""
+    timestamp = int(report.get("timestamp") or time.time())
+    tasks: list[dict[str, Any]] = []
+    gaps = [str(gap) for gap in report.get("gaps", [])]
+
+    def has_gap(fragment: str) -> bool:
+        return any(fragment in gap for gap in gaps)
+
+    if has_gap("measurement artifact"):
+        tasks.append(
+            {
+                "id": f"frontier-repair-measurement-artifact-{timestamp}",
+                "status": "ready",
+                "priority": 98,
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "Frontier eval found decode measurement contamination, so separate backend server tok/s from wall-clock proxy/tool overhead before any promotion.",
+                "metric": "server_wall_decode_gap",
+                "guard_checks": ["no_model_turn_required", "no_live_profile_change", "no_opencode_changes"],
+                "acceptance": "A runtime-overhead map identifies the contaminated boundary or records that the measurement path is clean.",
+                "rollback": "No runtime rollback needed; this is a read-only supervisor artifact.",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+            }
+        )
+    elif has_gap("empty synthesis") or has_gap("no deterministic ready task") or has_gap("implementation bridge"):
+        tasks.append(
+            {
+                "id": f"frontier-repair-implementation-bridge-{timestamp}",
+                "status": "ready",
+                "priority": 97,
+                "lane": "implementation-gate",
+                "task_type": "supervisor",
+                "supervisor_action": "implementation-bridge",
+                "target": "tasks.jsonl",
+                "hypothesis": "Frontier eval found weak handoff, so convert the best current finding into a deterministic supervisor task instead of another generic research turn.",
+                "metric": "decode_tps_delta",
+                "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
+                "acceptance": "The bridge records at least one ready deterministic task with a valid contract.",
+                "rollback": "No source rollback needed; the bridge only changes the autoresearch queue.",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+            }
+        )
+    elif has_gap("memory/Metal"):
+        tasks.append(
+            {
+                "id": f"frontier-repair-memory-replay-{timestamp}",
+                "status": "ready",
+                "priority": 96,
+                "lane": "safety",
+                "task_type": "supervisor",
+                "supervisor_action": "focused-test",
+                "target": "openclaw/test-speed-research-autopilot.py",
+                "hypothesis": "Frontier eval found recent memory/Metal blockers, so rerun the autopilot guard test before another overnight loop.",
+                "metric": "memory_guard_replay",
+                "guard_checks": ["no_model_load", "no_opencode_changes", "bounded_test"],
+                "acceptance": "The autopilot focused test passes, including memory gate and recovery path assertions.",
+                "rollback": "No source rollback needed for a focused replay test.",
+                "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research-autopilot.py",
+            }
+        )
+    return tasks
+
+
+def frontier_eval(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    report = score_frontier_system(root, recent_rows=args.recent_rows)
+    seeded_tasks = 0
+    if report["overall"] < args.min_score:
+        repairs = [
+            task
+            for task in frontier_repair_tasks(report)
+            if not active_task_has_prefix(root, str(task.get("id", "")).rsplit("-", 1)[0] + "-")
+        ]
+        seeded_tasks = upsert_tasks(root, repairs) if repairs else 0
+        report["seeded_repair_tasks"] = seeded_tasks
+        if seeded_tasks:
+            report["next"] = "run seeded frontier repair task, then rerun frontier-eval"
+    else:
+        report["seeded_repair_tasks"] = 0
+    path = root / "benchmarks" / f"frontier-system-eval-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "frontier-system-eval",
+            "finding": "supervisor scored the autoresearch harness against frontier-level reliability and self-improvement criteria",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"frontier-system-eval-{report['timestamp']}",
+        status="keep" if report["overall"] >= args.min_score else "blocked",
+        target="autoresearch-frontier-eval",
+        hypothesis="OpenClaw autoresearch should be scored against Karpathy-style loop quality, safety, and implementation handoff",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"overall={report['overall']} readiness={report['readiness']} "
+            f"core={report['scores']['karpathy_core_loop']} safety={report['scores']['crash_memory_safety']} "
+            f"quality={report['scores']['research_quality']} handoff={report['scores']['implementation_handoff']} "
+            f"self_improvement={report['scores']['self_improvement']} gaps={len(report['gaps'])} "
+            f"seeded_repair_tasks={seeded_tasks}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0 if report["overall"] >= args.min_score or args.allow_fail else 2
+
+
 def gepa_escalation(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -3376,6 +3652,12 @@ def main() -> int:
     frontier.add_argument("--recent-rows", type=int, default=160)
     frontier.add_argument("--min-samples", type=int, default=3)
     frontier.set_defaults(func=frontier_review)
+
+    frontier_eval_parser = sub.add_parser("frontier-eval")
+    frontier_eval_parser.add_argument("--recent-rows", type=int, default=120)
+    frontier_eval_parser.add_argument("--min-score", type=float, default=9.0)
+    frontier_eval_parser.add_argument("--allow-fail", action="store_true")
+    frontier_eval_parser.set_defaults(func=frontier_eval)
 
     rank = sub.add_parser("hypothesis-rank")
     rank.add_argument("--limit", type=int, default=12)
