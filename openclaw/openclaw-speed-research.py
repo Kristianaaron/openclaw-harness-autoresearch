@@ -33,6 +33,7 @@ from openclaw_speed_research_core import (
     exhausted_lanes,
     gepa_escalation_report,
     gepa_policy_promotion_report,
+    latest_decode_mean,
     mark_lane_exhausted,
     measurement_artifact_analysis,
     load_benchmark_manifest,
@@ -1192,6 +1193,124 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     return additions
 
 
+def recent_result_has_prefix(root: Path, prefix: str, *, recent_rows: int = 80) -> bool:
+    return any(row.get("run_id", "").startswith(prefix) for row in result_rows(root)[-recent_rows:])
+
+
+def active_task_has_prefix(root: Path, prefix: str) -> bool:
+    return any(
+        task.get("status", "ready") in {"ready", "rework"} and str(task.get("id", "")).startswith(prefix)
+        for task in read_jsonl(root / "tasks.jsonl")
+    )
+
+
+def should_seed_action(root: Path, prefix: str, *, recent_rows: int = 80) -> bool:
+    return not active_task_has_prefix(root, prefix) and not recent_result_has_prefix(root, prefix, recent_rows=recent_rows)
+
+
+def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
+    """Create one high-signal next action when static synthesis candidates are exhausted."""
+    recent = rows[-120:]
+    tasks: list[dict[str, Any]] = []
+    sweep_rows = [
+        row for row in recent if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
+    ]
+    sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
+    last_sweeps = sweep_fields[-3:]
+    block_sweep_converged = (
+        len(last_sweeps) >= 2
+        and all(fields.get("decision") == "keep-current" for fields in last_sweeps)
+        and all(fields.get("winner_block") in {"", "2"} for fields in last_sweeps)
+    )
+    decode_mean = latest_decode_mean(root, recent_rows=80)
+    below_practical_floor = decode_mean is None or decode_mean < 20
+    recent_mtp_report = recent_result_has_prefix(root, "mtp-report-", recent_rows=30)
+
+    if not recent_mtp_report and should_seed_action(root, "deliberate-mtp-report-", recent_rows=30):
+        tasks.append(
+            {
+                "id": f"deliberate-mtp-report-{timestamp}",
+                "status": "ready",
+                "priority": 97,
+                "lane": "mtp-decode",
+                "task_type": "supervisor",
+                "supervisor_action": "mtp-report",
+                "target": "openclaw-model-proxy.log",
+                "hypothesis": "Before another speed experiment, capture MTP acceptance evidence from the live proxy log.",
+                "metric": "mean_accept",
+                "guard_checks": ["no_model_turn_required", "no_opencode_changes", "one_narrow_tool"],
+                "acceptance": "An MTP report artifact records server tok/s, MTP sample count, and mean acceptance when logs expose it.",
+                "rollback": "No runtime rollback needed; this is a read-only supervisor report.",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 240",
+                "lines": 240,
+            }
+        )
+        return tasks
+
+    if block_sweep_converged and below_practical_floor:
+        if should_seed_action(root, "deliberate-runtime-overhead-map-", recent_rows=35):
+            tasks.append(
+                {
+                    "id": f"deliberate-runtime-overhead-map-{timestamp}",
+                    "status": "ready",
+                    "priority": 96,
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
+                    "target": "openclaw/openclaw-jang-vlm-server.py",
+                    "hypothesis": "Block-size tuning has converged below target, so the next likely speed gain is reducing MTP loop or proxy overhead.",
+                    "metric": "server_wall_decode_gap",
+                    "guard_checks": ["no_live_profile_change", "no_model_turn_required", "no_opencode_changes", "tests_before_patch"],
+                    "acceptance": "A runtime-overhead artifact identifies one patchable boundary or explicitly rules out local source changes.",
+                    "rollback": "No live rollback needed unless a later source patch is created and canary-tested.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+                }
+            )
+            return tasks
+        if should_seed_action(root, "deliberate-drafter-fit-plan-", recent_rows=35):
+            tasks.append(
+                {
+                    "id": f"deliberate-drafter-fit-plan-{timestamp}",
+                    "status": "ready",
+                    "priority": 95,
+                    "lane": "drafter-alignment",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-fit-plan",
+                    "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+                    "hypothesis": "If official block-2 MTP is plateaued, the next frontier path is a JANQ-specific drafter fit gate.",
+                    "metric": "drafter_fit_gate",
+                    "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
+                    "acceptance": "A drafter-fit plan states required traces, gates, and promotion criteria before any training or live-profile change.",
+                    "rollback": "Keep the current MTP drafter as default until a fitted candidate beats paired TUI benchmarks.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
+                }
+            )
+            return tasks
+
+    if len(sweep_rows) < 2 and should_seed_action(root, "deliberate-drafter-sweep-", recent_rows=40):
+        tasks.append(
+            {
+                "id": f"deliberate-drafter-sweep-{timestamp}",
+                "status": "ready",
+                "priority": 94,
+                "lane": "mtp-decode",
+                "task_type": "supervisor",
+                "supervisor_action": "drafter-sweep-run",
+                "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+                "hypothesis": "A small paired block sweep is still needed before declaring MTP block-size tuning exhausted.",
+                "metric": "decode_tps",
+                "guard_checks": ["memory_gate", "bounded_trials", "tests_pass", "no_model_change", "restore_live_profile"],
+                "acceptance": "A paired sweep artifact records control and variant decode TPS with a keep/discard decision.",
+                "rollback": "Restore live profile after every variant and keep current settings unless the promotion gate passes.",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-sweep-run --blocks 1,2,3,4",
+                "blocks": "1,2,3,4",
+                "samples": 3,
+                "retries": 2,
+            }
+        )
+    return tasks
+
+
 def quality_review(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -2161,6 +2280,10 @@ def synthesize(args: argparse.Namespace) -> int:
         root,
         candidate_tasks,
     )
+    deliberate_tasks: list[dict[str, Any]] = []
+    if seeded == 0:
+        deliberate_tasks = synthesis_deliberate_action_tasks(root, rows, int(time.time()))
+        seeded = upsert_tasks(root, deliberate_tasks) if deliberate_tasks else 0
     append_jsonl(
         root / "findings.jsonl",
         {
@@ -2179,6 +2302,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 for task in candidate_tasks
                 if task.get("task_type") in {"implementation", "supervisor"}
             ],
+            "deliberate_actions": [task["id"] for task in deliberate_tasks],
             "seeded_tasks": seeded,
             "kind": args.kind,
         },
@@ -2190,9 +2314,23 @@ def synthesize(args: argparse.Namespace) -> int:
         target="synthesis",
         hypothesis="exhausted benchmark queues must generate ranked speed ideas and next tasks",
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
-        notes=f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind}",
+        notes=(
+            f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind} "
+            f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)}"
+        ),
     )
-    print(json.dumps({"ok": True, "ideas": len(ideas), "seeded_tasks": seeded, "ideas_path": str(ideas_path)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "ideas": len(ideas),
+                "seeded_tasks": seeded,
+                "deliberate_actions": [task["id"] for task in deliberate_tasks],
+                "ideas_path": str(ideas_path),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

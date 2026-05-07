@@ -462,6 +462,14 @@ def main() -> int:
             assert '"quality"' in findings
             assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
+            exhausted_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            for task in exhausted_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", exhausted_tasks)
+            assert helper.synthesize(Namespace(kind="frontier")) == 0
+            deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
+            assert "deliberate-mtp-report-" in deliberate_tasks
+            assert "deliberate_actions" in (root / "findings.jsonl").read_text(encoding="utf-8")
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
