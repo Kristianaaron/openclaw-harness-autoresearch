@@ -288,6 +288,7 @@ def configure_workspace(helper, workspace: Path) -> None:
     helper.EXPERIMENTS = helper.WORKSPACE / "experiments.jsonl"
     helper.REJECTIONS = helper.WORKSPACE / "rejections.jsonl"
     helper.OPENCLAW_HOME = workspace / "home"
+    helper.AUTOPILOT_LOCK = helper.WORKSPACE / "autopilot.lock"
 
 
 def main() -> int:
@@ -297,6 +298,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         configure_workspace(helper, Path(tmp))
         helper.ensure_task_queue()
+        first_lock = helper.acquire_autopilot_lock("unit-primary")
+        assert first_lock is not None
+        assert helper.acquire_autopilot_lock("unit-duplicate") is None
+        assert "autopilot-lock-" in helper.RESULTS.read_text(encoding="utf-8")
+        first_lock.close()
+        second_lock = helper.acquire_autopilot_lock("unit-after-release")
+        assert second_lock is not None
+        second_lock.close()
         helper.write_jsonl(
             helper.TASKS,
             [

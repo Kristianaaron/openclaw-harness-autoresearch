@@ -9,6 +9,7 @@ bounded `openclaw agent` turns against the same session.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -52,6 +53,7 @@ EXPERIMENTS = WORKSPACE / "experiments.jsonl"
 REJECTIONS = WORKSPACE / "rejections.jsonl"
 LOG_DIR = WORKSPACE / "logs"
 PROGRAM = WORKSPACE / "program.md"
+AUTOPILOT_LOCK = WORKSPACE / "autopilot.lock"
 DEFAULT_REPO = "/Users/kristian/Documents/openclaw-harness-autoresearch"
 DEFAULT_JANQ_TARGET_PATH = (
     "/Users/kristian/.cache/huggingface/hub/"
@@ -117,6 +119,47 @@ MEMORY_OR_CRASH_TERMS = (
 def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def acquire_autopilot_lock(session: str) -> object | None:
+    """Prevent two autopilots from mutating one research workspace at once."""
+    AUTOPILOT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = AUTOPILOT_LOCK.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        owner = handle.read().strip()
+        handle.close()
+        reason = f"another autoresearch autopilot already owns {AUTOPILOT_LOCK}"
+        if owner:
+            reason += f" owner={owner}"
+        append_result(
+            WORKSPACE,
+            run_id=f"autopilot-lock-{int(time.time())}",
+            status="blocked",
+            target="autoresearch-autopilot-lock",
+            hypothesis="only one autoresearch supervisor may mutate tasks/results for a workspace at a time",
+            commit=current_commit(),
+            notes=clean_tsv(reason),
+        )
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "session": session,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "workspace": str(WORKSPACE),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    handle.flush()
+    return handle
 
 
 def results_line_count() -> int:
@@ -1978,6 +2021,8 @@ def run_supervisor_implementation_bridge(
         if item.get("status", "ready") in {"ready", "rework"}
     }
     ok, issue = run_supervisor_synthesis(args, cycle, session, log_file)
+    stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
+    stale_causal_blocked = block_stale_model_bound_causal_tasks()
     after_ready = [
         item
         for item in read_jsonl(TASKS)
@@ -2005,6 +2050,8 @@ def run_supervisor_implementation_bridge(
         "seeded_deterministic_tasks": seeded,
         "ready_deterministic_tasks": deterministic[:12],
         "contract_blockers": blocked_contracts,
+        "stale_lane_blocked": stale_lane_blocked,
+        "stale_causal_blocked": stale_causal_blocked,
         "next": "select_next_ready_supervisor_task",
     }
     status = "keep" if ok and deterministic else "blocked"
@@ -2847,6 +2894,10 @@ def main() -> int:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ensure_task_queue()
+    autopilot_lock = acquire_autopilot_lock(args.session)
+    if autopilot_lock is None:
+        log(f"autopilot refused duplicate workspace run lock={AUTOPILOT_LOCK}")
+        return 2
     log_file = LOG_DIR / f"autopilot-{args.session}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + args.max_hours * 3600
     stalled_cycles = 0
