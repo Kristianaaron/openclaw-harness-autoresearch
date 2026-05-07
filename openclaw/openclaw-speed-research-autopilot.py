@@ -252,6 +252,46 @@ def ready_implementation_tasks() -> list[dict[str, object]]:
     return ready_tasks(task_type="implementation")
 
 
+def ready_work_summary() -> dict[str, object]:
+    tasks = ready_tasks()
+    lanes = sorted({str(task.get("lane", "")) for task in tasks if str(task.get("lane", ""))})
+    supervisor = sum(1 for task in tasks if str(task.get("task_type", "research")) == "supervisor")
+    implementation = sum(1 for task in tasks if str(task.get("task_type", "research")) == "implementation")
+    research = len(tasks) - supervisor - implementation
+    return {
+        "ready_tasks": len(tasks),
+        "supervisor_tasks": supervisor,
+        "implementation_tasks": implementation,
+        "research_tasks": research,
+        "lanes": lanes,
+    }
+
+
+def should_extend_cycle_budget(
+    args: argparse.Namespace,
+    *,
+    deadline: float,
+    progress_cycles: int,
+    blocked_cycles: int,
+    stalled_cycles: int,
+) -> tuple[bool, str, dict[str, object]]:
+    summary = ready_work_summary()
+    if not getattr(args, "auto_extend_cycles", False):
+        return False, "cycle budget reached and auto extension disabled", summary
+    remaining = deadline - time.monotonic()
+    if remaining <= max(1.0, float(getattr(args, "sleep_seconds", 0.0))):
+        return False, "max-hours deadline is reached or too close for another useful cycle", summary
+    rotate_after = int(getattr(args, "rotate_session_after_stalls", 0) or 0)
+    unhealthy_stalls = max(3, rotate_after * 2 if rotate_after > 0 else 3)
+    if progress_cycles <= 0 and stalled_cycles >= unhealthy_stalls:
+        return False, f"no durable progress after {stalled_cycles} stalled cycles", summary
+    if int(summary["ready_tasks"]) > 0:
+        return True, f"ready work remains: {summary['ready_tasks']} tasks lanes={','.join(summary['lanes']) or 'none'}", summary
+    if progress_cycles > 0 and blocked_cycles <= progress_cycles + max(2, rotate_after):
+        return True, "cycle tranche completed with healthy progress; allow supervisor synthesis/refill", summary
+    return False, "no ready tasks and recent progress is not healthy enough to extend", summary
+
+
 def recovery_mode(stalled_cycles: int, last_issue: str) -> str:
     issue = last_issue.lower()
     if "memory" in issue or "metal" in issue or "crash" in issue or "fatal process exit" in issue:
@@ -2290,6 +2330,18 @@ def main() -> int:
         help="start a fresh recovery session after this many cycles without durable progress",
     )
     parser.add_argument(
+        "--auto-extend-cycles",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_EXTEND_CYCLES", "1") != "0",
+        help="when the cycle tranche ends, keep going until max-hours if useful work remains or progress is healthy",
+    )
+    parser.add_argument(
+        "--cycle-extension-size",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_CYCLE_EXTENSION_SIZE", "0")),
+        help="additional cycles to add per auto-extension; 0 reuses the original --cycles tranche size",
+    )
+    parser.add_argument(
         "--reuse-session",
         action="store_true",
         help="reuse one OpenClaw session instead of Ralph-style fresh sessions per cycle",
@@ -2308,14 +2360,41 @@ def main() -> int:
     recovery_epoch = 0
     progress_cycles = 0
     blocked_cycles = 0
-    log(f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} log={log_file}")
+    cycle_limit = args.cycles
+    extension_size = args.cycle_extension_size if args.cycle_extension_size > 0 else max(1, args.cycles)
+    log(
+        f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} "
+        f"auto_extend_cycles={args.auto_extend_cycles} extension_size={extension_size} log={log_file}"
+    )
     run_supervisor_compaction(args, log_file)
     replay_start = replay_checks(WORKSPACE)
     if not replay_start["ok"]:
         append_supervisor_result(0, args.session, "blocked", f"startup replay failed: {replay_start}")
         log(f"startup replay guards failed: {replay_start}")
         return 2
-    for cycle in range(1, args.cycles + 1):
+    cycle = 0
+    while True:
+        if cycle >= cycle_limit:
+            extend, reason, summary = should_extend_cycle_budget(
+                args,
+                deadline=deadline,
+                progress_cycles=progress_cycles,
+                blocked_cycles=blocked_cycles,
+                stalled_cycles=stalled_cycles,
+            )
+            if not extend:
+                log(
+                    f"cycle budget reached at cycle={cycle}; stopping: {reason} "
+                    f"ready_tasks={summary['ready_tasks']} progress={progress_cycles} blocked={blocked_cycles}"
+                )
+                break
+            old_limit = cycle_limit
+            cycle_limit += extension_size
+            log(
+                f"cycle budget reached at cycle={cycle}; extending {old_limit}->{cycle_limit}: {reason} "
+                f"progress={progress_cycles} blocked={blocked_cycles}"
+            )
+        cycle += 1
         if not args.reuse_session:
             current_session = f"{args.session}-cycle-{cycle:03d}"
         if time.monotonic() >= deadline:
@@ -2337,7 +2416,7 @@ def main() -> int:
             if (
                 args.rotate_session_after_stalls > 0
                 and stalled_cycles >= args.rotate_session_after_stalls
-                and cycle < args.cycles
+                and cycle < cycle_limit
             ):
                 recovery_epoch += 1
                 current_session = f"{args.session}-recovery-{recovery_epoch}"
@@ -2517,7 +2596,7 @@ def main() -> int:
         if (
             args.rotate_session_after_stalls > 0
             and stalled_cycles >= args.rotate_session_after_stalls
-            and cycle < args.cycles
+            and cycle < cycle_limit
         ):
             recovery_epoch += 1
             current_session = f"{args.session}-recovery-{recovery_epoch}"

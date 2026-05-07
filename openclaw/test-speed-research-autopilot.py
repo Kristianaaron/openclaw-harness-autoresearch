@@ -230,6 +230,47 @@ def main() -> int:
         assert "implementation-bridge-cycle-042" in recurring_tasks
         assert '"supervisor_action": "implementation-bridge"' in recurring_tasks
         assert "autopilot-refill" in helper.RESULTS.read_text(encoding="utf-8")
+        extend_args = Namespace(auto_extend_cycles=True, sleep_seconds=0, rotate_session_after_stalls=3)
+        extend, reason, summary = helper.should_extend_cycle_budget(
+            extend_args,
+            deadline=helper.time.monotonic() + 120,
+            progress_cycles=1,
+            blocked_cycles=0,
+            stalled_cycles=0,
+        )
+        assert extend
+        assert "ready work remains" in reason
+        assert summary["ready_tasks"] >= 1
+        helper.write_jsonl(helper.TASKS, [])
+        extend, reason, summary = helper.should_extend_cycle_budget(
+            extend_args,
+            deadline=helper.time.monotonic() + 120,
+            progress_cycles=3,
+            blocked_cycles=1,
+            stalled_cycles=0,
+        )
+        assert extend
+        assert "supervisor synthesis" in reason
+        extend, reason, summary = helper.should_extend_cycle_budget(
+            extend_args,
+            deadline=helper.time.monotonic() + 120,
+            progress_cycles=0,
+            blocked_cycles=3,
+            stalled_cycles=6,
+        )
+        assert not extend
+        assert "no durable progress" in reason
+        disabled_args = Namespace(auto_extend_cycles=False, sleep_seconds=0, rotate_session_after_stalls=3)
+        extend, reason, summary = helper.should_extend_cycle_budget(
+            disabled_args,
+            deadline=helper.time.monotonic() + 120,
+            progress_cycles=3,
+            blocked_cycles=0,
+            stalled_cycles=0,
+        )
+        assert not extend
+        assert "disabled" in reason
+        helper.ensure_task_queue()
         selected = helper.select_next_task(helper.WORKSPACE)
         assert selected["id"] == "decode-mtp-baseline"
         with helper.RESULTS.open("a", encoding="utf-8") as file:
