@@ -738,6 +738,36 @@ def main() -> int:
         assert code == 0
         assert issue == "target-generated-trace-data-missing"
         assert helper.read_jsonl(helper.TASKS)[0]["status"] == "blocked"
+        dflash_helper = Path(tmp) / "dflash-helper.py"
+        dflash_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok': True, 'status': 'keep', 'decision': 'canary-plan-ready', 'blockers': []}))\n",
+            encoding="utf-8",
+        )
+        dflash_helper.chmod(0o700)
+        dflash_args = Namespace(research_helper_bin=str(dflash_helper))
+        legacy_dflash_task = {
+            "id": "deliberate-dflash-compatibility-1",
+            "status": "ready",
+            "lane": "frontier-dflash",
+            "task_type": "research",
+            "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
+            "hypothesis": "legacy model-bound DFlash task should be supervisor-routed",
+        }
+        assert helper.is_supervisor_dflash_compatibility_task(legacy_dflash_task)
+        assert helper.task_runs_without_model(legacy_dflash_task)
+        helper.write_jsonl(helper.TASKS, [legacy_dflash_task])
+        code, issue = helper.run_supervisor_dflash_compatibility_task(
+            dflash_args,
+            10,
+            "test-session",
+            helper.read_jsonl(helper.TASKS)[0],
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert helper.read_jsonl(helper.TASKS)[0]["status"] == "done"
         patch_helper = Path(tmp) / "patch-helper.py"
         patch_helper.write_text(
             "#!/usr/bin/env python3\n"

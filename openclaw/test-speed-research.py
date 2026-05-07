@@ -177,6 +177,26 @@ def main() -> int:
             bad_contract = helper.task_contract_report(root)
             assert bad_contract["ok"] is False
             assert "forbidden scope reference: opencode" in bad_contract["issues"][0]["blockers"]
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    {
+                        "id": "deliberate-dflash-compatibility-legacy",
+                        "status": "ready",
+                        "priority": 93,
+                        "lane": "frontier-dflash",
+                        "task_type": "research",
+                        "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
+                        "hypothesis": "legacy DFlash task",
+                        "metric": "compatibility_decision_then_decode_tps",
+                        "next_action": "read implementation-skill.md",
+                    }
+                ],
+            )
+            helper.ensure_research_state(root)
+            migrated = helper.read_jsonl(root / "tasks.jsonl")[0]
+            assert migrated["supervisor_action"] == "dflash-compatibility-gate"
+            assert "openclaw-speed-research dflash-compatibility-gate" in migrated["next_action"]
             helper.write_jsonl(root / "tasks.jsonl", tasks)
             helper.write_jsonl(
                 root / "tasks.jsonl",
@@ -505,14 +525,74 @@ def main() -> int:
             assert "implement-janq-drafter-calibration-gate" in tasks
             assert "dflash-janq-compatibility-spike" in tasks
             assert '"supervisor_action": "drafter-sweep-run"' in tasks
+            assert '"supervisor_action": "dflash-compatibility-gate"' in tasks
             assert "openclaw-speed-research mtp-report" in tasks
-            assert "First tool call: read exactly" in tasks
+            assert "openclaw-speed-research dflash-compatibility-gate" in tasks
             findings = (root / "findings.jsonl").read_text(encoding="utf-8")
             assert "synthesize-speed-ideas" in findings
             assert '"quality"' in findings
             assert "implementation_candidates" in findings
             assert "synthesis" in (root / "results.tsv").read_text(encoding="utf-8")
             assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            repo = Path(tmp) / "repo"
+            (repo / "openclaw").mkdir(parents=True)
+            (repo / "openclaw" / "openclaw-jang-vlm-server.py").write_text(
+                "\n".join(
+                    [
+                        "from dflash.model_mlx import load_draft",
+                        "from dflash.model_mlx import stream_generate",
+                        "def validate_dflash_compatibility(): pass",
+                        "def should_use_dflash(): pass",
+                        "def record_dflash_acceptance(): pass",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (repo / "openclaw" / "openclaw-jang-vlm-launcher.py").write_text(
+                "def ensure_dflash_runtime():\n    return 'import dflash.model_mlx'\n",
+                encoding="utf-8",
+            )
+            draft = Path(tmp) / "draft"
+            draft.mkdir()
+            (draft / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "gemma4",
+                        "dflash_config": {"target_layer_ids": [1, 12, 23, 35, 46, 57]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fit_plan = Path(tmp) / "fit-plan.json"
+            fit_plan.write_text(
+                json.dumps({"decision": "ready-for-target-generated-trace-data"}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_REPO": str(repo)}, clear=False):
+                assert helper.dflash_compatibility_gate(
+                    Namespace(draft_path=str(draft), plan=str(fit_plan))
+                ) == 0
+            dflash_reports = list((root / "experiments").glob("dflash-compatibility-gate-*.json"))
+            assert dflash_reports
+            dflash_report = json.loads(dflash_reports[-1].read_text(encoding="utf-8"))
+            assert dflash_report["status"] == "keep"
+            assert dflash_report["evidence"]["server_hooks"]["acceptance_metrics"] is True
+            (draft / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "dflash_config": {"target_layer_ids": [1, 12, 23, 35, 46, 57]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_REPO": str(repo)}, clear=False):
+                assert helper.dflash_compatibility_gate(
+                    Namespace(draft_path=str(draft), plan=str(fit_plan))
+                ) == 0
+            mismatch_report = json.loads(sorted((root / "experiments").glob("dflash-compatibility-gate-*.json"))[-1].read_text())
+            assert mismatch_report["status"] == "blocked"
+            assert "draft_model_type_mismatch=qwen3" in mismatch_report["blockers"]
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths
             handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))

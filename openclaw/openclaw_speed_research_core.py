@@ -603,6 +603,21 @@ def ensure_research_state(root: Path) -> None:
                     if task.get(key) != value:
                         task[key] = value
                         changed = True
+            if (
+                task_id.startswith(("deliberate-dflash-compatibility-", "plateau-dflash-compat-"))
+                and task.get("status", "ready") in {"ready", "rework"}
+            ):
+                dflash_update = {
+                    "task_type": "supervisor",
+                    "supervisor_action": "dflash-compatibility-gate",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research dflash-compatibility-gate",
+                    "blocked_reason": "",
+                    "supervisor_summary": {},
+                }
+                for key, value in dflash_update.items():
+                    if task.get(key) != value:
+                        task[key] = value
+                        changed = True
             migration = TASK_MIGRATIONS.get(str(task.get("id", "")))
             if not migration:
                 continue
@@ -1461,6 +1476,7 @@ def task_risk_level(task: dict[str, Any]) -> str:
         "gepa-policy-canary",
         "drafter-fit-plan",
         "drafter-trace-gate",
+        "dflash-compatibility-gate",
     }:
         return "low"
     if "restore_live_profile" in guards or "memory_gate" in guards or "tests_pass" in guards:

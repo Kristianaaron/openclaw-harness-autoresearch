@@ -1323,15 +1323,33 @@ def dflash_compatibility_task(timestamp: int, *, task_id: str, priority: int = 9
         "status": "ready",
         "priority": priority,
         "lane": "frontier-dflash",
-        "task_type": "research",
+        "task_type": "supervisor",
+        "supervisor_action": "dflash-compatibility-gate",
         "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
         "hypothesis": "DFlash-style block drafting may raise decode speed, but JANQ compatibility must be proven before runtime promotion.",
         "metric": "compatibility_decision_then_decode_tps",
-        "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_opencode_changes"],
-        "acceptance": "Compatibility evidence names the exact unsupported layer or a canary-only path with no live profile mutation.",
+        "guard_checks": [
+            "no_model_load",
+            "no_live_profile_change",
+            "separate_env",
+            "stream_guard",
+            "no_opencode_changes",
+        ],
+        "acceptance": "A deterministic compatibility artifact names the exact blocker or a canary-only path with no live profile mutation.",
         "rollback": "Do not touch the normal OpenClaw TUI profile unless a paired benchmark beats the current MTP path and all guards pass.",
-        "next_action": "read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md, then inspect the DFlash compatibility plan without installing into the live runtime",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research dflash-compatibility-gate",
     }
+
+
+def default_dflash_draft_path() -> Path:
+    return Path(
+        os.environ.get(
+            "OPENCLAW_DFLASH_DRAFT_PATH",
+            "/Users/kristian/.cache/huggingface/hub/"
+            "models--z-lab--gemma-4-31B-it-DFlash/"
+            "snapshots/9e3bf61731945317dfb0dc2d130c383c9d051f76",
+        )
+    ).expanduser()
 
 
 def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
@@ -2393,6 +2411,153 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def dflash_compatibility_gate(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    repo = repo_root()
+    server_path = repo / "openclaw" / "openclaw-jang-vlm-server.py"
+    launcher_path = repo / "openclaw" / "openclaw-jang-vlm-launcher.py"
+    draft_path = Path(args.draft_path).expanduser() if args.draft_path else default_dflash_draft_path()
+    plan_path = Path(args.plan).expanduser()
+    blockers: list[str] = []
+    warnings: list[str] = []
+    evidence: dict[str, Any] = {
+        "server_path": str(server_path),
+        "launcher_path": str(launcher_path),
+        "draft_path": str(draft_path),
+        "plan_path": str(plan_path),
+    }
+
+    try:
+        server_text = server_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        server_text = ""
+        blockers.append(f"server_read_error={type(error).__name__}")
+    try:
+        launcher_text = launcher_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        launcher_text = ""
+        blockers.append(f"launcher_read_error={type(error).__name__}")
+
+    required_server_hooks = {
+        "load_dflash": "from dflash.model_mlx import load_draft",
+        "stream_generate": "from dflash.model_mlx import stream_generate",
+        "compatibility_check": "validate_dflash_compatibility",
+        "tool_guard": "should_use_dflash",
+        "acceptance_metrics": "record_dflash_acceptance",
+    }
+    evidence["server_hooks"] = {
+        name: needle in server_text for name, needle in required_server_hooks.items()
+    }
+    for name, present in evidence["server_hooks"].items():
+        if not present:
+            blockers.append(f"missing_server_hook={name}")
+
+    required_launcher_hooks = {
+        "separate_runtime_check": "ensure_dflash_runtime",
+        "package_import_probe": "import dflash.model_mlx",
+    }
+    evidence["launcher_hooks"] = {
+        name: needle in launcher_text for name, needle in required_launcher_hooks.items()
+    }
+    for name, present in evidence["launcher_hooks"].items():
+        if not present:
+            blockers.append(f"missing_launcher_hook={name}")
+
+    draft_config = draft_path / "config.json"
+    evidence["draft_config_exists"] = draft_config.exists()
+    if not draft_config.exists():
+        blockers.append("dflash_draft_config_missing")
+    else:
+        try:
+            with draft_config.open("r", encoding="utf-8") as file:
+                loaded_config = json.load(file)
+            dflash_cfg = loaded_config.get("dflash_config") if isinstance(loaded_config, dict) else {}
+            if not isinstance(dflash_cfg, dict):
+                dflash_cfg = {}
+            evidence["draft_model_type"] = loaded_config.get("model_type") if isinstance(loaded_config, dict) else ""
+            evidence["draft_target_layer_ids"] = (
+                loaded_config.get("target_layer_ids") if isinstance(loaded_config, dict) else None
+            ) or dflash_cfg.get("target_layer_ids")
+            evidence["draft_num_target_layers"] = (
+                loaded_config.get("num_target_layers") if isinstance(loaded_config, dict) else None
+            ) or dflash_cfg.get("num_target_layers")
+            model_type = str(evidence["draft_model_type"]).lower()
+            if model_type and "gemma" not in model_type:
+                blockers.append(f"draft_model_type_mismatch={model_type}")
+            if not evidence["draft_target_layer_ids"]:
+                blockers.append("draft_target_layer_ids_missing")
+        except (OSError, json.JSONDecodeError) as error:
+            blockers.append(f"draft_config_read_error={type(error).__name__}")
+
+    plan_decision = ""
+    if plan_path.exists():
+        try:
+            with plan_path.open("r", encoding="utf-8") as file:
+                plan = json.load(file)
+            if isinstance(plan, dict):
+                plan_decision = str(plan.get("decision", ""))
+        except (OSError, json.JSONDecodeError) as error:
+            warnings.append(f"fit_plan_read_error={type(error).__name__}")
+    else:
+        warnings.append("fit_plan_missing")
+    evidence["fit_plan_decision"] = plan_decision
+    if plan_decision and plan_decision != "ready-for-target-generated-trace-data":
+        blockers.append(f"fit_plan_not_ready={plan_decision}")
+
+    status = "keep" if not blockers else "blocked"
+    decision = "canary-plan-ready" if status == "keep" else "blocked"
+    timestamp = int(time.time())
+    report = {
+        "ok": True,
+        "kind": "dflash-compatibility-gate",
+        "status": status,
+        "decision": decision,
+        "blockers": blockers,
+        "warnings": warnings,
+        "evidence": evidence,
+        "promotion_gate": {
+            "must_keep_target_model": True,
+            "must_use_separate_env": True,
+            "must_pass_tool_thinking_stream_replay": True,
+            "must_beat_current_decode_tps": True,
+            "must_restore_live_profile": True,
+        },
+        "next_action": (
+            "run_dflash_canary_with_paired_decode_benchmark"
+            if status == "keep"
+            else "repair_blockers_or_collect_target_generated_trace_data"
+        ),
+        "timestamp": timestamp,
+    }
+    path = root / "experiments" / f"dflash-compatibility-gate-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "dflash-compatibility-gate",
+            "finding": "supervisor converted DFlash research into a deterministic no-model-load compatibility gate",
+            "evidence": report,
+            "next": report["next_action"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"dflash-compatibility-gate-{timestamp}",
+        status=status,
+        target="frontier-dflash",
+        hypothesis="DFlash must pass a deterministic JANQ compatibility gate before any live runtime canary.",
+        commit=current_commit(repo),
+        notes=(
+            f"decision={decision} blockers={len(blockers)} warnings={len(warnings)} "
+            f"path={path}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0
+
+
 def hypothesis_rank(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -2686,20 +2851,24 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
             "status": "ready",
             "priority": 64,
             "lane": "frontier-dflash",
-            "task_type": "analysis",
+            "task_type": "supervisor",
+            "supervisor_action": "dflash-compatibility-gate",
             "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
             "source_files": ["openclaw/openclaw-jang-vlm-server.py", "openclaw/test-speed-research.py"],
             "hypothesis": "DFlash can only improve TUI decode speed if its MLX draft loop can wrap the JANQ-loaded mlx_vlm Gemma4 target without bypassing OpenClaw guardrails.",
             "metric": "compatibility_decision_then_decode_tps",
-            "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_reasoning_leak", "no_opencode_changes"],
-            "acceptance": "Record a keep/discard/blocked decision with exact compatibility evidence before any DFlash install or live model benchmark.",
+            "guard_checks": [
+                "no_model_load",
+                "no_live_profile_change",
+                "separate_env",
+                "stream_guard",
+                "no_reasoning_leak",
+                "no_opencode_changes",
+            ],
+            "acceptance": "Record a deterministic keep/discard/blocked decision with exact compatibility evidence before any DFlash install or live model benchmark.",
             "rollback": "No live rollback needed; this task must not change the active model profile or server path.",
             "evidence": speed_gap,
-            "next_action": (
-                "First tool call: read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md. "
-                "Then inspect exactly https://github.com/z-lab/dflash or /tmp/dflash-openclaw-inspect/dflash/model_mlx.py if already cloned. "
-                "Do not install DFlash into the live OpenClaw runtime and do not change the active model profile."
-            ),
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research dflash-compatibility-gate",
         },
     ]
 
@@ -4239,6 +4408,14 @@ def main() -> int:
     )
     trace_gate.add_argument("--trace-data", default="")
     trace_gate.set_defaults(func=drafter_trace_gate)
+
+    dflash_gate = sub.add_parser("dflash-compatibility-gate")
+    dflash_gate.add_argument("--draft-path", default="")
+    dflash_gate.add_argument(
+        "--plan",
+        default="/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+    )
+    dflash_gate.set_defaults(func=dflash_compatibility_gate)
 
     compact_parser = sub.add_parser("compact")
     compact_parser.add_argument("--recent-rows", type=int, default=24)
