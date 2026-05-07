@@ -1326,6 +1326,24 @@ def drafter_trace_gate_task(timestamp: int, *, task_id: str, priority: int = 96)
     }
 
 
+def drafter_trace_prerequisite_task(timestamp: int, *, task_id: str, priority: int = 99) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-trace-prerequisite",
+        "target": "/Users/kristian/.openclaw/drafter-fit/target-generated-traces.jsonl",
+        "hypothesis": "JANQ drafter fitting is blocked on target-generated trace data; record the exact prerequisite instead of repeating trace gates.",
+        "metric": "target_trace_data_presence",
+        "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A prerequisite artifact lists the expected trace files and marks the lane blocked until data exists.",
+        "rollback": "No runtime rollback needed; this is a read-only prerequisite report.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-prerequisite",
+    }
+
+
 def recent_drafter_fit_plan_ready(root: Path, *, recent_rows: int = 160) -> bool:
     for row in result_rows(root)[-max(1, recent_rows) :]:
         if row.get("status") != "keep":
@@ -1342,6 +1360,19 @@ def recent_drafter_trace_gate(root: Path, *, recent_rows: int = 80) -> bool:
     return any(
         row.get("run_id", "").startswith("drafter-trace-gate-")
         or row.get("run_id", "").startswith("supervisor-drafter-trace-gate-")
+        for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
+def recent_drafter_trace_missing(root: Path, *, recent_rows: int = 120) -> bool:
+    return any(
+        (
+            row.get("run_id", "").startswith("drafter-trace-gate-")
+            or row.get("run_id", "").startswith("supervisor-drafter-trace-gate-")
+            or row.get("run_id", "").startswith("drafter-trace-prerequisite-")
+            or row.get("run_id", "").startswith("supervisor-drafter-trace-prerequisite-")
+        )
+        and "target-generated-trace-data-missing" in row.get("notes", "")
         for row in result_rows(root)[-max(1, recent_rows) :]
     )
 
@@ -1465,6 +1496,82 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             continue
         seedable.append(task)
     return seedable
+
+
+def is_deterministic_research_task(task: dict[str, Any]) -> bool:
+    return (
+        task.get("task_type") == "supervisor"
+        or bool(task.get("benchmark_mode"))
+        or "openclaw-speed-research" in str(task.get("next_action", ""))
+    )
+
+
+def is_implementation_bridge_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    return (
+        task.get("supervisor_action") == "implementation-bridge"
+        or task_id.startswith("implementation-bridge-")
+        or task_id.startswith("handoff-audit-deterministic-bridge-")
+        or task_id.startswith("frontier-repair-implementation-bridge-")
+    )
+
+
+def recent_empty_bridge_rows(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 80,
+) -> list[dict[str, str]]:
+    window = (rows if rows is not None else result_rows(root))[-max(1, recent_rows) :]
+    return [
+        row
+        for row in window
+        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        and "ready_deterministic=0" in row.get("notes", "")
+    ]
+
+
+def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
+    """Return one non-bridge task when handoff synthesis has already stalled."""
+    tasks: list[dict[str, Any]] = []
+    if recent_drafter_fit_plan_ready(root, recent_rows=240):
+        if recent_drafter_trace_missing(root, recent_rows=160):
+            tasks.append(
+                drafter_trace_prerequisite_task(
+                    timestamp,
+                    task_id=f"handoff-audit-drafter-trace-prerequisite-{timestamp}",
+                    priority=99,
+                )
+            )
+        else:
+            tasks.append(
+                drafter_trace_gate_task(
+                    timestamp,
+                    task_id=f"handoff-audit-drafter-trace-gate-{timestamp}",
+                    priority=99,
+                )
+            )
+    elif should_seed_runtime_overhead_map(root, rows, recent_rows=60):
+        tasks.append(
+            {
+                "id": f"handoff-audit-runtime-overhead-map-{timestamp}",
+                "status": "ready",
+                "priority": 98,
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "Implementation handoff stalled, so map the runtime/proxy overhead boundary before another bridge.",
+                "metric": "server_wall_decode_gap",
+                "guard_checks": ["no_model_turn_required", "no_live_profile_change", "no_opencode_changes"],
+                "acceptance": "A runtime-overhead artifact identifies a patchable boundary or explicitly rules out local source changes.",
+                "rollback": "No runtime rollback needed; this is a read-only supervisor artifact.",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+            }
+        )
+    else:
+        tasks.append(drafter_fit_task(timestamp, task_id=f"handoff-audit-drafter-fit-plan-{timestamp}", priority=97))
+    return filter_seedable_tasks(root, tasks)
 
 
 def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
@@ -2206,25 +2313,13 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         for row in historical_synthesis_rows
         if "seeded_tasks=0" in row.get("notes", "") and "deliberate_actions=deliberate-" not in row.get("notes", "")
     ]
-    bridge_zero = [
-        row
-        for row in active_recent
-        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
-        and "ready_deterministic=0" in row.get("notes", "")
-    ]
+    bridge_zero = recent_empty_bridge_rows(root, active_recent, recent_rows=len(active_recent) or 1)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, active_recent, recent_rows=len(active_recent) or 1)
-    historical_bridge_zero = [
-        row
-        for row in recent
-        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
-        and "ready_deterministic=0" in row.get("notes", "")
-    ]
+    historical_bridge_zero = recent_empty_bridge_rows(root, recent, recent_rows=recent_rows)
     deliberate_ready = [task for task in ready if str(task.get("id", "")).startswith("deliberate-")]
-    deterministic_ready = [
-        task
-        for task in ready
-        if task.get("task_type") == "supervisor" or task.get("benchmark_mode") or "openclaw-speed-research" in str(task.get("next_action", ""))
-    ]
+    deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
+    bridge_ready = [task for task in deterministic_ready if is_implementation_bridge_task(task)]
+    bridge_only_ready = bool(deterministic_ready) and len(bridge_ready) == len(deterministic_ready)
     patch_rows = [row for row in active_recent if row.get("run_id", "").startswith("patch-executor-")]
     handoff_audit_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
@@ -2321,6 +2416,11 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if not deterministic_ready:
         scores["karpathy_core_loop"] -= 1.0
         gaps.append("no deterministic ready task is queued")
+    if bridge_only_ready and bridge_zero:
+        scores["karpathy_core_loop"] -= 1.2
+        scores["implementation_handoff"] -= 1.0
+        scores["research_quality"] -= 0.6
+        gaps.append("bridge-only deterministic ready task after an empty implementation bridge")
     if bridge_zero:
         scores["implementation_handoff"] -= min(1.4, len(bridge_zero) * 0.25)
         gaps.append(f"recent implementation bridge rows had no deterministic task={len(bridge_zero)}")
@@ -2371,7 +2471,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 
     scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
     overall = round(sum(scores.values()) / len(scores), 2)
-    blocking_gap_terms = ("contract", "measurement artifact", "repeated clean runtime-overhead")
+    blocking_gap_terms = ("contract", "measurement artifact", "repeated clean runtime-overhead", "bridge-only")
     readiness = (
         "frontier-candidate"
         if overall >= 9.0 and not any(term in gap for term in blocking_gap_terms for gap in gaps)
@@ -2422,6 +2522,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Seed one deterministic repair lane when the frontier score is below target."""
     timestamp = int(report.get("timestamp") or time.time())
+    root = workspace_root()
+    rows = result_rows(root)
     tasks: list[dict[str, Any]] = []
     gaps = [str(gap) for gap in report.get("gaps", [])]
 
@@ -2446,24 +2548,27 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
             }
         )
-    elif has_gap("empty synthesis") or has_gap("no deterministic ready task") or has_gap("implementation bridge"):
-        tasks.append(
-            {
-                "id": f"frontier-repair-implementation-bridge-{timestamp}",
-                "status": "ready",
-                "priority": 97,
-                "lane": "implementation-gate",
-                "task_type": "supervisor",
-                "supervisor_action": "implementation-bridge",
-                "target": "tasks.jsonl",
-                "hypothesis": "Frontier eval found weak handoff, so convert the best current finding into a deterministic supervisor task instead of another generic research turn.",
-                "metric": "decode_tps_delta",
-                "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
-                "acceptance": "The bridge records at least one ready deterministic task with a valid contract.",
-                "rollback": "No source rollback needed; the bridge only changes the autoresearch queue.",
-                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
-            }
-        )
+    elif has_gap("bridge-only") or has_gap("empty synthesis") or has_gap("no deterministic ready task") or has_gap("implementation bridge"):
+        if recent_empty_bridge_rows(root, rows, recent_rows=120) or has_gap("bridge-only"):
+            tasks.extend(concrete_handoff_prerequisite_tasks(root, rows, timestamp))
+        else:
+            tasks.append(
+                {
+                    "id": f"frontier-repair-implementation-bridge-{timestamp}",
+                    "status": "ready",
+                    "priority": 97,
+                    "lane": "implementation-gate",
+                    "task_type": "supervisor",
+                    "supervisor_action": "implementation-bridge",
+                    "target": "tasks.jsonl",
+                    "hypothesis": "Frontier eval found weak handoff, so convert the best current finding into a deterministic supervisor task instead of another generic research turn.",
+                    "metric": "decode_tps_delta",
+                    "guard_checks": ["tests_pass", "no_opencode_changes", "memory_gate", "rollback_path"],
+                    "acceptance": "The bridge records at least one ready deterministic task with a valid contract.",
+                    "rollback": "No source rollback needed; the bridge only changes the autoresearch queue.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                }
+            )
     elif has_gap("memory/Metal"):
         tasks.append(
             {
@@ -2800,6 +2905,53 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
         ),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    candidates = [
+        home() / "drafter-fit" / "target-generated-traces.jsonl",
+        home() / "drafter-fit" / "target-generated-trace-data.jsonl",
+        home() / "drafter-fit" / "janq-target-traces.jsonl",
+    ]
+    traces = [path for path in candidates if path.exists() and path.stat().st_size > 0]
+    status = "keep" if traces else "blocked"
+    reason = "target-generated-trace-data-present" if traces else "target-generated-trace-data-missing"
+    timestamp = int(time.time())
+    report = {
+        "ok": True,
+        "kind": "drafter-trace-prerequisite",
+        "status": status,
+        "reason": reason,
+        "trace_candidates": [str(path) for path in candidates],
+        "trace_data": [str(path) for path in traces],
+        "next_action": "run_candidate_drafter_calibration_canary" if traces else "collect_target_generated_trace_data",
+        "timestamp": timestamp,
+    }
+    path = root / "benchmarks" / f"drafter-trace-prerequisite-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-trace-prerequisite",
+            "finding": "JANQ drafter fitting is blocked on target-generated trace data rather than another synthesis loop",
+            "evidence": report,
+            "next": report["next_action"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-trace-prerequisite-{timestamp}",
+        status=status,
+        target="janq-drafter-fit-trace-data",
+        hypothesis="Trace-data prerequisite must be explicit before drafter calibration work continues.",
+        commit=current_commit(repo_root()),
+        notes=f"decision={reason} trace_files={len(traces)} next={report['next_action']}",
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
     return 0
 
 
@@ -3439,48 +3591,42 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         for task in implementation_candidate_tasks(rows)
         if task.get("task_type") in {"implementation", "supervisor"}
     ]
-    deterministic_ready = [
-        task
-        for task in ready
-        if task.get("task_type") == "supervisor"
-        or task.get("benchmark_mode")
-        or "openclaw-speed-research" in str(task.get("next_action", ""))
-    ]
+    deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
     timestamp = int(time.time())
     seeded_bridge = False
-    if not deterministic_ready:
-        seeded_bridge = bool(
-            upsert_tasks(
-                root,
-                [
-                    {
-                        "id": f"handoff-audit-deterministic-bridge-{timestamp}",
-                        "status": "ready",
-                        "priority": 98,
-                        "lane": "implementation-gate",
-                        "task_type": "supervisor",
-                        "supervisor_action": "implementation-bridge",
-                        "target": "openclaw/openclaw-speed-research.py",
-                        "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
-                        "hypothesis": "A failed handoff audit must seed one scoped deterministic bridge instead of another generic research loop.",
-                        "metric": "decode_tps_delta",
-                        "guard_checks": ["canary_only", "tests_pass", "no_opencode_changes", "rollback_path"],
-                        "acceptance": "The bridge seeds or confirms deterministic supervisor tasks with clean contracts before implementation proceeds.",
-                        "rollback": "Delete this queue task if it seeds no deterministic follow-up; no live profile or model setting is changed.",
-                        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
-                    }
-                ],
+    seeded_prerequisite = False
+    bridge_zero = recent_empty_bridge_rows(root, rows, recent_rows=120)
+    bridge_only_ready = bool(deterministic_ready) and all(is_implementation_bridge_task(task) for task in deterministic_ready)
+    if not deterministic_ready or (bridge_only_ready and bridge_zero):
+        if bridge_zero:
+            seeded_prerequisite = bool(upsert_tasks(root, concrete_handoff_prerequisite_tasks(root, rows, timestamp)))
+        else:
+            seeded_bridge = bool(
+                upsert_tasks(
+                    root,
+                    [
+                        {
+                            "id": f"handoff-audit-deterministic-bridge-{timestamp}",
+                            "status": "ready",
+                            "priority": 98,
+                            "lane": "implementation-gate",
+                            "task_type": "supervisor",
+                            "supervisor_action": "implementation-bridge",
+                            "target": "openclaw/openclaw-speed-research.py",
+                            "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+                            "hypothesis": "A failed handoff audit must seed one scoped deterministic bridge instead of another generic research loop.",
+                            "metric": "decode_tps_delta",
+                            "guard_checks": ["canary_only", "tests_pass", "no_opencode_changes", "rollback_path"],
+                            "acceptance": "The bridge seeds or confirms deterministic supervisor tasks with clean contracts before implementation proceeds.",
+                            "rollback": "Delete this queue task if it seeds no deterministic follow-up; no live profile or model setting is changed.",
+                            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                        }
+                    ],
+                )
             )
-        )
         tasks = read_jsonl(root / "tasks.jsonl")
         ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
-        deterministic_ready = [
-            task
-            for task in ready
-            if task.get("task_type") == "supervisor"
-            or task.get("benchmark_mode")
-            or "openclaw-speed-research" in str(task.get("next_action", ""))
-        ]
+        deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
     scoped_candidates = [
         task
         for task in candidates
@@ -3530,6 +3676,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "gaps": gaps,
         "ready_deterministic_tasks": [str(task.get("id", "")) for task in deterministic_ready[:12]],
         "seeded_bridge": seeded_bridge,
+        "seeded_prerequisite": seeded_prerequisite,
+        "recent_empty_bridges": len(bridge_zero),
         "implementation_candidates": [str(task.get("id", "")) for task in candidates],
         "scoped_candidates": [str(task.get("id", "")) for task in scoped_candidates],
         "contract_blockers": contract_blockers,
@@ -3557,7 +3705,9 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"ok={ok} score={score} candidates={len(candidates)} scoped={len(scoped_candidates)} "
-            f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} blockers={len(contract_blockers)}"
+            f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} "
+            f"seeded_prerequisite={seeded_prerequisite} empty_bridges={len(bridge_zero)} "
+            f"blockers={len(contract_blockers)}"
         ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
@@ -4830,6 +4980,9 @@ def main() -> int:
     )
     trace_gate.add_argument("--trace-data", default="")
     trace_gate.set_defaults(func=drafter_trace_gate)
+
+    trace_prereq = sub.add_parser("drafter-trace-prerequisite")
+    trace_prereq.set_defaults(func=drafter_trace_prerequisite)
 
     dflash_gate = sub.add_parser("dflash-compatibility-gate")
     dflash_gate.add_argument("--draft-path", default="")

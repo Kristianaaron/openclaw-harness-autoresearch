@@ -528,7 +528,47 @@ def is_supervisor_implementation_bridge_task(task: dict[str, object] | None) -> 
     return (
         task.get("supervisor_action") == "implementation-bridge"
         or str(task.get("id", "")).startswith("implementation-bridge-")
+        or str(task.get("id", "")).startswith("handoff-audit-deterministic-bridge-")
+        or str(task.get("id", "")).startswith("frontier-repair-implementation-bridge-")
     )
+
+
+def recent_empty_implementation_bridges(limit: int = 80) -> list[dict[str, str]]:
+    return [
+        row
+        for row in all_result_rows(WORKSPACE)[-max(1, limit) :]
+        if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        and "ready_deterministic=0" in row.get("notes", "")
+    ]
+
+
+def bridge_only_deterministic_ready(tasks: list[dict[str, object]]) -> bool:
+    return bool(tasks) and all(is_supervisor_implementation_bridge_task(task) for task in tasks)
+
+
+def block_ready_empty_bridge_tasks() -> int:
+    if not recent_empty_implementation_bridges(limit=120):
+        return 0
+    tasks = read_jsonl(TASKS)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if not is_supervisor_implementation_bridge_task(task):
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = "empty implementation bridge already proved this bridge path has no downstream task"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "bridge_quarantined_after_empty_handoff",
+            "next": "route to concrete prerequisite task instead of another implementation bridge",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+    return blocked
 
 
 def is_supervisor_patch_execute_task(task: dict[str, object] | None) -> bool:
@@ -555,6 +595,15 @@ def is_supervisor_drafter_trace_gate_task(task: dict[str, object] | None) -> boo
     return (
         task.get("supervisor_action") == "drafter-trace-gate"
         or "openclaw-speed-research drafter-trace-gate" in str(task.get("next_action", ""))
+    )
+
+
+def is_supervisor_drafter_trace_prerequisite_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-trace-prerequisite"
+        or "openclaw-speed-research drafter-trace-prerequisite" in str(task.get("next_action", ""))
     )
 
 
@@ -621,6 +670,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_patch_execute_task,
             is_supervisor_drafter_fit_task,
             is_supervisor_drafter_trace_gate_task,
+            is_supervisor_drafter_trace_prerequisite_task,
             is_supervisor_dflash_compatibility_task,
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
@@ -2382,6 +2432,38 @@ def run_supervisor_drafter_trace_gate_task(
     return 0, "" if status == "keep" else reason
 
 
+def run_supervisor_drafter_trace_prerequisite_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "drafter-trace-prerequisite"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter trace prerequisite "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        result = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
+    reason = str(parsed.get("reason") or f"supervisor drafter trace prerequisite exit {result.returncode}")
+    complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_dflash_compatibility_task(
     args: argparse.Namespace,
     cycle: int,
@@ -2799,6 +2881,9 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
     quality = latest_json_artifact("quality-review-*.json")
     replay = replay_checks(WORKSPACE)
     deterministic = deterministic_ready_tasks()
+    empty_bridges = recent_empty_implementation_bridges(limit=120)
+    bridge_ready = [task for task in deterministic if is_supervisor_implementation_bridge_task(task)]
+    bridge_only_ready = bridge_only_deterministic_ready(deterministic)
     exhausted = active_exhausted_lanes()
     ready = ready_tasks()
     exhausted_ready = [
@@ -2836,6 +2921,11 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         issues.append(f"quality score {quality_score}<min {args.frontier_certification_min_quality}")
     if not deterministic:
         issues.append("no deterministic ready task")
+    if bridge_ready and empty_bridges:
+        issues.append(
+            "implementation bridge tasks remain ready after empty bridge rows: "
+            + ",".join(str(row.get("run_id", "")) for row in empty_bridges[-3:])
+        )
     if exhausted_ready:
         issues.append("ready tasks remain in exhausted lanes: " + ",".join(exhausted_ready[:6]))
     if model_bound_causal:
@@ -2849,6 +2939,9 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         "handoff_score": handoff_score,
         "quality_score": quality_score,
         "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic[:8]],
+        "implementation_bridge_ready_tasks": [str(task.get("id", "")) for task in bridge_ready[:8]],
+        "bridge_only_ready": bridge_only_ready,
+        "recent_empty_bridges": len(empty_bridges),
         "exhausted_lanes": sorted(exhausted),
         "frontier": frontier,
         "handoff": handoff,
@@ -2860,6 +2953,7 @@ def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path)
     stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
     exhausted_lane_blocked = block_ready_exhausted_lane_tasks()
     stale_causal_blocked = block_stale_model_bound_causal_tasks()
+    empty_bridge_blocked = block_ready_empty_bridge_tasks()
     run_supervisor_quality_review(args, 0, "startup-certification", log_file)
     status = frontier_certification_status(args)
     if status["ok"]:
@@ -2874,7 +2968,7 @@ def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path)
                 f"frontier={status['frontier_score']} handoff={status['handoff_score']} "
                 f"quality={status['quality_score']} deterministic={len(status['deterministic_ready_tasks'])} "
                 f"stale_lane_blocked={stale_lane_blocked} exhausted_lane_blocked={exhausted_lane_blocked} "
-                f"stale_causal_blocked={stale_causal_blocked}"
+                f"stale_causal_blocked={stale_causal_blocked} empty_bridge_blocked={empty_bridge_blocked}"
             ),
         )
         return True, ""
@@ -2883,6 +2977,7 @@ def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path)
     block_stale_hard_blocked_lane_tasks()
     block_ready_exhausted_lane_tasks()
     block_stale_model_bound_causal_tasks()
+    block_ready_empty_bridge_tasks()
     run_supervisor_quality_review(args, 0, "startup-certification-recheck", log_file)
     repaired = frontier_certification_status(args)
     if repaired["ok"]:
@@ -3313,6 +3408,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_fit_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_trace_gate_task(selected_task):
             code, issue = run_supervisor_drafter_trace_gate_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_trace_prerequisite_task(selected_task):
+            code, issue = run_supervisor_drafter_trace_prerequisite_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
             code, issue = run_supervisor_dflash_compatibility_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):

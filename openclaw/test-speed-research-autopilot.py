@@ -371,6 +371,31 @@ def main() -> int:
         )
         certified = helper.frontier_certification_status(certification_args)
         assert certified["ok"] is True
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "handoff-audit-deterministic-bridge-unit",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "implementation-bridge",
+                }
+            ],
+        )
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="supervisor-implementation-bridge-unit",
+            status="blocked",
+            target="implementation-bridge",
+            hypothesis="unit empty bridge",
+            commit="abc123",
+            notes="seeded=0 ready_deterministic=0 issue=no deterministic implementation tasks available",
+        )
+        bridge_only = helper.frontier_certification_status(certification_args)
+        assert bridge_only["ok"] is False
+        assert "handoff-audit-deterministic-bridge-unit" in bridge_only["implementation_bridge_ready_tasks"]
+        assert any("implementation bridge tasks remain ready" in issue for issue in bridge_only["issues"])
+        assert helper.block_ready_empty_bridge_tasks() == 1
         helper.append_jsonl(
             helper.WORKSPACE / "exhausted-approaches.jsonl",
             {"lane": "frontier-dflash", "reason": "unit-test"},

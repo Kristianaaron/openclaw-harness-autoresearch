@@ -701,6 +701,28 @@ def main() -> int:
             assert "canary_only" in bridge["guard_checks"]
             assert bridge["acceptance"]
             assert bridge["rollback"]
+            for task in bridge_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", bridge_tasks)
+            helper.append_result(
+                root,
+                run_id="supervisor-implementation-bridge-unit",
+                status="blocked",
+                target="implementation-bridge",
+                hypothesis="unit empty bridge",
+                commit="abc123",
+                notes="seeded=0 ready_deterministic=0 issue=no deterministic implementation tasks available",
+            )
+            assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            handoff_after_empty = json.loads(
+                max(
+                    (root / "benchmarks").glob("implementation-handoff-audit-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert handoff_after_empty["seeded_bridge"] is False
+            assert handoff_after_empty["seeded_prerequisite"] is True
+            assert "handoff-audit-drafter-trace-gate-" in "\n".join(handoff_after_empty["ready_deterministic_tasks"])
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
