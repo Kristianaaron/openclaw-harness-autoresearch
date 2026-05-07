@@ -517,6 +517,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_gepa_policy_canary_task,
             is_supervisor_runtime_overhead_map_task,
             requires_profile_variant_runner,
+            is_supervisor_benchmark_task,
         )
     )
 
@@ -2592,7 +2593,22 @@ def main() -> int:
         if defer_reason:
             issue = f"{defer_reason}; routing to deterministic synthesis"
             ok, synth_issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
-            seeded = enqueue_recurring_decode_tasks(cycle, issue)
+            complete_supervisor_task(
+                selected_task,
+                status="blocked",
+                summary={
+                    "reason": defer_reason,
+                    "next": "convert this into a deterministic supervisor task before retrying",
+                },
+                commit=current_commit(),
+            )
+            seeded = 0
+            if not any(
+                task_runs_without_model(task)
+                for task in read_jsonl(TASKS)
+                if task.get("status", "ready") in {"ready", "rework"}
+            ):
+                seeded = enqueue_recurring_decode_tasks(cycle, issue)
             append_supervisor_result(cycle, current_session, "blocked", issue)
             after = durable_snapshot()
             progress_reasons = durable_progress(before, after)

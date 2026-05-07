@@ -126,6 +126,7 @@ def check_prompt_and_routing_guards(helper) -> None:
     assert helper.task_runs_without_model(
         {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"}
     )
+    assert helper.task_runs_without_model({"benchmark_mode": "decode-sample"})
     assert not helper.task_runs_without_model(
         {"id": "model-bound-research", "target": "notes.md", "next_action": "inspect and update notes"}
     )
