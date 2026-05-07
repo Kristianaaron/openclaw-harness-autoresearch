@@ -70,6 +70,8 @@ DEFAULT_MAX_SAFE_TOOL_PROMPT_TOKENS = 3500
 DEFAULT_MIN_SAFE_FREE_MB = 0
 DEFAULT_MAX_SAFE_COMPRESSOR_MB = 8192
 DEFAULT_MAX_SAFE_SWAP_MB = 8192
+DEFAULT_RECOVERED_FREE_MB = 12288
+DEFAULT_RECOVERED_PRESSURE_FREE_PCT = 20
 PREFLIGHT_BLOCK_MESSAGE = (
     "[OpenClaw blocked this request before model execution because the prompt/tool context "
     "is large enough to risk a local MLX/Metal memory crash. Start a fresh session, reduce "
@@ -341,7 +343,7 @@ def int_env(name: str, default: int) -> int:
 
 
 def macos_memory_snapshot() -> dict[str, int]:
-    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
+    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0, "pressure_free_pct": 0}
     try:
         vm_stat = subprocess.check_output(["/usr/bin/vm_stat"], text=True, stderr=subprocess.DEVNULL, timeout=3)
         page_size = 16384
@@ -370,6 +372,13 @@ def macos_memory_snapshot() -> dict[str, int]:
             snapshot["swap_used_mb"] = int(float(match.group(1)))
     except Exception as error:
         log(f"memory snapshot swap unavailable: {error}")
+    try:
+        pressure = subprocess.check_output(["/usr/bin/memory_pressure"], text=True, stderr=subprocess.DEVNULL, timeout=3)
+        match = re.search(r"System-wide memory free percentage:\s*(\d+)%", pressure)
+        if match:
+            snapshot["pressure_free_pct"] = int(match.group(1))
+    except Exception as error:
+        log(f"memory snapshot pressure unavailable: {error}")
     return snapshot
 
 
@@ -380,15 +389,19 @@ def memory_pressure_block_reason(snapshot: dict[str, int] | None = None) -> str 
     free_mb = snapshot.get("free_mb", 0)
     compressor_mb = snapshot.get("compressor_mb", 0)
     swap_used_mb = snapshot.get("swap_used_mb", 0)
+    pressure_free_pct = snapshot.get("pressure_free_pct", 0)
     min_free_mb = int_env("OPENCLAW_MODEL_MIN_SAFE_FREE_MB", DEFAULT_MIN_SAFE_FREE_MB)
     max_compressor_mb = int_env("OPENCLAW_MODEL_MAX_SAFE_COMPRESSOR_MB", DEFAULT_MAX_SAFE_COMPRESSOR_MB)
     max_swap_mb = int_env("OPENCLAW_MODEL_MAX_SAFE_SWAP_MB", DEFAULT_MAX_SAFE_SWAP_MB)
-    if compressor_mb >= max_compressor_mb:
-        return f"compressor_mb={compressor_mb}>={max_compressor_mb}"
-    if swap_used_mb >= max_swap_mb:
-        return f"swap_used_mb={swap_used_mb}>={max_swap_mb}"
+    recovered_free_mb = int_env("OPENCLAW_MODEL_RECOVERED_FREE_MB", DEFAULT_RECOVERED_FREE_MB)
+    recovered_pressure_pct = int_env("OPENCLAW_MODEL_RECOVERED_PRESSURE_FREE_PCT", DEFAULT_RECOVERED_PRESSURE_FREE_PCT)
     if free_mb and free_mb < min_free_mb:
         return f"free_mb={free_mb}<{min_free_mb}"
+    recovered = free_mb >= recovered_free_mb and pressure_free_pct >= recovered_pressure_pct
+    if not recovered and compressor_mb >= max_compressor_mb:
+        return f"compressor_mb={compressor_mb}>={max_compressor_mb}"
+    if not recovered and swap_used_mb >= max_swap_mb:
+        return f"swap_used_mb={swap_used_mb}>={max_swap_mb}"
     return None
 
 

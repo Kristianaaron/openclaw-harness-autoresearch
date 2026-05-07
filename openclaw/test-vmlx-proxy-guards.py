@@ -404,6 +404,8 @@ def main() -> int:
     assert proxy.memory_pressure_block_reason({"free_mb": 460, "compressor_mb": 1024, "swap_used_mb": 2048}) is None
     assert proxy.memory_pressure_block_reason({"free_mb": 3003, "compressor_mb": 1024, "swap_used_mb": 2048}) is None
     assert proxy.memory_pressure_block_reason({"free_mb": 8192, "compressor_mb": 9000, "swap_used_mb": 0}) == "compressor_mb=9000>=8192"
+    recovered_snapshot = {"free_mb": 24000, "compressor_mb": 21000, "swap_used_mb": 10500, "pressure_free_pct": 62}
+    assert proxy.memory_pressure_block_reason(recovered_snapshot) is None
     tool_shaped = proxy.shape_upstream_payload(
         {
             "stream": True,

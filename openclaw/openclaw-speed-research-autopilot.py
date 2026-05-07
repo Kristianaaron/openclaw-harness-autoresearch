@@ -904,17 +904,21 @@ def stop_openclaw_model_for_memory_recovery(args: argparse.Namespace, *, reason:
 def memory_gate_reason(args: argparse.Namespace, snap: dict[str, int], *, ready: bool) -> str:
     min_free_mb = args.ready_min_free_mb if ready else args.min_free_mb
     min_pressure_free_pct = int(getattr(args, "min_pressure_free_pct", 0) or 0)
+    recovered = bool(
+        snap.get("free_mb", 0) >= getattr(args, "recovered_free_mb", 12288)
+        and snap.get("pressure_free_pct", 0) >= getattr(args, "recovered_pressure_free_pct", 20)
+    )
     if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
         return (
             f"pressureFree={snap['pressure_free_pct']}%<{min_pressure_free_pct}% "
             f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB ready={ready}"
         )
-    if snap["compressor_mb"] >= args.max_compressor_mb:
+    if not recovered and snap["compressor_mb"] >= args.max_compressor_mb:
         return (
             f"compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB "
             f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}% ready={ready}"
         )
-    if snap["swap_used_mb"] >= args.max_swap_mb:
+    if not recovered and snap["swap_used_mb"] >= args.max_swap_mb:
         return (
             f"swap={snap['swap_used_mb']}MB>={args.max_swap_mb}MB "
             f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}% ready={ready}"
@@ -967,17 +971,21 @@ def active_memory_circuit_reason(args: argparse.Namespace, snap: dict[str, int])
     compressor_limit = args.active_max_compressor_mb or args.max_compressor_mb
     swap_limit = args.active_max_swap_mb or args.max_swap_mb
     min_pressure_free_pct = int(getattr(args, "active_min_pressure_free_pct", 0) or 0)
+    recovered = bool(
+        snap.get("free_mb", 0) >= getattr(args, "recovered_free_mb", 12288)
+        and snap.get("pressure_free_pct", 0) >= getattr(args, "recovered_pressure_free_pct", 20)
+    )
     if min_pressure_free_pct > 0 and snap.get("pressure_free_pct", 0) and snap["pressure_free_pct"] < min_pressure_free_pct:
         return (
             f"pressureFree={snap['pressure_free_pct']}%<{min_pressure_free_pct}% "
             f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB swap={snap['swap_used_mb']}MB"
         )
-    if snap["compressor_mb"] >= compressor_limit:
+    if not recovered and snap["compressor_mb"] >= compressor_limit:
         return (
             f"compressor={snap['compressor_mb']}MB>={compressor_limit}MB "
             f"free={snap['free_mb']}MB swap={snap['swap_used_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}%"
         )
-    if snap["swap_used_mb"] >= swap_limit:
+    if not recovered and snap["swap_used_mb"] >= swap_limit:
         return (
             f"swap={snap['swap_used_mb']}MB>={swap_limit}MB "
             f"free={snap['free_mb']}MB compressor={snap['compressor_mb']}MB pressureFree={snap.get('pressure_free_pct', 0)}%"

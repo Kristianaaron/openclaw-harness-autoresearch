@@ -42,15 +42,15 @@ _openclaw_memory_pressure_message() {
   compressor_mb="${${(s: :)snapshot}[2]#compressor_mb=}"
   pressure_free_pct="${${(s: :)snapshot}[3]#memory_pressure_free_pct=}"
   swap_used="$(/usr/sbin/sysctl vm.swapusage 2>/dev/null | /usr/bin/sed -n 's/.*used = \([0-9.]*\)M.*/\1/p' | /usr/bin/awk '{ printf "%d", $1 }')"
-  if [[ -n "$compressor_mb" && "$compressor_mb" -ge 8192 ]]; then
-    echo "active memory pressure: compressor=${compressor_mb}MB, free=${free_mb:-unknown}MB, swapUsed=${swap_used:-unknown}MB"
-    return 0
-  fi
-  if [[ -n "$pressure_free_pct" && "$pressure_free_pct" != "memory_pressure_free_pct=" && "$pressure_free_pct" -ge 20 ]]; then
-    return 1
-  fi
   if [[ -n "$free_mb" && "$free_mb" -lt 1024 ]]; then
     echo "active memory pressure: free=${free_mb}MB, compressor=${compressor_mb:-unknown}MB, swapUsed=${swap_used:-unknown}MB"
+    return 0
+  fi
+  if [[ -n "$pressure_free_pct" && "$pressure_free_pct" != "memory_pressure_free_pct=" && "$pressure_free_pct" -ge 20 && -n "$free_mb" && "$free_mb" -ge 12288 ]]; then
+    return 1
+  fi
+  if [[ -n "$compressor_mb" && "$compressor_mb" -ge 8192 ]]; then
+    echo "active memory pressure: compressor=${compressor_mb}MB, free=${free_mb:-unknown}MB, swapUsed=${swap_used:-unknown}MB"
     return 0
   fi
   if [[ -n "$swap_used" && "$swap_used" -ge 32768 && -n "$free_mb" && "$free_mb" -lt 4096 ]]; then
