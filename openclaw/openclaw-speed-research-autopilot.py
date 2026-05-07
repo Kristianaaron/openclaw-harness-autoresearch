@@ -1718,6 +1718,33 @@ def start_model_for_supervisor_benchmark(log_file: Path, timeout_seconds: float)
         subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=timeout_seconds, check=False)
 
 
+def ensure_model_for_supervisor_task(
+    log_file: Path,
+    timeout_seconds: float,
+    *,
+    task_id: str,
+    reason: str,
+) -> tuple[bool, str]:
+    """Start and verify the local model before deterministic model-bound work.
+
+    Benchmark-like supervisor tasks are deterministic, but they are not useful
+    unless the OpenAI-compatible model endpoint is actually alive. Failing here
+    avoids burning a sweep artifact full of connection-refused samples.
+    """
+    try:
+        start_model_for_supervisor_benchmark(log_file, timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return False, "supervisor model start timeout"
+    if model_ready():
+        return True, ""
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            "\nSUPERVISOR MODEL PREFLIGHT FAILED "
+            f"task={task_id} reason={reason}: endpoint unavailable after model-start\n"
+        )
+    return False, "model endpoint unavailable after model-start"
+
+
 def run_supervisor_benchmark_task(
     args: argparse.Namespace,
     cycle: int,
@@ -1734,10 +1761,14 @@ def run_supervisor_benchmark_task(
     else:
         cmd.extend(["--mode", mode])
     cmd.extend(["--timeout", str(args.supervisor_benchmark_timeout_seconds)])
-    try:
-        start_model_for_supervisor_benchmark(log_file, args.model_start_timeout_seconds)
-    except subprocess.TimeoutExpired:
-        return 124, "supervisor model start timeout"
+    ready, start_issue = ensure_model_for_supervisor_task(
+        log_file,
+        args.model_start_timeout_seconds,
+        task_id=str(task.get("id", "fallback")),
+        reason="supervisor benchmark",
+    )
+    if not ready:
+        return 124 if "timeout" in start_issue else 75, start_issue
     with log_file.open("a", encoding="utf-8") as file:
         label = "supervisor fallback benchmark" if fallback else "supervisor benchmark"
         file.write(f"\n===== cycle {cycle} session {session} {label} task={task.get('id', 'fallback')} =====\n")
@@ -2071,6 +2102,14 @@ def run_supervisor_drafter_sweep_plan(
     block_count = len([part for part in blocks.split(",") if part.strip()])
     timeout_seconds = 30
     if action == "drafter-sweep-run":
+        ready, start_issue = ensure_model_for_supervisor_task(
+            log_file,
+            args.model_start_timeout_seconds,
+            task_id=str(task.get("id", "unknown")),
+            reason="supervisor drafter sweep",
+        )
+        if not ready:
+            return 124 if "timeout" in start_issue else 75, start_issue
         timeout_seconds = max(90, block_count * int(samples) * (int(retries) + 1) * 12)
     with log_file.open("a", encoding="utf-8") as file:
         file.write(

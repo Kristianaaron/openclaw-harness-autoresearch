@@ -646,7 +646,7 @@ def main() -> int:
             encoding="utf-8",
         )
         sweep_helper.chmod(0o700)
-        sweep_args = Namespace(research_helper_bin=str(sweep_helper))
+        sweep_args = Namespace(research_helper_bin=str(sweep_helper), model_start_timeout_seconds=1)
         helper.write_jsonl(
             helper.TASKS,
             [
@@ -672,6 +672,71 @@ def main() -> int:
         assert issue == ""
         assert "supervisor-drafter-sweep-8" in helper.RESULTS.read_text(encoding="utf-8")
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "sweep-run",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-sweep-run",
+                    "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+                    "hypothesis": "run block sweep",
+                    "blocks": "1,2",
+                    "samples": 1,
+                }
+            ],
+        )
+        original_model_ready = helper.model_ready
+        original_start_model = helper.start_model_for_supervisor_benchmark
+        start_calls = []
+        helper.model_ready = lambda: True
+        helper.start_model_for_supervisor_benchmark = lambda log_file, timeout: start_calls.append((str(log_file), timeout))
+        try:
+            code, issue = helper.run_supervisor_drafter_sweep_plan(
+                sweep_args,
+                9,
+                "test-session",
+                helper.read_jsonl(helper.TASKS)[0],
+                Path(tmp) / "autopilot.log",
+            )
+        finally:
+            helper.model_ready = original_model_ready
+            helper.start_model_for_supervisor_benchmark = original_start_model
+        assert code == 0
+        assert issue == ""
+        assert start_calls
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "sweep-run-offline",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-sweep-run",
+                    "target": "OPENCLAW_JANG_DRAFT_BLOCK_SIZE",
+                    "hypothesis": "run block sweep",
+                    "blocks": "1,2",
+                    "samples": 1,
+                }
+            ],
+        )
+        helper.model_ready = lambda: False
+        helper.start_model_for_supervisor_benchmark = lambda log_file, timeout: None
+        try:
+            code, issue = helper.run_supervisor_drafter_sweep_plan(
+                sweep_args,
+                10,
+                "test-session",
+                helper.read_jsonl(helper.TASKS)[0],
+                Path(tmp) / "autopilot.log",
+            )
+        finally:
+            helper.model_ready = original_model_ready
+            helper.start_model_for_supervisor_benchmark = original_start_model
+        assert code == 75
+        assert issue == "model endpoint unavailable after model-start"
+        assert '"status": "ready"' in helper.TASKS.read_text(encoding="utf-8")
         fit_helper = Path(tmp) / "fit-helper.py"
         fit_plan = Path(tmp) / "fit-plan.json"
         fit_helper.write_text(
