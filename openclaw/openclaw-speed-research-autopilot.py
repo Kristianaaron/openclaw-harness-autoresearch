@@ -26,6 +26,7 @@ from openclaw_speed_research_core import (
     complete_task_from_evidence,
     cycle_quality,
     ensure_research_state,
+    mark_lane_exhausted,
     paired_profile_plan,
     promotion_decision,
     read_jsonl,
@@ -725,6 +726,12 @@ def block_stale_hard_blocked_lane_tasks() -> int:
         blocked += 1
     if blocked:
         write_jsonl(TASKS, tasks)
+        mark_lane_exhausted(
+            WORKSPACE,
+            lane="frontier-dflash",
+            reason="DFlash/JANQ compatibility is hard-blocked; suppress stale lane tasks until the draft candidate changes",
+            evidence={"blocker": dflash_blocker, "blocked_tasks": blocked},
+        )
         append_jsonl(
             FINDINGS,
             {

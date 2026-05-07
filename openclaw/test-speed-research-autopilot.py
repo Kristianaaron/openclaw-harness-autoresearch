@@ -881,6 +881,7 @@ def main() -> int:
         quarantined_tasks = helper.read_jsonl(helper.TASKS)
         assert quarantined_tasks[0]["status"] == "blocked"
         assert quarantined_tasks[1]["status"] == "ready"
+        assert "frontier-dflash" in helper.read_jsonl(helper.WORKSPACE / "exhausted-approaches.jsonl")[0]["lane"]
         helper.write_jsonl(
             helper.TASKS,
             [

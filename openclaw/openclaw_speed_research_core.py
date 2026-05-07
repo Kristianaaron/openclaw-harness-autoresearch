@@ -2120,8 +2120,7 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
     filtered = [
         task
         for task in tasks
-        if lane_key_for_task(task) not in exhausted
-        or task.get("lane") in {"exhaustion-report", "frontier-dflash", "drafter-alignment", "runtime-overhead"}
+        if lane_key_for_task(task) not in exhausted or task.get("lane") == "exhaustion-report"
     ]
     if suppress_runtime_map:
         non_runtime_map = [

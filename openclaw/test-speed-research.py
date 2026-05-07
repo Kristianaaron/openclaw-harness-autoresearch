@@ -382,6 +382,7 @@ def main() -> int:
             assert helper.quality_review(
                 Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
             ) == 0
+            assert len(helper.completed_drafter_sweep_rows(root, recent_rows=1, min_sweeps=3)) >= 3
             assert helper.plateau_pivot(Namespace(recent_rows=80, min_sweeps=3, target_tps=30.0)) == 0
             review_paths = list((root / "benchmarks").glob("quality-review-*.json"))
             assert review_paths
@@ -612,6 +613,8 @@ def main() -> int:
             assert mismatch_report["status"] == "blocked"
             assert "draft_model_type_mismatch=qwen3" in mismatch_report["blockers"]
             assert helper.dflash_lane_is_blocked(root, recent_rows=20) is True
+            assert helper.suppress_hard_blocked_dflash_lane(root, recent_rows=20) is True
+            assert "frontier-dflash" in helper.exhausted_lanes(root)
             helper.write_jsonl(
                 root / "tasks.jsonl",
                 [task for task in helper.read_jsonl(root / "tasks.jsonl") if "dflash" not in str(task.get("id", ""))],
@@ -647,6 +650,24 @@ def main() -> int:
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "frontier-repair-measurement-artifact-" in repair_tasks
+            all_done_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            for task in all_done_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", all_done_tasks)
+            assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            handoff_report = json.loads(
+                max(
+                    (root / "benchmarks").glob("implementation-handoff-audit-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert handoff_report["seeded_bridge"] is True
+            assert "handoff-audit-deterministic-bridge" in "\n".join(handoff_report["ready_deterministic_tasks"])
+            bridge_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            bridge = next(task for task in bridge_tasks if task["id"] == "handoff-audit-deterministic-bridge")
+            assert "canary_only" in bridge["guard_checks"]
+            assert bridge["acceptance"]
+            assert bridge["rollback"]
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")

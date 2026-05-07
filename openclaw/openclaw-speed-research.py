@@ -1255,6 +1255,35 @@ def should_seed_runtime_overhead_map(root: Path, rows: list[dict[str, str]], *, 
     return not recent_clean_runtime_overhead_maps(root, rows, recent_rows=recent_rows)
 
 
+def completed_drafter_sweep_rows(
+    root: Path,
+    *,
+    recent_rows: int = 120,
+    min_sweeps: int = 3,
+) -> list[dict[str, str]]:
+    """Return enough completed sweep rows even when review rows push them out of the short window."""
+    rows = result_rows(root)
+    recent = [
+        row
+        for row in rows[-max(1, recent_rows) :]
+        if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
+    ]
+    if len(recent) >= min_sweeps:
+        return recent
+    seen = {row.get("run_id", "") for row in recent}
+    older: list[dict[str, str]] = []
+    for row in reversed(rows[: -max(1, recent_rows)]):
+        run_id = row.get("run_id", "")
+        if run_id in seen:
+            continue
+        if row.get("status") == "keep" and run_id.startswith("drafter-sweep-run"):
+            older.append(row)
+            seen.add(run_id)
+        if len(recent) + len(older) >= min_sweeps:
+            break
+    return list(reversed(older)) + recent
+
+
 def drafter_fit_task(timestamp: int, *, task_id: str, priority: int = 95) -> dict[str, Any]:
     return {
         "id": task_id,
@@ -1357,6 +1386,31 @@ def dflash_lane_is_blocked(root: Path, *, recent_rows: int = 80) -> bool:
     return bool(hard_blockers)
 
 
+def suppress_hard_blocked_dflash_lane(root: Path, *, recent_rows: int = 160) -> bool:
+    blocked = recent_blocked_dflash_gate(root, recent_rows=recent_rows)
+    if not blocked:
+        return False
+    blockers = [str(item) for item in blocked.get("blockers", []) if item]
+    hard_blockers = [
+        blocker
+        for blocker in blockers
+        if blocker.startswith("draft_model_type_mismatch=")
+        or blocker in {"dflash_draft_config_missing", "draft_target_layer_ids_missing"}
+    ]
+    if not hard_blockers:
+        return False
+    return mark_lane_exhausted(
+        root,
+        lane="frontier-dflash",
+        reason="DFlash/JANQ compatibility is hard-blocked; do not reseed until the draft candidate changes",
+        evidence={
+            "blocked_run_id": blocked.get("run_id", ""),
+            "artifact": blocked.get("artifact", ""),
+            "blockers": hard_blockers,
+        },
+    )
+
+
 def dflash_compatibility_task(timestamp: int, *, task_id: str, priority: int = 93) -> dict[str, Any]:
     return {
         "id": task_id,
@@ -1396,9 +1450,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     """Create one high-signal next action when static synthesis candidates are exhausted."""
     recent = rows[-120:]
     tasks: list[dict[str, Any]] = []
-    sweep_rows = [
-        row for row in recent if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
-    ]
+    sweep_rows = completed_drafter_sweep_rows(root, recent_rows=120, min_sweeps=3)
     sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
     last_sweeps = sweep_fields[-3:]
     block_sweep_converged = (
@@ -1411,7 +1463,19 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     recent_mtp_report = recent_result_has_prefix(root, "mtp-report-", recent_rows=30)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=45)
     drafter_plan_ready = recent_drafter_fit_plan_ready(root, recent_rows=160)
-    dflash_blocked = dflash_lane_is_blocked(root, recent_rows=80)
+    dflash_suppressed = suppress_hard_blocked_dflash_lane(root, recent_rows=160)
+    dflash_blocked = dflash_suppressed or dflash_lane_is_blocked(root, recent_rows=160)
+
+    if block_sweep_converged and below_practical_floor:
+        mark_lane_exhausted(
+            root,
+            lane="mtp-decode",
+            reason="block-size sweep repeatedly kept block 2 below target; route to drafter alignment or runtime overhead",
+            evidence={
+                "last_sweeps": last_sweeps,
+                "decode_mean": decode_mean,
+            },
+        )
 
     if not recent_mtp_report and should_seed_action(root, "deliberate-mtp-report-", recent_rows=30):
         tasks.append(
@@ -1474,7 +1538,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
             tasks.append(dflash_compatibility_task(timestamp, task_id=f"deliberate-dflash-compatibility-{timestamp}"))
             return tasks
 
-    if len(sweep_rows) < 2 and should_seed_action(root, "deliberate-drafter-sweep-", recent_rows=40):
+    if not block_sweep_converged and len(sweep_rows) < 2 and should_seed_action(root, "deliberate-drafter-sweep-", recent_rows=40):
         tasks.append(
             {
                 "id": f"deliberate-drafter-sweep-{timestamp}",
@@ -1554,11 +1618,16 @@ def quality_review(args: argparse.Namespace) -> int:
             best_mean = float(mean_decode)
             max_decode = summary.get("max_decode_tps")
             best_max = float(max_decode) if isinstance(max_decode, (int, float)) else None
-    sweep_rows = [
+    sweep_rows_in_recent = [
         row
         for row in recent
         if row.get("status") == "keep" and row.get("run_id", "").startswith("drafter-sweep-run")
     ]
+    sweep_rows = completed_drafter_sweep_rows(
+        root,
+        recent_rows=int(args.recent_rows),
+        min_sweeps=int(args.min_sweeps),
+    )
     sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows]
     winner_blocks = [fields.get("winner_block", "") for fields in sweep_fields if fields.get("winner_block")]
     repeated_block2 = len(winner_blocks) >= int(args.min_sweeps) and all(block == "2" for block in winner_blocks[-int(args.min_sweeps) :])
@@ -1567,7 +1636,12 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
-    active_lanes = {str(task.get("lane", "")) for task in active_tasks}
+    exhausted = exhausted_lanes(root)
+    active_lanes = {
+        str(task.get("lane", ""))
+        for task in active_tasks
+        if str(task.get("lane", "")) not in exhausted
+    }
     frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
     frontier_ready = sorted(active_lanes & frontier_lanes)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=int(args.recent_rows))
@@ -1596,6 +1670,17 @@ def quality_review(args: argparse.Namespace) -> int:
     }
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
+    dflash_suppressed = suppress_hard_blocked_dflash_lane(root, recent_rows=max(160, int(args.recent_rows)))
+    if dflash_suppressed:
+        recommendations.append("DFlash/JANQ compatibility was hard-blocked and the lane was retired until the draft candidate changes.")
+    repeated_deliberate_dflash = [
+        row
+        for row in recent[-40:]
+        if row.get("target") == "synthesis" and "deliberate_actions=deliberate-dflash-compatibility-" in row.get("notes", "")
+    ]
+    if len(repeated_deliberate_dflash) >= 2 and not dflash_suppressed:
+        quality_score -= 15
+        recommendations.append("repeated DFlash synthesis detected without new compatibility evidence; route to prerequisite evidence or retire the lane.")
     if blocked:
         quality_score -= 30
     if missing_required_blocks:
@@ -1670,12 +1755,22 @@ def quality_review(args: argparse.Namespace) -> int:
         )
         if should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
             seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=96))
-        if not dflash_lane_is_blocked(root, recent_rows=80) and should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10):
+        if (
+            not dflash_lane_is_blocked(root, recent_rows=160)
+            and "frontier-dflash" not in exhausted_lanes(root)
+            and should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10)
+        ):
             seeded_tasks.append(
                 dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=94)
             )
     if repeated_block2 and repeated_keep_current:
         recommendations.append("block-size sweep has converged on block 2; move to acceptance, drafter-fit, DFlash, and MTP-loop overhead.")
+        mark_lane_exhausted(
+            root,
+            lane="mtp-decode",
+            reason="quality review found repeated keep-current block-2 wins below target",
+            evidence={"best_block": best_block, "best_mean_decode_tps": best_mean, "sweep_rows": len(sweep_rows)},
+        )
         if not clean_runtime_maps:
             seeded_tasks.append(
                 {
@@ -1693,7 +1788,7 @@ def quality_review(args: argparse.Namespace) -> int:
                 },
             )
         seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
-        if not dflash_lane_is_blocked(root, recent_rows=80):
+        if not dflash_lane_is_blocked(root, recent_rows=160) and "frontier-dflash" not in exhausted_lanes(root):
             seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
         else:
             recommendations.append("DFlash compatibility is already blocked by a hard draft mismatch; do not re-seed that lane until the draft candidate changes.")
@@ -1753,6 +1848,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "recent_rows": len(recent),
         "blocked_rows": len(blocked),
         "sweep_rows": len(sweep_rows),
+        "sweep_rows_in_recent": len(sweep_rows_in_recent),
         "block_summary": block_summary,
         "best_block": best_block,
         "best_mean_decode_tps": best_mean,
@@ -3128,6 +3224,40 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         or task.get("benchmark_mode")
         or "openclaw-speed-research" in str(task.get("next_action", ""))
     ]
+    seeded_bridge = False
+    if not deterministic_ready:
+        seeded_bridge = bool(
+            upsert_tasks(
+                root,
+                [
+                    {
+                        "id": "handoff-audit-deterministic-bridge",
+                        "status": "ready",
+                        "priority": 98,
+                        "lane": "implementation-gate",
+                        "task_type": "supervisor",
+                        "supervisor_action": "implementation-bridge",
+                        "target": "openclaw/openclaw-speed-research.py",
+                        "source_files": ["openclaw/openclaw-speed-research.py", "openclaw/test-speed-research.py"],
+                        "hypothesis": "A failed handoff audit must seed one scoped deterministic bridge instead of another generic research loop.",
+                        "metric": "decode_tps_delta",
+                        "guard_checks": ["canary_only", "tests_pass", "no_opencode_changes", "rollback_path"],
+                        "acceptance": "The bridge seeds or confirms deterministic supervisor tasks with clean contracts before implementation proceeds.",
+                        "rollback": "Delete this queue task if it seeds no deterministic follow-up; no live profile or model setting is changed.",
+                        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                    }
+                ],
+            )
+        )
+        tasks = read_jsonl(root / "tasks.jsonl")
+        ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+        deterministic_ready = [
+            task
+            for task in ready
+            if task.get("task_type") == "supervisor"
+            or task.get("benchmark_mode")
+            or "openclaw-speed-research" in str(task.get("next_action", ""))
+        ]
     scoped_candidates = [
         task
         for task in candidates
@@ -3177,6 +3307,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "gates": gates,
         "gaps": gaps,
         "ready_deterministic_tasks": [str(task.get("id", "")) for task in deterministic_ready[:12]],
+        "seeded_bridge": seeded_bridge,
         "implementation_candidates": [str(task.get("id", "")) for task in candidates],
         "scoped_candidates": [str(task.get("id", "")) for task in scoped_candidates],
         "contract_blockers": contract_blockers,
@@ -3204,7 +3335,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"ok={ok} score={score} candidates={len(candidates)} scoped={len(scoped_candidates)} "
-            f"ready_deterministic={len(deterministic_ready)} blockers={len(contract_blockers)}"
+            f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} blockers={len(contract_blockers)}"
         ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
