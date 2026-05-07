@@ -267,6 +267,10 @@ def ready_implementation_tasks() -> list[dict[str, object]]:
     return ready_tasks(task_type="implementation")
 
 
+def deterministic_ready_tasks() -> list[dict[str, object]]:
+    return [task for task in ready_tasks() if task_runs_without_model(task)]
+
+
 def ready_work_summary() -> dict[str, object]:
     tasks = ready_tasks()
     lanes = sorted({str(task.get("lane", "")) for task in tasks if str(task.get("lane", ""))})
@@ -386,6 +390,30 @@ def append_supervisor_result(cycle: int, session: str, status: str, issue: str) 
     ]
     with RESULTS.open("a", encoding="utf-8") as file:
         file.write("\t".join(clean_tsv(item) for item in row) + "\n")
+
+
+def append_quality_pause(cycle: int, session: str, reason: str) -> None:
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": timestamp,
+            "task_id": "autopilot-quality-pause",
+            "finding": "autoresearch paused instead of refilling another generic measurement loop",
+            "reason": reason,
+            "session": session,
+            "next": "add a deterministic implementation, benchmark, or reviewer task before restarting",
+        },
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"quality-pause-{cycle}",
+        status="blocked",
+        target="autoresearch-quality",
+        hypothesis="exhausted synthesis should pause instead of researching for the sake of research",
+        commit=current_commit(),
+        notes=f"session={session} reason={clean_tsv(reason)}",
+    )
 
 
 def benchmark_mode_for_task(task: dict[str, object] | None) -> str:
@@ -2568,10 +2596,18 @@ def main() -> int:
         selected_task = select_next_task(WORKSPACE)
         if selected_task is None:
             ok, issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
-            seeded = enqueue_recurring_decode_tasks(cycle, issue or "queue exhausted after synthesis")
             after = durable_snapshot()
             progress_reasons = durable_progress(before, after)
-            progressed = ok and (bool(progress_reasons) or seeded > 0)
+            deterministic_ready = deterministic_ready_tasks()
+            if ok and not deterministic_ready:
+                pause_reason = (
+                    "synthesis produced no new deterministic ready tasks; "
+                    "pausing to avoid low-quality repeated measurement"
+                )
+                append_quality_pause(cycle, current_session, pause_reason)
+                log(f"cycle={cycle} quality_pause reason={pause_reason}")
+                break
+            progressed = ok and bool(progress_reasons)
             stalled_cycles = 0 if progressed else stalled_cycles + 1
             last_issue = "" if progressed else (issue or "supervisor synthesis made no durable progress")
             if progressed:
@@ -2581,7 +2617,7 @@ def main() -> int:
                 append_supervisor_result(cycle, current_session, "blocked", last_issue)
             log(
                 f"cycle={cycle} supervisor_synthesis ok={ok} progressed={progressed} "
-                f"seeded_tasks={seeded} "
+                f"deterministic_ready={len(deterministic_ready)} "
                 f"artifact={','.join(progress_reasons) if progress_reasons else 'none'} "
                 f"issue={last_issue or 'none'}"
             )
@@ -2602,17 +2638,19 @@ def main() -> int:
                 },
                 commit=current_commit(),
             )
-            seeded = 0
-            if not any(
-                task_runs_without_model(task)
-                for task in read_jsonl(TASKS)
-                if task.get("status", "ready") in {"ready", "rework"}
-            ):
-                seeded = enqueue_recurring_decode_tasks(cycle, issue)
+            deterministic_ready = deterministic_ready_tasks()
+            if not deterministic_ready:
+                pause_reason = (
+                    f"{defer_reason}; no deterministic ready tasks remained after synthesis, "
+                    "so autoresearch paused instead of refilling generic cycles"
+                )
+                append_quality_pause(cycle, current_session, pause_reason)
+                log(f"cycle={cycle} quality_pause reason={pause_reason}")
+                break
             append_supervisor_result(cycle, current_session, "blocked", issue)
             after = durable_snapshot()
             progress_reasons = durable_progress(before, after)
-            progressed = ok and (bool(progress_reasons) or seeded > 0)
+            progressed = ok and bool(progress_reasons)
             if progressed:
                 progress_cycles += 1
                 stalled_cycles = 0
@@ -2623,7 +2661,7 @@ def main() -> int:
                 last_issue = synth_issue or issue
             log(
                 f"cycle={cycle} skipped model-bound task={selected_task.get('id', 'unknown')} "
-                f"because {defer_reason}; synthesis_ok={ok} seeded_tasks={seeded} "
+                f"because {defer_reason}; synthesis_ok={ok} deterministic_ready={len(deterministic_ready)} "
                 f"progressed={progressed} issue={last_issue or 'none'}"
             )
             time.sleep(args.sleep_seconds)

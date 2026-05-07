@@ -292,6 +292,18 @@ def main() -> int:
         assert "implementation-bridge-cycle-042" in recurring_tasks
         assert '"supervisor_action": "implementation-bridge"' in recurring_tasks
         assert "autopilot-refill" in helper.RESULTS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {"id": "freeform", "status": "ready", "next_action": "inspect a broad folder"},
+                {"id": "bounded-benchmark", "status": "ready", "benchmark_mode": "decode-sample"},
+            ],
+        )
+        deterministic = helper.deterministic_ready_tasks()
+        assert [task["id"] for task in deterministic] == ["bounded-benchmark"]
+        helper.append_quality_pause(43, "nightly", "unit-test exhausted synthesis")
+        assert "quality-pause-43" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "autopilot-quality-pause" in helper.FINDINGS.read_text(encoding="utf-8")
         extend_args = Namespace(auto_extend_cycles=True, sleep_seconds=0, rotate_session_after_stalls=3)
         extend, reason, summary = helper.should_extend_cycle_budget(
             extend_args,
