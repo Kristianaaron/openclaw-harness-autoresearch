@@ -389,6 +389,10 @@ def main() -> int:
             review = json.loads(max(review_paths, key=lambda path: path.stat().st_mtime_ns).read_text(encoding="utf-8"))
             assert review["repeated_block2_winner"] is True
             assert review["verdict"] == "converged-below-target"
+            assert review["scorecard"]["overall"] >= 90
+            assert review["scorecard"]["components"]["causal"] >= 90
+            assert review["scorecard"]["components"]["next_action"] >= 90
+            assert review["quality_score"] >= review["legacy_quality_score"]
             assert review["gates"]["required_block_coverage"] is True
             assert review["best_block"] == "2"
             assert review["target_tps"] == 30.0
@@ -435,6 +439,7 @@ def main() -> int:
             )
             assert clean_review["clean_runtime_overhead_maps"] >= 2
             assert clean_review["gates"]["runtime_overhead_not_repeated"] is False
+            assert clean_review["scorecard"]["components"]["novelty"] >= 70
             assert "review-janq-drafter-fit-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             with (root / "results.tsv").open("a", encoding="utf-8") as file:
                 for index in range(3):
@@ -615,6 +620,14 @@ def main() -> int:
             assert helper.dflash_lane_is_blocked(root, recent_rows=20) is True
             assert helper.suppress_hard_blocked_dflash_lane(root, recent_rows=20) is True
             assert "frontier-dflash" in helper.exhausted_lanes(root)
+            assert helper.quality_review(
+                Namespace(recent_rows=120, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+            ) == 0
+            dflash_review = json.loads(
+                max((root / "benchmarks").glob("quality-review-*.json"), key=lambda path: path.stat().st_mtime_ns).read_text()
+            )
+            assert dflash_review["scorecard"]["signals"]["dflash_suppressed"] is True
+            assert dflash_review["scorecard"]["components"]["convergence"] >= 90
             helper.write_jsonl(
                 root / "tasks.jsonl",
                 [task for task in helper.read_jsonl(root / "tasks.jsonl") if "dflash" not in str(task.get("id", ""))],
@@ -646,10 +659,13 @@ def main() -> int:
             assert eval_paths
             eval_report = json.loads(eval_paths[-1].read_text(encoding="utf-8"))
             assert eval_report["scores"]["karpathy_core_loop"] >= 8.0
+            assert eval_report["scores"]["research_quality"] >= 9.0
+            assert eval_report["latest_quality_scorecard_overall"] >= 90
+            assert eval_report["readiness"] == "frontier-candidate"
             assert "deliberate-drafter-trace-gate-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "frontier-repair-measurement-artifact-" in repair_tasks
+            assert "frontier-repair-measurement-artifact-" not in repair_tasks
             all_done_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in all_done_tasks:
                 task["status"] = "done"

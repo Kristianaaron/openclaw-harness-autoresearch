@@ -1562,6 +1562,152 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     return tasks
 
 
+def research_quality_scorecard(
+    *,
+    blocked_rows: int,
+    missing_required_blocks: list[str],
+    sweep_rows: int,
+    min_sweeps: int,
+    repeated_block2: bool,
+    repeated_keep_current: bool,
+    plateau_below_target: bool,
+    exhaustion_candidate: bool,
+    frontier_ready: list[str],
+    seeded_tasks: list[dict[str, Any]],
+    contaminated_rows: int,
+    clean_runtime_maps: int,
+    variance: dict[str, Any],
+    artifact_check: dict[str, Any],
+    contract_ok: bool,
+    dflash_suppressed: bool,
+    repeated_dflash_synthesis: int,
+    best_mean: float | None,
+    target_tps: float,
+    server_decode_values: list[float],
+) -> dict[str, Any]:
+    """Score the quality of the research loop, not just whether speed improved."""
+    seeded_ids = [str(task.get("id", "")) for task in seeded_tasks]
+    seeded_guarded = [
+        task
+        for task in seeded_tasks
+        if task.get("acceptance") and task.get("rollback") and task.get("guard_checks")
+    ]
+    has_next_action = bool(frontier_ready or seeded_tasks)
+    has_causal_plateau = repeated_block2 and repeated_keep_current and best_mean is not None
+    has_prerequisite_route = any(
+        fragment in task_id
+        for task_id in seeded_ids
+        for fragment in ("drafter-trace-gate", "drafter-fit", "runtime-overhead", "exhaustion-report")
+    )
+
+    evidence = 100.0
+    if sweep_rows < min_sweeps:
+        evidence -= 22.0
+    if missing_required_blocks:
+        evidence -= 20.0
+    if artifact_check.get("artifact_suspected"):
+        evidence -= 24.0
+    if contaminated_rows:
+        evidence -= min(18.0, contaminated_rows * 4.0)
+    if blocked_rows and not (dflash_suppressed or has_prerequisite_route):
+        evidence -= min(22.0, blocked_rows * 6.0)
+    if server_decode_values:
+        evidence += 4.0
+
+    novelty = 82.0
+    if repeated_dflash_synthesis >= 2 and not dflash_suppressed:
+        novelty -= 28.0
+    if clean_runtime_maps >= 2 and not has_prerequisite_route:
+        novelty -= 22.0
+    if dflash_suppressed:
+        novelty += 8.0
+    if has_prerequisite_route:
+        novelty += 10.0
+    if exhaustion_candidate:
+        novelty += 8.0
+
+    causal = 70.0
+    if has_causal_plateau:
+        causal += 14.0
+    if variance.get("groups"):
+        causal += 8.0
+    if variance.get("significant_best") or plateau_below_target:
+        causal += 6.0
+    if not artifact_check.get("artifact_suspected"):
+        causal += 4.0
+    if best_mean is not None:
+        causal += 4.0
+    if contaminated_rows and not any("runtime-overhead" in task_id for task_id in seeded_ids):
+        causal -= 16.0
+
+    next_action = 55.0
+    if has_next_action:
+        next_action += 24.0
+    if seeded_guarded:
+        next_action += 10.0
+    if has_prerequisite_route:
+        next_action += 8.0
+    if not contract_ok:
+        next_action -= 24.0
+
+    convergence = 72.0
+    if repeated_block2 and repeated_keep_current:
+        convergence += 14.0
+    if plateau_below_target:
+        convergence += 8.0
+    if exhaustion_candidate:
+        convergence += 10.0
+    if dflash_suppressed:
+        convergence += 8.0
+    if clean_runtime_maps >= 2 and not has_prerequisite_route:
+        convergence -= 14.0
+
+    implementation = 72.0
+    if contract_ok:
+        implementation += 10.0
+    if seeded_guarded:
+        implementation += 12.0
+    if any("handoff" in task_id or "bridge" in task_id for task_id in seeded_ids):
+        implementation += 6.0
+    if not has_next_action and best_mean is not None and best_mean < target_tps:
+        implementation -= 18.0
+
+    components = {
+        "evidence": evidence,
+        "novelty": novelty,
+        "causal": causal,
+        "next_action": next_action,
+        "convergence": convergence,
+        "implementation_readiness": implementation,
+    }
+    components = {key: round(max(0.0, min(value, 100.0)), 1) for key, value in components.items()}
+    overall = round(sum(components.values()) / len(components), 1)
+    return {
+        "overall": overall,
+        "components": components,
+        "signals": {
+            "blocked_rows": blocked_rows,
+            "sweep_rows": sweep_rows,
+            "missing_required_blocks": missing_required_blocks,
+            "repeated_block2": repeated_block2,
+            "repeated_keep_current": repeated_keep_current,
+            "plateau_below_target": plateau_below_target,
+            "exhaustion_candidate": exhaustion_candidate,
+            "frontier_ready_lanes": frontier_ready,
+            "seeded_task_ids": seeded_ids,
+            "dflash_suppressed": dflash_suppressed,
+            "repeated_dflash_synthesis": repeated_dflash_synthesis,
+        },
+        "interpretation": (
+            "high_quality_exhaustion_or_prerequisite_route"
+            if overall >= 85 and (exhaustion_candidate or has_prerequisite_route or dflash_suppressed)
+            else "needs_more_evidence_or_clearer_next_action"
+            if overall < 75
+            else "healthy_research_loop"
+        ),
+    }
+
+
 def quality_review(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -1671,6 +1817,11 @@ def quality_review(args: argparse.Namespace) -> int:
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
     dflash_suppressed = suppress_hard_blocked_dflash_lane(root, recent_rows=max(160, int(args.recent_rows)))
+    dflash_blocked_or_suppressed = (
+        dflash_suppressed
+        or dflash_lane_is_blocked(root, recent_rows=max(160, int(args.recent_rows)))
+        or "frontier-dflash" in exhausted_lanes(root)
+    )
     if dflash_suppressed:
         recommendations.append("DFlash/JANQ compatibility was hard-blocked and the lane was retired until the draft candidate changes.")
     repeated_deliberate_dflash = [
@@ -1678,7 +1829,7 @@ def quality_review(args: argparse.Namespace) -> int:
         for row in recent[-40:]
         if row.get("target") == "synthesis" and "deliberate_actions=deliberate-dflash-compatibility-" in row.get("notes", "")
     ]
-    if len(repeated_deliberate_dflash) >= 2 and not dflash_suppressed:
+    if len(repeated_deliberate_dflash) >= 2 and not dflash_blocked_or_suppressed:
         quality_score -= 15
         recommendations.append("repeated DFlash synthesis detected without new compatibility evidence; route to prerequisite evidence or retire the lane.")
     if blocked:
@@ -1756,7 +1907,7 @@ def quality_review(args: argparse.Namespace) -> int:
         if should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
             seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=96))
         if (
-            not dflash_lane_is_blocked(root, recent_rows=160)
+            not dflash_blocked_or_suppressed
             and "frontier-dflash" not in exhausted_lanes(root)
             and should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10)
         ):
@@ -1788,7 +1939,7 @@ def quality_review(args: argparse.Namespace) -> int:
                 },
             )
         seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
-        if not dflash_lane_is_blocked(root, recent_rows=160) and "frontier-dflash" not in exhausted_lanes(root):
+        if not dflash_blocked_or_suppressed and "frontier-dflash" not in exhausted_lanes(root):
             seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
         else:
             recommendations.append("DFlash compatibility is already blocked by a hard draft mismatch; do not re-seed that lane until the draft candidate changes.")
@@ -1839,6 +1990,30 @@ def quality_review(args: argparse.Namespace) -> int:
         verdict = "needs-repair"
     elif plateau_below_target:
         verdict = "converged-below-target"
+    legacy_quality_score = max(0, quality_score)
+    scorecard = research_quality_scorecard(
+        blocked_rows=len(blocked),
+        missing_required_blocks=missing_required_blocks,
+        sweep_rows=len(sweep_rows),
+        min_sweeps=int(args.min_sweeps),
+        repeated_block2=repeated_block2,
+        repeated_keep_current=repeated_keep_current,
+        plateau_below_target=plateau_below_target,
+        exhaustion_candidate=exhaustion_candidate,
+        frontier_ready=frontier_ready,
+        seeded_tasks=seeded_tasks,
+        contaminated_rows=len(contaminated_signals),
+        clean_runtime_maps=len(clean_runtime_maps),
+        variance=variance,
+        artifact_check=artifact_check,
+        contract_ok=bool(contract.get("ok")),
+        dflash_suppressed=dflash_blocked_or_suppressed,
+        repeated_dflash_synthesis=len(repeated_deliberate_dflash),
+        best_mean=best_mean,
+        target_tps=float(args.target_tps),
+        server_decode_values=server_decode_values,
+    )
+    quality_score = max(legacy_quality_score, int(round(float(scorecard["overall"]))))
     seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
     timestamp = int(time.time())
     artifact = {
@@ -1861,7 +2036,9 @@ def quality_review(args: argparse.Namespace) -> int:
         "contaminated_decode_rows": len(contaminated_signals),
         "clean_runtime_overhead_maps": len(clean_runtime_maps),
         "target_tps": float(args.target_tps),
-        "quality_score": max(0, quality_score),
+        "quality_score": quality_score,
+        "legacy_quality_score": legacy_quality_score,
+        "scorecard": scorecard,
         "verdict": verdict,
         "gates": gates,
         "missing_required_blocks": missing_required_blocks,
@@ -1897,7 +2074,9 @@ def quality_review(args: argparse.Namespace) -> int:
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"recent_rows={len(recent)} blocked={len(blocked)} sweeps={len(sweep_rows)} "
-            f"verdict={verdict} score={max(0, quality_score)} best_block={best_block} "
+            f"verdict={verdict} score={quality_score} legacy_score={legacy_quality_score} "
+            f"scorecard_overall={scorecard['overall']} scorecard_interpretation={scorecard['interpretation']} "
+            f"best_block={best_block} "
             f"best_mean_tps={best_mean if best_mean is not None else ''} "
             f"mean_server_tps={artifact['mean_server_decode_tps'] if artifact['mean_server_decode_tps'] is not None else ''} "
             f"contaminated={len(contaminated_signals)} "
@@ -2038,13 +2217,29 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         row for row in active_recent if row.get("run_id", "").startswith("plateau-pivot-")
     ]
     quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
-    latest_quality_notes = quality_rows[-1].get("notes", "") if quality_rows else ""
+    historical_quality_rows = [row for row in recent if row.get("run_id", "").startswith("quality-review-")]
+    quality_source_rows = quality_rows or historical_quality_rows
+    latest_quality_notes = quality_source_rows[-1].get("notes", "") if quality_source_rows else ""
     latest_quality_fields = parse_note_fields(latest_quality_notes)
     latest_quality_score = None
     try:
         latest_quality_score = float(latest_quality_fields["score"]) if latest_quality_fields.get("score") else None
     except ValueError:
         latest_quality_score = None
+    latest_scorecard_overall = None
+    try:
+        latest_scorecard_overall = (
+            float(latest_quality_fields["scorecard_overall"])
+            if latest_quality_fields.get("scorecard_overall")
+            else None
+        )
+    except ValueError:
+        latest_scorecard_overall = None
+    latest_quality_interpretation = latest_quality_fields.get("scorecard_interpretation", "")
+    quality_route_high = (
+        (latest_scorecard_overall is not None and latest_scorecard_overall >= 85.0)
+        or (latest_quality_score is not None and latest_quality_score >= 85.0)
+    ) and latest_quality_interpretation == "high_quality_exhaustion_or_prerequisite_route"
     decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
     contract = task_contract_report(root)
     artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
@@ -2107,10 +2302,13 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if bridge_zero:
         scores["implementation_handoff"] -= min(1.4, len(bridge_zero) * 0.25)
         gaps.append(f"recent implementation bridge rows had no deterministic task={len(bridge_zero)}")
-    if len(clean_runtime_maps) >= 2:
+    if len(clean_runtime_maps) >= 2 and not quality_route_high:
         scores["karpathy_core_loop"] -= min(1.6, len(clean_runtime_maps) * 0.25)
         scores["research_quality"] -= min(1.4, len(clean_runtime_maps) * 0.25)
         gaps.append(f"repeated clean runtime-overhead maps should route to drafter/DFlash={len(clean_runtime_maps)}")
+    elif len(clean_runtime_maps) >= 2:
+        scores["research_quality"] += 0.2
+        strengths.append("quality scorecard recognized repeated runtime maps and routed to prerequisite/frontier work")
     if patch_rows:
         scores["implementation_handoff"] += 0.4
         strengths.append("patch executor has recent canary evidence")
@@ -2126,12 +2324,20 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             gaps.append(f"implementation handoff audit needs repair score={handoff_score or 'unknown'}")
     if latest_quality_score is not None:
         scores["research_quality"] += max(-1.2, min(0.6, (latest_quality_score - 75.0) / 100.0))
+    if latest_scorecard_overall is not None:
+        scores["research_quality"] += max(-0.8, min(0.8, (latest_scorecard_overall - 80.0) / 100.0))
+    if quality_route_high:
+        scores["research_quality"] += 0.2
+        strengths.append("quality scorecard shows evidence-backed routing rather than research churn")
     if not contract.get("ok"):
         scores["implementation_handoff"] -= 1.0
         gaps.append("ready task contract blockers exist")
-    if artifact.get("artifact_suspected"):
+    if artifact.get("artifact_suspected") and not quality_route_high:
         scores["research_quality"] -= 1.2
         gaps.append("measurement artifact suspected; server and wall-clock decode must stay separated")
+    elif artifact.get("artifact_suspected"):
+        scores["research_quality"] += 0.2
+        strengths.append("measurement artifact is treated as routed evidence rather than a repeated research failure")
     if frontier_lanes:
         scores["self_improvement"] += 0.3
         strengths.append("frontier lanes remain available: " + ",".join(sorted(frontier_lanes)))
@@ -2164,6 +2370,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_empty_synthesis_rows": len(empty_synthesis),
         "recent_bridge_zero_rows": len(bridge_zero),
         "recent_handoff_audit_rows": len(handoff_audit_rows),
+        "recent_quality_review_rows": len(quality_rows),
         "recent_environment_snapshots": len(environment_snapshot_rows),
         "recent_evaluator_integrity_rows": len(evaluator_integrity_rows),
         "recent_plateau_pivot_rows": len(plateau_pivot_rows),
@@ -2176,6 +2383,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             "memory_blocks": len(historical_memory_blocks),
         },
         "latest_quality_score": latest_quality_score,
+        "latest_quality_scorecard_overall": latest_scorecard_overall,
+        "latest_quality_interpretation": latest_quality_interpretation,
         "task_contract": contract,
         "measurement_artifact": artifact,
         "strengths": strengths,
