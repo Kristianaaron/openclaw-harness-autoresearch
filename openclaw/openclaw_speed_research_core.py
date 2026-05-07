@@ -20,7 +20,7 @@ RESULTS_HEADER = (
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
 BENCHMARK_MANIFEST_VERSION = 1
-RESEARCH_PROFILE_VERSION = 1
+RESEARCH_PROFILE_VERSION = 2
 GEPA_POLICY_TARGETS = (
     "program.md",
     "STRATEGY.md",
@@ -104,6 +104,8 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "runtime-overhead",
             "frontier-dflash",
             "implementation-gate",
+            "causal-repair",
+            "safety",
             "exhaustion-report",
         ],
     },
@@ -117,6 +119,8 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "acceptance_delta",
             "compatibility_decision_then_decode_tps",
             "bottleneck_evidence",
+            "memory_guard_replay",
+            "promotion_confidence",
         ],
     },
     "implementation_contract": {
@@ -1752,6 +1756,26 @@ def result_rows_since(root: Path, before_line_count: int) -> list[dict[str, str]
     return rows
 
 
+def runtime_overhead_map_is_clean(row: dict[str, str]) -> bool:
+    if row.get("status") != "keep" or not row.get("run_id", "").startswith("runtime-overhead-map-"):
+        return False
+    return parse_note_fields(row.get("notes", "")).get("contaminated") == "0"
+
+
+def should_suppress_runtime_overhead_map(root: Path, *, recent_rows: int = 80) -> bool:
+    recent = all_result_rows(root)[-max(1, recent_rows) :]
+    if not any(runtime_overhead_map_is_clean(row) for row in recent):
+        return False
+    contaminated_decode = [
+        row
+        for row in recent
+        if row.get("status") == "keep"
+        and row.get("target") == "decode-sample"
+        and decode_measurement_signal(row)["contaminated"]
+    ]
+    return not contaminated_decode
+
+
 def parse_float(value: object) -> float | None:
     try:
         text = str(value).strip()
@@ -1923,12 +1947,24 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
     if not tasks:
         return None
     exhausted = exhausted_lanes(root)
+    suppress_runtime_map = should_suppress_runtime_overhead_map(root)
     filtered = [
         task
         for task in tasks
         if lane_key_for_task(task) not in exhausted
         or task.get("lane") in {"exhaustion-report", "frontier-dflash", "drafter-alignment", "runtime-overhead"}
     ]
+    if suppress_runtime_map:
+        non_runtime_map = [
+            task
+            for task in filtered
+            if not (
+                task.get("supervisor_action") == "runtime-overhead-map"
+                and not str(task.get("id", "")).startswith("runtime-overhead-contamination-map")
+            )
+        ]
+        if non_runtime_map:
+            filtered = non_runtime_map
     if not filtered:
         filtered = tasks
     contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]

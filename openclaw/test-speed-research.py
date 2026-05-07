@@ -350,6 +350,28 @@ def main() -> int:
             assert "mtp-decode" in (root / "exhausted-approaches.jsonl").read_text(encoding="utf-8")
             assert "review-mtp-loop-overhead-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             with (root / "results.tsv").open("a", encoding="utf-8") as file:
+                file.write(
+                    "2026-05-05T00:11:50+0000\tmtp-report-unit\tkeep\tmtp-acceptance-report\t"
+                    "unit mtp report\t\t\t\t\t\tabc123\tsamples=3 mtp_samples=3 mean_accept=0.7\n"
+                )
+                for index in range(2):
+                    file.write(
+                        f"2026-05-05T00:11:5{index + 1}+0000\truntime-overhead-map-unit-{index}\tkeep\t"
+                        "runtime-overhead-map\tclean runtime map\t\t\t\t\t\tabc123\t"
+                        "contaminated=0 mean_server_tps=14.0 mean_clean_wall_tps=13.9 hit_count=10\n"
+                    )
+            clean_routed = helper.synthesis_deliberate_action_tasks(root, helper.result_rows(root), 123456)
+            assert clean_routed
+            assert clean_routed[0]["id"].startswith("deliberate-drafter-fit-plan-")
+            assert "openclaw-drafter-fit plan" in clean_routed[0]["next_action"]
+            assert helper.quality_review(
+                Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+            ) == 0
+            clean_review = json.loads(sorted((root / "benchmarks").glob("quality-review-*.json"))[-1].read_text())
+            assert clean_review["clean_runtime_overhead_maps"] >= 2
+            assert clean_review["gates"]["runtime_overhead_not_repeated"] is False
+            assert "review-janq-drafter-fit-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            with (root / "results.tsv").open("a", encoding="utf-8") as file:
                 for index in range(3):
                     file.write(
                         f"2026-05-05T00:12:0{index}+0000\tfallback-decode-{index}\tkeep\t"
@@ -468,14 +490,14 @@ def main() -> int:
             helper.write_jsonl(root / "tasks.jsonl", exhausted_tasks)
             assert helper.synthesize(Namespace(kind="frontier")) == 0
             deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "deliberate-mtp-report-" in deliberate_tasks
+            assert "deliberate-drafter-fit-plan-" in deliberate_tasks
             assert "deliberate_actions" in (root / "findings.jsonl").read_text(encoding="utf-8")
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
             assert eval_paths
             eval_report = json.loads(eval_paths[-1].read_text(encoding="utf-8"))
             assert eval_report["scores"]["karpathy_core_loop"] >= 8.0
-            assert "deliberate-mtp-report-" in "\n".join(eval_report["deterministic_ready_tasks"])
+            assert "deliberate-drafter-fit-plan-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "frontier-repair-measurement-artifact-" in repair_tasks

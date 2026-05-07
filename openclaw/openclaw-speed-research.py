@@ -1208,6 +1208,68 @@ def should_seed_action(root: Path, prefix: str, *, recent_rows: int = 80) -> boo
     return not active_task_has_prefix(root, prefix) and not recent_result_has_prefix(root, prefix, recent_rows=recent_rows)
 
 
+def recent_clean_runtime_overhead_maps(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 80,
+) -> list[dict[str, str]]:
+    """Return runtime maps that already ruled out wall-clock contamination."""
+    window = (rows if rows is not None else result_rows(root))[-max(1, recent_rows) :]
+    clean_maps: list[dict[str, str]] = []
+    for row in window:
+        if row.get("status") != "keep" or not row.get("run_id", "").startswith("runtime-overhead-map-"):
+            continue
+        if parse_note_fields(row.get("notes", "")).get("contaminated") == "0":
+            clean_maps.append(row)
+    return clean_maps
+
+
+def should_seed_runtime_overhead_map(root: Path, rows: list[dict[str, str]], *, recent_rows: int = 45) -> bool:
+    if active_task_has_prefix(root, "deliberate-runtime-overhead-map-"):
+        return False
+    if active_task_has_prefix(root, "runtime-overhead-contamination-map"):
+        return False
+    if recent_result_has_prefix(root, "runtime-overhead-map-", recent_rows=recent_rows):
+        return False
+    return not recent_clean_runtime_overhead_maps(root, rows, recent_rows=recent_rows)
+
+
+def drafter_fit_task(timestamp: int, *, task_id: str, priority: int = 95) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-fit-plan",
+        "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+        "hypothesis": "If official block-2 MTP is plateaued, the next frontier path is a JANQ-specific drafter fit gate.",
+        "metric": "drafter_fit_gate",
+        "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A drafter-fit plan states required traces, gates, and promotion criteria before any training or live-profile change.",
+        "rollback": "Keep the current MTP drafter as default until a fitted candidate beats paired TUI benchmarks.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
+    }
+
+
+def dflash_compatibility_task(timestamp: int, *, task_id: str, priority: int = 93) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "frontier-dflash",
+        "task_type": "research",
+        "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
+        "hypothesis": "DFlash-style block drafting may raise decode speed, but JANQ compatibility must be proven before runtime promotion.",
+        "metric": "compatibility_decision_then_decode_tps",
+        "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard", "no_opencode_changes"],
+        "acceptance": "Compatibility evidence names the exact unsupported layer or a canary-only path with no live profile mutation.",
+        "rollback": "Do not touch the normal OpenClaw TUI profile unless a paired benchmark beats the current MTP path and all guards pass.",
+        "next_action": "read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md, then inspect the DFlash compatibility plan without installing into the live runtime",
+    }
+
+
 def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
     """Create one high-signal next action when static synthesis candidates are exhausted."""
     recent = rows[-120:]
@@ -1225,6 +1287,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     decode_mean = latest_decode_mean(root, recent_rows=80)
     below_practical_floor = decode_mean is None or decode_mean < 20
     recent_mtp_report = recent_result_has_prefix(root, "mtp-report-", recent_rows=30)
+    clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=45)
 
     if not recent_mtp_report and should_seed_action(root, "deliberate-mtp-report-", recent_rows=30):
         tasks.append(
@@ -1248,7 +1311,7 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
         return tasks
 
     if block_sweep_converged and below_practical_floor:
-        if should_seed_action(root, "deliberate-runtime-overhead-map-", recent_rows=35):
+        if should_seed_runtime_overhead_map(root, recent, recent_rows=45):
             tasks.append(
                 {
                     "id": f"deliberate-runtime-overhead-map-{timestamp}",
@@ -1268,23 +1331,16 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
             )
             return tasks
         if should_seed_action(root, "deliberate-drafter-fit-plan-", recent_rows=35):
-            tasks.append(
-                {
-                    "id": f"deliberate-drafter-fit-plan-{timestamp}",
-                    "status": "ready",
-                    "priority": 95,
-                    "lane": "drafter-alignment",
-                    "task_type": "supervisor",
-                    "supervisor_action": "drafter-fit-plan",
-                    "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
-                    "hypothesis": "If official block-2 MTP is plateaued, the next frontier path is a JANQ-specific drafter fit gate.",
-                    "metric": "drafter_fit_gate",
-                    "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
-                    "acceptance": "A drafter-fit plan states required traces, gates, and promotion criteria before any training or live-profile change.",
-                    "rollback": "Keep the current MTP drafter as default until a fitted candidate beats paired TUI benchmarks.",
-                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
-                }
-            )
+            task = drafter_fit_task(timestamp, task_id=f"deliberate-drafter-fit-plan-{timestamp}")
+            if clean_runtime_maps:
+                task["hypothesis"] = (
+                    "Runtime-overhead mapping is clean, so the next frontier path is JANQ-specific drafter fit "
+                    "rather than another source map."
+                )
+            tasks.append(task)
+            return tasks
+        if should_seed_action(root, "deliberate-dflash-compatibility-", recent_rows=55):
+            tasks.append(dflash_compatibility_task(timestamp, task_id=f"deliberate-dflash-compatibility-{timestamp}"))
             return tasks
 
     if len(sweep_rows) < 2 and should_seed_action(root, "deliberate-drafter-sweep-", recent_rows=40):
@@ -1383,6 +1439,7 @@ def quality_review(args: argparse.Namespace) -> int:
     active_lanes = {str(task.get("lane", "")) for task in active_tasks}
     frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
     frontier_ready = sorted(active_lanes & frontier_lanes)
+    clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=int(args.recent_rows))
     plateau_below_target = (
         repeated_block2
         and repeated_keep_current
@@ -1403,6 +1460,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "variance_significant_best": bool(variance.get("significant_best")),
         "no_measurement_artifact": not bool(artifact_check.get("artifact_suspected")),
         "no_contaminated_wall_clock": not contaminated_signals,
+        "runtime_overhead_not_repeated": len(clean_runtime_maps) < 2,
         "ready_task_contracts_ok": bool(contract.get("ok")),
     }
     quality_score = 100
@@ -1453,10 +1511,21 @@ def quality_review(args: argparse.Namespace) -> int:
     if variance.get("groups") and not variance.get("significant_best"):
         quality_score -= 10
         recommendations.append("variance gate: best decode result has not cleared the observed noise band; keep measuring or change hypothesis.")
+    if len(clean_runtime_maps) >= 2:
+        quality_score -= 25
+        recommendations.append(
+            "runtime-overhead map has repeatedly reported clean measurements; stop repeating that lane until a fresh contaminated benchmark appears."
+        )
+        if should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
+            seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=96))
+        if should_seed_action(root, "review-dflash-compatibility-next", recent_rows=10):
+            seeded_tasks.append(
+                dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=94)
+            )
     if repeated_block2 and repeated_keep_current:
         recommendations.append("block-size sweep has converged on block 2; move to acceptance, drafter-fit, DFlash, and MTP-loop overhead.")
-        seeded_tasks.extend(
-            [
+        if not clean_runtime_maps:
+            seeded_tasks.append(
                 {
                     "id": "review-mtp-loop-overhead-next",
                     "status": "ready",
@@ -1470,32 +1539,9 @@ def quality_review(args: argparse.Namespace) -> int:
                     "guard_checks": ["one_narrow_tool", "no_live_profile_change", "tests_before_patch"],
                     "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
                 },
-                {
-                    "id": "review-janq-drafter-fit-next",
-                    "status": "ready",
-                    "priority": 92,
-                    "lane": "drafter-alignment",
-                    "task_type": "supervisor",
-                    "supervisor_action": "drafter-fit-plan",
-                    "target": "/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
-                    "hypothesis": "Block-size tuning is exhausted; the next speed ceiling requires JANQ-specific drafter fit or a safely rejected DFlash path.",
-                    "metric": "drafter_fit_gate",
-                    "guard_checks": ["no_model_load", "no_opencode_changes", "no_live_profile_change"],
-                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
-                },
-                {
-                    "id": "review-dflash-compatibility-next",
-                    "status": "ready",
-                    "priority": 90,
-                    "lane": "frontier-dflash",
-                    "target": "dflash.model_mlx/openclaw-jang-vlm-server.py",
-                    "hypothesis": "The 30+ tok/s path may require DFlash-style block drafting, but JANQ compatibility must be proven before any live runtime change.",
-                    "metric": "compatibility_decision_then_decode_tps",
-                    "guard_checks": ["no_live_profile_change", "separate_env", "memory_gate", "stream_guard"],
-                    "next_action": "read exactly /Users/kristian/.openclaw/research/speed/implementation-skill.md, then inspect the DFlash compatibility plan without installing into the live runtime",
-                },
-            ]
-        )
+            )
+        seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
+        seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
     if blocked:
         review_status = "blocked"
         recommendations.append(f"recent run has {len(blocked)} blocked rows; inspect the last blocker before trusting speed conclusions.")
@@ -1562,6 +1608,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "mean_server_decode_tps": mean_float(server_decode_values),
         "max_server_decode_tps": round(max(server_decode_values), 3) if server_decode_values else None,
         "contaminated_decode_rows": len(contaminated_signals),
+        "clean_runtime_overhead_maps": len(clean_runtime_maps),
         "target_tps": float(args.target_tps),
         "quality_score": max(0, quality_score),
         "verdict": verdict,
@@ -1713,6 +1760,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         if row.get("run_id", "").startswith("supervisor-implementation-bridge-")
         and "ready_deterministic=0" in row.get("notes", "")
     ]
+    clean_runtime_maps = recent_clean_runtime_overhead_maps(root, active_recent, recent_rows=len(active_recent) or 1)
     historical_bridge_zero = [
         row
         for row in recent
@@ -1776,6 +1824,10 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if bridge_zero:
         scores["implementation_handoff"] -= min(1.4, len(bridge_zero) * 0.25)
         gaps.append(f"recent implementation bridge rows had no deterministic task={len(bridge_zero)}")
+    if len(clean_runtime_maps) >= 2:
+        scores["karpathy_core_loop"] -= min(1.6, len(clean_runtime_maps) * 0.25)
+        scores["research_quality"] -= min(1.4, len(clean_runtime_maps) * 0.25)
+        gaps.append(f"repeated clean runtime-overhead maps should route to drafter/DFlash={len(clean_runtime_maps)}")
     if patch_rows:
         scores["implementation_handoff"] += 0.4
         strengths.append("patch executor has recent canary evidence")
@@ -1785,7 +1837,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         scores["implementation_handoff"] -= 1.0
         gaps.append("ready task contract blockers exist")
     if artifact.get("artifact_suspected"):
-        scores["research_quality"] -= 0.5
+        scores["research_quality"] -= 1.2
         gaps.append("measurement artifact suspected; server and wall-clock decode must stay separated")
     if frontier_lanes:
         scores["self_improvement"] += 0.3
@@ -1798,7 +1850,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 
     scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
     overall = round(sum(scores.values()) / len(scores), 2)
-    readiness = "frontier-candidate" if overall >= 9.0 and not any("contract" in gap for gap in gaps) else "needs-targeted-work"
+    blocking_gap_terms = ("contract", "measurement artifact", "repeated clean runtime-overhead")
+    readiness = (
+        "frontier-candidate"
+        if overall >= 9.0 and not any(term in gap for term in blocking_gap_terms for gap in gaps)
+        else "needs-targeted-work"
+    )
     return {
         "ok": True,
         "kind": "frontier-system-eval",
@@ -1813,6 +1870,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "deliberate_ready_tasks": [str(task.get("id", "")) for task in deliberate_ready[:8]],
         "recent_empty_synthesis_rows": len(empty_synthesis),
         "recent_bridge_zero_rows": len(bridge_zero),
+        "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
         "historical_debt": {
             "window_rows": len(recent),
