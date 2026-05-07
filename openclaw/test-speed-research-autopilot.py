@@ -23,8 +23,7 @@ def load_helper():
     return module
 
 
-def main() -> int:
-    helper = load_helper()
+def check_prompt_and_routing_guards(helper) -> None:
     prompt = helper.continuation_prompt(1, 0)
     assert "do not read it this turn" in prompt
     assert "Do not touch opencode" in prompt
@@ -147,6 +146,8 @@ def main() -> int:
     assert helper.should_run_deterministic_fallback("", {"reason": "no durable artifact"})
     assert not helper.should_run_deterministic_fallback("memory gate waiting", {"reason": "memory"})
 
+
+def check_memory_and_failure_guards(helper) -> None:
     assert helper.summarize_issue("x OpenClaw blocked a broad local tool command y", "", 0) == (
         "OpenClaw blocked a broad local tool command"
     )
@@ -237,17 +238,27 @@ def main() -> int:
     assert helper.continuation_prompt(4, 0, "rotated to fresh session after 3 stalled cycles").count(
         "Last cycle issue"
     ) == 1
+
+
+def configure_workspace(helper, workspace: Path) -> None:
+    helper.WORKSPACE = workspace
+    helper.RESULTS = helper.WORKSPACE / "results.tsv"
+    helper.IDEAS = helper.WORKSPACE / "ideas.md"
+    helper.TASKS = helper.WORKSPACE / "tasks.jsonl"
+    helper.BENCHMARKS = helper.WORKSPACE / "benchmarks"
+    helper.STRATEGY = helper.WORKSPACE / "STRATEGY.md"
+    helper.FINDINGS = helper.WORKSPACE / "findings.jsonl"
+    helper.EXPERIMENTS = helper.WORKSPACE / "experiments.jsonl"
+    helper.REJECTIONS = helper.WORKSPACE / "rejections.jsonl"
+    helper.OPENCLAW_HOME = workspace / "home"
+
+
+def main() -> int:
+    helper = load_helper()
+    check_prompt_and_routing_guards(helper)
+    check_memory_and_failure_guards(helper)
     with tempfile.TemporaryDirectory() as tmp:
-        helper.WORKSPACE = Path(tmp)
-        helper.RESULTS = helper.WORKSPACE / "results.tsv"
-        helper.IDEAS = helper.WORKSPACE / "ideas.md"
-        helper.TASKS = helper.WORKSPACE / "tasks.jsonl"
-        helper.BENCHMARKS = helper.WORKSPACE / "benchmarks"
-        helper.STRATEGY = helper.WORKSPACE / "STRATEGY.md"
-        helper.FINDINGS = helper.WORKSPACE / "findings.jsonl"
-        helper.EXPERIMENTS = helper.WORKSPACE / "experiments.jsonl"
-        helper.REJECTIONS = helper.WORKSPACE / "rejections.jsonl"
-        helper.OPENCLAW_HOME = Path(tmp) / "home"
+        configure_workspace(helper, Path(tmp))
         helper.ensure_task_queue()
         task_text = helper.TASKS.read_text(encoding="utf-8")
         assert "decode-mtp-baseline" in task_text
