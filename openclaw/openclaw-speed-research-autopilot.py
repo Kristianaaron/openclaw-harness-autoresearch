@@ -501,6 +501,26 @@ def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     )
 
 
+def task_runs_without_model(task: dict[str, object] | None) -> bool:
+    if not task:
+        return True
+    return any(
+        predicate(task)
+        for predicate in (
+            is_supervisor_log_review_task,
+            is_supervisor_drafter_sweep_task,
+            is_supervisor_mtp_report_task,
+            is_supervisor_implementation_bridge_task,
+            is_supervisor_patch_execute_task,
+            is_supervisor_drafter_fit_task,
+            is_supervisor_focused_test_task,
+            is_supervisor_gepa_policy_canary_task,
+            is_supervisor_runtime_overhead_map_task,
+            requires_profile_variant_runner,
+        )
+    )
+
+
 def recent_task_rejections(task_id: str, reason: str, limit: int = 3) -> int:
     if not task_id:
         return 0
@@ -2552,6 +2572,29 @@ def main() -> int:
             continue
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
         before = durable_snapshot()
+        if not task_runs_without_model(selected_task) and not model_ready():
+            issue = "model endpoint offline after memory recovery; deferring model-bound task to deterministic synthesis"
+            ok, synth_issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
+            seeded = enqueue_recurring_decode_tasks(cycle, issue)
+            append_supervisor_result(cycle, current_session, "blocked", issue)
+            after = durable_snapshot()
+            progress_reasons = durable_progress(before, after)
+            progressed = ok and (bool(progress_reasons) or seeded > 0)
+            if progressed:
+                progress_cycles += 1
+                stalled_cycles = 0
+                last_issue = ""
+            else:
+                blocked_cycles += 1
+                stalled_cycles += 1
+                last_issue = synth_issue or issue
+            log(
+                f"cycle={cycle} skipped model-bound task={selected_task.get('id', 'unknown')} "
+                f"because model endpoint is offline; synthesis_ok={ok} seeded_tasks={seeded} "
+                f"progressed={progressed} issue={last_issue or 'none'}"
+            )
+            time.sleep(args.sleep_seconds)
+            continue
         if is_supervisor_drafter_fit_task(selected_task):
             code, issue = run_supervisor_drafter_fit_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):
