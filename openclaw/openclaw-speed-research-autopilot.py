@@ -271,6 +271,19 @@ def deterministic_ready_tasks() -> list[dict[str, object]]:
     return [task for task in ready_tasks() if task_runs_without_model(task)]
 
 
+def select_next_runnable_task(args: argparse.Namespace) -> dict[str, object] | None:
+    selected = select_next_task(WORKSPACE)
+    if not selected:
+        deterministic = deterministic_ready_tasks()
+        return deterministic[0] if deterministic else None
+    if not model_bound_defer_reason(args, selected):
+        return selected
+    deterministic = deterministic_ready_tasks()
+    if deterministic:
+        return deterministic[0]
+    return selected
+
+
 def ready_work_summary() -> dict[str, object]:
     tasks = ready_tasks()
     lanes = sorted({str(task.get("lane", "")) for task in tasks if str(task.get("lane", ""))})
@@ -2683,7 +2696,7 @@ def main() -> int:
             time.sleep(args.sleep_seconds)
             continue
         before = durable_snapshot()
-        selected_task = select_next_task(WORKSPACE)
+        selected_task = select_next_runnable_task(args)
         if selected_task is None:
             ok, issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
             after = durable_snapshot()

@@ -290,6 +290,29 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         configure_workspace(helper, Path(tmp))
         helper.ensure_task_queue()
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "model-bound-high-priority",
+                    "status": "ready",
+                    "priority": 99,
+                    "target": "notes.md",
+                    "next_action": "inspect notes",
+                },
+                {
+                    "id": "deterministic-lower-priority",
+                    "status": "ready",
+                    "priority": 50,
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 80",
+                },
+            ],
+        )
+        selected = helper.select_next_runnable_task(Namespace(allow_model_bound_research_turns=False))
+        assert selected["id"] == "deterministic-lower-priority"
+        helper.ensure_task_queue()
         task_text = helper.TASKS.read_text(encoding="utf-8")
         assert "decode-mtp-baseline" in task_text
         assert "decode-sample" in helper.next_task_summary()
