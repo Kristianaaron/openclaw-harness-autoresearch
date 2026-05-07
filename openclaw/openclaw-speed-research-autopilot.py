@@ -32,6 +32,7 @@ from openclaw_speed_research_core import (
     record_trajectory_case,
     replay_checks,
     select_next_task,
+    task_contract_issues,
     task_summary,
     write_jsonl,
 )
@@ -1739,17 +1740,28 @@ def run_supervisor_implementation_bridge(
         for item in read_jsonl(TASKS)
         if item.get("status", "ready") in {"ready", "rework"}
     ]
+    contract_issues = {
+        str(item.get("id", "")): task_contract_issues(WORKSPACE, item)
+        for item in after_ready
+    }
     deterministic = [
         str(item.get("id", ""))
         for item in after_ready
         if item.get("task_type") == "supervisor" and str(item.get("id", "")) != str(task.get("id", ""))
+        and not contract_issues.get(str(item.get("id", "")), {}).get("blockers")
     ]
     seeded = [task_id for task_id in deterministic if task_id not in before_ids]
+    blocked_contracts = {
+        task_id: issue["blockers"]
+        for task_id, issue in contract_issues.items()
+        if issue.get("blockers")
+    }
     summary = {
         "synthesis_ok": ok,
         "issue": issue,
         "seeded_deterministic_tasks": seeded,
         "ready_deterministic_tasks": deterministic[:12],
+        "contract_blockers": blocked_contracts,
         "next": "select_next_ready_supervisor_task",
     }
     status = "keep" if ok and deterministic else "blocked"

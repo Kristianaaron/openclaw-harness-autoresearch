@@ -20,6 +20,7 @@ RESULTS_HEADER = (
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
 BENCHMARK_MANIFEST_VERSION = 1
+RESEARCH_PROFILE_VERSION = 1
 GEPA_POLICY_TARGETS = (
     "program.md",
     "STRATEGY.md",
@@ -89,6 +90,40 @@ DEFAULT_INSIGHT_RUBRIC: dict[str, Any] = {
         "Treat repeated GEPA canaries as a signal to promote one narrow rubric change or suppress the lane.",
         "Prefer deterministic source/log mappers over LLM-led broad inspection for runtime-overhead work.",
     ],
+}
+DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
+    "version": RESEARCH_PROFILE_VERSION,
+    "name": "openclaw-speed",
+    "objective": "Improve normal OpenClaw TUI decode speed and visible response smoothness without changing the selected model.",
+    "scope": {
+        "product": "OpenClaw",
+        "forbidden": ["opencode", "tokens", "secrets", ".env"],
+        "allowed_lanes": [
+            "mtp-decode",
+            "drafter-alignment",
+            "runtime-overhead",
+            "frontier-dflash",
+            "implementation-gate",
+            "exhaustion-report",
+        ],
+    },
+    "metrics": {
+        "primary": ["decode_tps", "decode_tps_delta", "speedup_factor", "mean_accept"],
+        "secondary": [
+            "ttft_s",
+            "prefill_tps",
+            "server_wall_decode_gap",
+            "drafter_fit_gate",
+            "acceptance_delta",
+            "compatibility_decision_then_decode_tps",
+            "bottleneck_evidence",
+        ],
+    },
+    "implementation_contract": {
+        "required_fields": ["source_files", "acceptance", "rollback"],
+        "required_guard_any": ["tests_pass", "canary_only", "no_live_profile_change", "no_model_change"],
+        "patch_execute_required_fields": ["patch_file", "source_files", "tests"],
+    },
 }
 DEFAULT_REPLAY_CASES: tuple[dict[str, Any], ...] = (
     {
@@ -396,6 +431,7 @@ def ensure_research_state(root: Path) -> None:
         exhausted.write_text("", encoding="utf-8")
     write_json_if_missing_or_stale(root / "benchmark-manifest.json", DEFAULT_BENCHMARK_MANIFEST, "version")
     write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
+    write_json_if_missing_or_stale(root / "research-profile.json", DEFAULT_RESEARCH_PROFILE, "version")
     ensure_replay_buffer(root / "replay-buffer.jsonl")
     tasks_path = root / "tasks.jsonl"
     if not tasks_path.exists() or tasks_path.stat().st_size == 0:
@@ -461,6 +497,15 @@ def load_benchmark_manifest(root: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         value = DEFAULT_BENCHMARK_MANIFEST
     return value if isinstance(value, dict) else DEFAULT_BENCHMARK_MANIFEST
+
+
+def load_research_profile(root: Path) -> dict[str, Any]:
+    path = root / "research-profile.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = DEFAULT_RESEARCH_PROFILE
+    return value if isinstance(value, dict) else DEFAULT_RESEARCH_PROFILE
 
 
 def benchmark_spec(root: Path, mode: str) -> dict[str, Any]:
@@ -1291,6 +1336,98 @@ def task_readiness_reasons(task: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def task_contract_issues(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    profile = load_research_profile(root)
+    blockers: list[str] = []
+    warnings: list[str] = []
+    for field in ("id", "target", "hypothesis", "metric", "next_action"):
+        if not task.get(field):
+            blockers.append(f"missing {field}")
+
+    target = str(task.get("target", "")).lower()
+    next_action = str(task.get("next_action", "")).lower()
+    scope = profile.get("scope", {})
+    if not isinstance(scope, dict):
+        scope = {}
+    forbidden = scope.get("forbidden", [])
+    for item in forbidden if isinstance(forbidden, list) else []:
+        needle = str(item).lower()
+        if needle and (needle in target or needle in next_action):
+            blockers.append(f"forbidden scope reference: {item}")
+
+    lane = str(task.get("lane", ""))
+    allowed_lanes = scope.get("allowed_lanes", [])
+    if lane and isinstance(allowed_lanes, list) and allowed_lanes and lane not in {str(item) for item in allowed_lanes}:
+        warnings.append(f"lane outside active research profile: {lane}")
+
+    metric = str(task.get("metric", ""))
+    metrics = profile.get("metrics", {})
+    allowed_metrics: set[str] = set()
+    if isinstance(metrics, dict):
+        for key in ("primary", "secondary"):
+            values = metrics.get(key, [])
+            if isinstance(values, list):
+                allowed_metrics.update(str(item) for item in values)
+    if metric and allowed_metrics and metric not in allowed_metrics:
+        warnings.append(f"metric outside active research profile: {metric}")
+
+    benchmark_mode = str(task.get("benchmark_mode", ""))
+    if benchmark_mode:
+        modes = load_benchmark_manifest(root).get("modes", {})
+        if not isinstance(modes, dict) or benchmark_mode not in modes:
+            blockers.append(f"unknown benchmark_mode: {benchmark_mode}")
+
+    contract = profile.get("implementation_contract", {})
+    if not isinstance(contract, dict):
+        contract = {}
+    task_type = str(task.get("task_type", "research"))
+    supervisor_action = str(task.get("supervisor_action", ""))
+    guard_checks = {str(item) for item in task.get("guard_checks", []) if item}
+    if task_type == "implementation":
+        for field in contract.get("required_fields", []):
+            if not task.get(str(field)):
+                blockers.append(f"implementation missing {field}")
+        required_guard_any = {str(item) for item in contract.get("required_guard_any", [])}
+        if required_guard_any and not (guard_checks & required_guard_any):
+            warnings.append("implementation lacks a recognized safety guard")
+    if supervisor_action == "patch-execute":
+        for field in contract.get("patch_execute_required_fields", []):
+            if not task.get(str(field)):
+                blockers.append(f"patch-execute missing {field}")
+
+    return {
+        "ok": not blockers,
+        "blockers": blockers,
+        "warnings": warnings,
+        "profile": str(profile.get("name", "unknown")),
+    }
+
+
+def task_contract_report(root: Path) -> dict[str, Any]:
+    tasks = [
+        task
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    ]
+    issues = []
+    for task in tasks:
+        contract = task_contract_issues(root, task)
+        if contract["blockers"] or contract["warnings"]:
+            issues.append(
+                {
+                    "task_id": str(task.get("id", "")),
+                    "blockers": contract["blockers"],
+                    "warnings": contract["warnings"],
+                }
+            )
+    return {
+        "ok": not any(item["blockers"] for item in issues),
+        "ready_tasks": len(tasks),
+        "issue_count": len(issues),
+        "issues": issues[:20],
+    }
+
+
 def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     rows = all_result_rows(root)
     recent = rows[-120:]
@@ -1300,6 +1437,13 @@ def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     guard_checks = {str(item) for item in task.get("guard_checks", [])}
     risk = task_risk_level(task)
     lane = lane_key_for_task(task)
+    contract = task_contract_issues(root, task)
+    if contract["blockers"]:
+        score -= 120
+        reasons.append("contract blockers: " + "; ".join(contract["blockers"][:2]))
+    if contract["warnings"]:
+        score -= min(20, len(contract["warnings"]) * 5)
+        reasons.append("contract warnings: " + "; ".join(contract["warnings"][:2]))
 
     if task.get("status") == "rework":
         score += 30
@@ -1784,6 +1928,9 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
     ]
     if not filtered:
         filtered = tasks
+    contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]
+    if contract_clean:
+        filtered = contract_clean
     journal = read_jsonl(root / "journal.jsonl")
     lane_scores: dict[str, float] = {}
     for entry in journal[-250:]:

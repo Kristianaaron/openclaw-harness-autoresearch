@@ -36,6 +36,7 @@ def main() -> int:
             assert (root / "implementation-skill.md").exists()
             assert (root / "benchmark-manifest.json").exists()
             assert (root / "insight-rubric.json").exists()
+            assert (root / "research-profile.json").exists()
             assert (root / "replay-buffer.jsonl").exists()
             manifest = json.loads((root / "benchmark-manifest.json").read_text(encoding="utf-8"))
             assert manifest["locked"] is True
@@ -43,6 +44,9 @@ def main() -> int:
             assert manifest["modes"]["decode-sample"]["requires_usage_completion_tokens"] is True
             rubric = json.loads((root / "insight-rubric.json").read_text(encoding="utf-8"))
             assert "rollback" in rubric["required_fields"]
+            profile = json.loads((root / "research-profile.json").read_text(encoding="utf-8"))
+            assert profile["name"] == "openclaw-speed"
+            assert "decode_tps" in profile["metrics"]["primary"]
             replay_cases = (root / "replay-buffer.jsonl").read_text(encoding="utf-8")
             assert "decode-token-source-required" in replay_cases
             assert "profile-variant-paired-control" in replay_cases
@@ -144,6 +148,24 @@ def main() -> int:
             tasks = helper.read_jsonl(root / "tasks.jsonl")
             assert any(task.get("id") == "mtp-loop-overhead-map" for task in tasks)
             assert any(task.get("id") == "janq-dflash-drafter-fit-plan" and task.get("priority") == 86 for task in tasks)
+            assert helper.task_contract_report(root)["ok"] is True
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    {
+                        "id": "bad-opencode-task",
+                        "status": "ready",
+                        "target": "opencode/config",
+                        "hypothesis": "bad task should be blocked by research profile",
+                        "metric": "decode_tps",
+                        "next_action": "edit opencode/config",
+                    }
+                ],
+            )
+            bad_contract = helper.task_contract_report(root)
+            assert bad_contract["ok"] is False
+            assert "forbidden scope reference: opencode" in bad_contract["issues"][0]["blockers"]
+            helper.write_jsonl(root / "tasks.jsonl", tasks)
             helper.write_jsonl(
                 root / "tasks.jsonl",
                 [

@@ -42,6 +42,7 @@ from openclaw_speed_research_core import (
     replay_checks,
     score_insight,
     seed_gepa_canary_task,
+    task_contract_report,
     variance_analysis,
     write_gepa_policy_canary,
     write_jsonl,
@@ -1271,6 +1272,7 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     variance = variance_analysis(root, recent_rows=int(args.recent_rows), min_samples=int(args.min_samples_per_block))
     artifact_check = measurement_artifact_analysis(root, recent_rows=int(args.recent_rows))
+    contract = task_contract_report(root)
     review_status = "keep"
     recommendations: list[str] = []
     gates: dict[str, Any] = {
@@ -1282,6 +1284,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "variance_significant_best": bool(variance.get("significant_best")),
         "no_measurement_artifact": not bool(artifact_check.get("artifact_suspected")),
         "no_contaminated_wall_clock": not contaminated_signals,
+        "ready_task_contracts_ok": bool(contract.get("ok")),
     }
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
@@ -1299,6 +1302,15 @@ def quality_review(args: argparse.Namespace) -> int:
     if artifact_check.get("artifact_suspected"):
         quality_score -= 25
         recommendations.append(f"measurement artifact suspected: {artifact_check.get('reason')}; remeasure baseline before promotion.")
+    if not contract.get("ok"):
+        quality_score -= 25
+        review_status = "blocked"
+        first_issue = (contract.get("issues") or [{}])[0]
+        recommendations.append(
+            "task contract blocker: "
+            f"{first_issue.get('task_id', 'unknown')} "
+            f"{'; '.join(str(item) for item in first_issue.get('blockers', [])[:2])}"
+        )
     if contaminated_signals:
         quality_score -= min(30, len(contaminated_signals) * 5)
         recommendations.append(
@@ -1443,6 +1455,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "repeated_keep_current": repeated_keep_current,
         "variance": variance,
         "measurement_artifact": artifact_check,
+        "task_contract": contract,
         "recommendations": recommendations,
         "seeded_tasks": seeded,
     }
