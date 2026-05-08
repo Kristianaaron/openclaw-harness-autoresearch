@@ -3122,6 +3122,11 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         strengths.append("GEPA-style reviewer policy path is active")
     if decode_mean is not None and decode_mean < 20:
         gaps.append(f"decode still below practical floor: {decode_mean} tok/s")
+        if not deterministic_ready:
+            scores["karpathy_core_loop"] -= 0.4
+            scores["implementation_handoff"] -= 0.8
+            scores["self_improvement"] -= 0.3
+            gaps.append("no deterministic ready task while decode remains below target")
 
     scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
     overall = round(sum(scores.values()) / len(scores), 2)
@@ -3207,9 +3212,24 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
             }
         )
-    elif has_gap("bridge-only") or has_gap("empty synthesis") or has_gap("no deterministic ready task") or has_gap("implementation bridge"):
+    elif (
+        has_gap("bridge-only")
+        or has_gap("empty synthesis")
+        or has_gap("no deterministic ready task")
+        or has_gap("implementation bridge")
+        or has_gap("implementation handoff audit needs repair")
+    ):
         if recent_empty_bridge_rows(root, rows, recent_rows=120) or has_gap("bridge-only"):
             tasks.extend(concrete_handoff_prerequisite_tasks(root, rows, timestamp))
+            if not tasks:
+                tasks.extend(
+                    lane_contract_fallback_tasks(
+                        root,
+                        rows,
+                        timestamp,
+                        reason="Frontier eval found an empty implementation bridge but concrete handoff prerequisites are exhausted",
+                    )
+                )
         elif has_gap("no deterministic ready task") or has_gap("empty synthesis"):
             tasks.extend(
                 lane_contract_fallback_tasks(
@@ -3217,9 +3237,9 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
                     rows,
                     timestamp,
                     reason="Frontier eval found no deterministic ready task",
+                    )
                 )
-            )
-        else:
+        elif has_gap("implementation bridge"):
             tasks.append(
                 {
                     "id": f"frontier-repair-implementation-bridge-{timestamp}",
@@ -3235,6 +3255,25 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
                     "acceptance": "The bridge records at least one ready deterministic task with a valid contract.",
                     "rollback": "No source rollback needed; the bridge only changes the autoresearch queue.",
                     "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                }
+            )
+        if not tasks:
+            tasks.append(
+                {
+                    "id": f"frontier-repair-exhaustion-mtp-report-{timestamp}",
+                    "status": "ready",
+                    "priority": 97,
+                    "lane": "exhaustion-report",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "target": "openclaw-model-proxy.log",
+                    "hypothesis": "Frontier eval found weak implementation handoff after the active speed lanes exhausted, so capture one bounded MTP/acceptance report before another handoff audit.",
+                    "metric": "mean_accept",
+                    "guard_checks": ["no_model_turn_required", "no_opencode_changes", "one_narrow_tool"],
+                    "acceptance": "The report records recent server tok/s and MTP acceptance evidence, or explicitly states that logs lack enough samples.",
+                    "rollback": "No runtime rollback needed; this is a read-only supervisor artifact.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 240",
+                    "lines": 240,
                 }
             )
     elif has_gap("memory/Metal"):
@@ -3264,7 +3303,10 @@ def frontier_eval(args: argparse.Namespace) -> int:
     ensure_lane_contracts(root)
     report = score_frontier_system(root, recent_rows=args.recent_rows)
     seeded_tasks = 0
-    if report["overall"] < args.min_score:
+    needs_repair = report["overall"] < args.min_score or any(
+        "no deterministic ready task" in str(gap) for gap in report.get("gaps", [])
+    )
+    if needs_repair:
         repairs = [
             task
             for task in frontier_repair_tasks(report)

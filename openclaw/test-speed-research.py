@@ -952,6 +952,17 @@ def main() -> int:
             for task in all_done_tasks:
                 task["status"] = "done"
             helper.write_jsonl(root / "tasks.jsonl", all_done_tasks)
+            assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
+            empty_queue_repair = [
+                task
+                for task in helper.read_jsonl(root / "tasks.jsonl")
+                if helper.is_deterministic_research_task(task) and task.get("status", "ready") == "ready"
+            ]
+            assert empty_queue_repair
+            repaired_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            for task in repaired_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", repaired_tasks)
             assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
             handoff_report = json.loads(
                 max(
