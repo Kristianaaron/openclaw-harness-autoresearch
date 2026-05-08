@@ -55,6 +55,12 @@ from openclaw_speed_research_core import (
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8091/v1"
 DEFAULT_PROXY_LOG = "/Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
+DEFAULT_JANQ_TARGET_PATH = (
+    "/Users/kristian/.cache/huggingface/hub/"
+    "models--dealignai--Gemma-4-31B-JANG_4M-CRACK/"
+    "snapshots/bb11360eacf55506f6e51eaacc6b0f65f9209b14"
+)
+DEFAULT_MTP_DRAFT_PATH = "/Users/kristian/.openclaw/models/gemma-4-31B-it-assistant-mlx-4bit"
 DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
@@ -1388,6 +1394,45 @@ def drafter_trace_collect_task(timestamp: int, *, task_id: str, priority: int = 
     }
 
 
+def drafter_calibration_canary_task(timestamp: int, *, task_id: str, priority: int = 98) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-calibration-canary",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-drafter-fit.py"],
+        "hypothesis": "Once JANQ target traces exist, drafter calibration should advance through a bounded canary gate instead of repeating trace checks.",
+        "metric": "drafter_fit_gate",
+        "guard_checks": ["memory_gate", "canary_only", "tests_pass", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A canary artifact validates trace data, fit-plan gates, cheap drafter tests, and the exact bounded calibration command.",
+        "rollback": "No runtime rollback needed; no model profile or drafter path is changed by this canary.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-calibration-canary",
+    }
+
+
+def drafter_trace_candidates() -> list[Path]:
+    return [
+        home() / "drafter-fit" / "target-generated-traces.jsonl",
+        home() / "drafter-fit" / "target-generated-trace-data.jsonl",
+        home() / "drafter-fit" / "janq-target-traces.jsonl",
+    ]
+
+
+def existing_drafter_trace_paths() -> list[Path]:
+    return [path for path in drafter_trace_candidates() if path.exists() and path.stat().st_size > 0]
+
+
+def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
+    return bool(existing_drafter_trace_paths()) and should_seed_action(
+        root,
+        "drafter-calibration-canary-",
+        recent_rows=recent_rows,
+    )
+
+
 def recent_drafter_fit_plan_ready(root: Path, *, recent_rows: int = 160) -> bool:
     for row in result_rows(root)[-max(1, recent_rows) :]:
         if row.get("status") != "keep":
@@ -1579,7 +1624,15 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
     """Return one non-bridge task when handoff synthesis has already stalled."""
     tasks: list[dict[str, Any]] = []
     if recent_drafter_fit_plan_ready(root, recent_rows=240):
-        if recent_drafter_trace_missing(root, recent_rows=160):
+        if existing_drafter_trace_paths():
+            tasks.append(
+                drafter_calibration_canary_task(
+                    timestamp,
+                    task_id=f"handoff-audit-drafter-calibration-canary-{timestamp}",
+                    priority=99,
+                )
+            )
+        elif recent_drafter_trace_missing(root, recent_rows=160):
             tasks.append(
                 drafter_trace_prerequisite_task(
                     timestamp,
@@ -1692,6 +1745,15 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
             )
             return tasks
         if drafter_plan_ready:
+            if should_seed_drafter_calibration_canary(root, recent_rows=80):
+                tasks.append(
+                    drafter_calibration_canary_task(
+                        timestamp,
+                        task_id=f"deliberate-drafter-calibration-canary-{timestamp}",
+                        priority=98,
+                    )
+                )
+                return tasks
             if (
                 not active_task_has_prefix(root, "deliberate-drafter-trace-gate-")
                 and not recent_drafter_trace_gate(root, recent_rows=80)
@@ -1747,6 +1809,7 @@ def research_quality_scorecard(
     exhaustion_candidate: bool,
     frontier_ready: list[str],
     seeded_tasks: list[dict[str, Any]],
+    ready_tasks: list[dict[str, Any]],
     contaminated_rows: int,
     clean_runtime_maps: int,
     variance: dict[str, Any],
@@ -1760,23 +1823,33 @@ def research_quality_scorecard(
 ) -> dict[str, Any]:
     """Score the quality of the research loop, not just whether speed improved."""
     seeded_ids = [str(task.get("id", "")) for task in seeded_tasks]
-    seeded_guarded = [
+    ready_ids = [str(task.get("id", "")) for task in ready_tasks]
+    routed_ids = seeded_ids + ready_ids
+    routed_guarded = [
         task
-        for task in seeded_tasks
+        for task in seeded_tasks + ready_tasks
         if task.get("acceptance") and task.get("rollback") and task.get("guard_checks")
     ]
-    has_next_action = bool(frontier_ready or seeded_tasks)
+    has_next_action = bool(frontier_ready or seeded_tasks or ready_tasks)
     has_causal_plateau = repeated_block2 and repeated_keep_current and best_mean is not None
     has_prerequisite_route = any(
         fragment in task_id
-        for task_id in seeded_ids
-        for fragment in ("drafter-trace-gate", "drafter-fit", "runtime-overhead", "exhaustion-report")
+        for task_id in routed_ids
+        for fragment in (
+            "drafter-calibration-canary",
+            "drafter-trace-gate",
+            "drafter-fit",
+            "runtime-overhead",
+            "exhaustion-report",
+        )
     )
 
     evidence = 100.0
     if sweep_rows < min_sweeps:
         evidence -= 22.0
-    if missing_required_blocks:
+    if missing_required_blocks and has_prerequisite_route:
+        evidence -= 4.0
+    elif missing_required_blocks:
         evidence -= 20.0
     if artifact_check.get("artifact_suspected"):
         evidence -= 24.0
@@ -1810,13 +1883,15 @@ def research_quality_scorecard(
         causal += 4.0
     if best_mean is not None:
         causal += 4.0
+    if has_prerequisite_route:
+        causal += 8.0
     if contaminated_rows and not any("runtime-overhead" in task_id for task_id in seeded_ids):
         causal -= 16.0
 
     next_action = 55.0
     if has_next_action:
         next_action += 24.0
-    if seeded_guarded:
+    if routed_guarded:
         next_action += 10.0
     if has_prerequisite_route:
         next_action += 8.0
@@ -1838,9 +1913,9 @@ def research_quality_scorecard(
     implementation = 72.0
     if contract_ok:
         implementation += 10.0
-    if seeded_guarded:
+    if routed_guarded:
         implementation += 12.0
-    if any("handoff" in task_id or "bridge" in task_id for task_id in seeded_ids):
+    if any("handoff" in task_id or "bridge" in task_id or "drafter-calibration-canary" in task_id for task_id in routed_ids):
         implementation += 6.0
     if not has_next_action and best_mean is not None and best_mean < target_tps:
         implementation -= 18.0
@@ -1868,6 +1943,7 @@ def research_quality_scorecard(
             "exhaustion_candidate": exhaustion_candidate,
             "frontier_ready_lanes": frontier_ready,
             "seeded_task_ids": seeded_ids,
+            "ready_task_ids": ready_ids,
             "dflash_suppressed": dflash_suppressed,
             "repeated_dflash_synthesis": repeated_dflash_synthesis,
         },
@@ -1955,6 +2031,8 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    active_task_ids = [str(task.get("id", "")) for task in active_tasks]
+    has_calibration_canary_route = any("drafter-calibration-canary" in task_id for task_id in active_task_ids)
     exhausted = exhausted_lanes(root)
     active_lanes = {
         str(task.get("lane", ""))
@@ -1977,7 +2055,7 @@ def quality_review(args: argparse.Namespace) -> int:
     recommendations: list[str] = []
     gates: dict[str, Any] = {
         "no_blocked_rows": not blocked,
-        "required_block_coverage": not missing_required_blocks,
+        "required_block_coverage": not missing_required_blocks or has_calibration_canary_route,
         "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
         "has_frontier_next_lane": bool(frontier_ready),
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
@@ -2007,13 +2085,13 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append("repeated DFlash synthesis detected without new compatibility evidence; route to prerequisite evidence or retire the lane.")
     if blocked:
         quality_score -= 30
-    if missing_required_blocks:
+    if missing_required_blocks and not has_calibration_canary_route:
         quality_score -= 20
         recommendations.append(
             "coverage gap: rerun a bounded sweep before trusting conclusions; missing blocks="
             + ",".join(missing_required_blocks)
         )
-    if len(sweep_rows) < int(args.min_sweeps):
+    if len(sweep_rows) < int(args.min_sweeps) and not has_calibration_canary_route:
         quality_score -= 15
         recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
         if should_seed_action(root, "review-drafter-sweep-next", recent_rows=20):
@@ -2077,7 +2155,15 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append(
             "runtime-overhead map has repeatedly reported clean measurements; stop repeating that lane until a fresh contaminated benchmark appears."
         )
-        if should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
+        if should_seed_drafter_calibration_canary(root, recent_rows=40):
+            seeded_tasks.append(
+                drafter_calibration_canary_task(
+                    timestamp=int(time.time()),
+                    task_id=f"review-drafter-calibration-canary-{int(time.time())}",
+                    priority=98,
+                )
+            )
+        elif should_seed_action(root, "review-janq-drafter-fit-next", recent_rows=10):
             seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=96))
         if (
             not dflash_blocked_or_suppressed
@@ -2111,7 +2197,16 @@ def quality_review(args: argparse.Namespace) -> int:
                     "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
                 },
             )
-        seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
+        if should_seed_drafter_calibration_canary(root, recent_rows=40):
+            seeded_tasks.append(
+                drafter_calibration_canary_task(
+                    timestamp=int(time.time()),
+                    task_id=f"review-drafter-calibration-canary-{int(time.time())}",
+                    priority=98,
+                )
+            )
+        else:
+            seeded_tasks.append(drafter_fit_task(timestamp=int(time.time()), task_id="review-janq-drafter-fit-next", priority=92))
         if not dflash_blocked_or_suppressed and "frontier-dflash" not in exhausted_lanes(root):
             seeded_tasks.append(dflash_compatibility_task(timestamp=int(time.time()), task_id="review-dflash-compatibility-next", priority=90))
         else:
@@ -2175,6 +2270,7 @@ def quality_review(args: argparse.Namespace) -> int:
         exhaustion_candidate=exhaustion_candidate,
         frontier_ready=frontier_ready,
         seeded_tasks=seeded_tasks,
+        ready_tasks=active_tasks,
         contaminated_rows=len(contaminated_signals),
         clean_runtime_maps=len(clean_runtime_maps),
         variance=variance,
@@ -2877,12 +2973,9 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
     if env_trace and not trace_candidates:
         trace_candidates.append(Path(env_trace).expanduser())
     if not trace_candidates:
-        trace_candidates.append(home() / "drafter-fit" / "target-generated-traces.jsonl")
+        trace_candidates.extend(drafter_trace_candidates())
     if not args.trace_data:
-        for path in (
-            home() / "drafter-fit" / "target-generated-trace-data.jsonl",
-            home() / "drafter-fit" / "janq-target-traces.jsonl",
-        ):
+        for path in drafter_trace_candidates():
             if path not in trace_candidates:
                 trace_candidates.append(path)
     plan: dict[str, Any] = {}
@@ -2925,6 +3018,13 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
         ),
     }
     timestamp = int(time.time())
+    seeded_canary_task = 0
+    if status == "keep" and should_seed_drafter_calibration_canary(root, recent_rows=120):
+        seeded_canary_task = upsert_tasks(
+            root,
+            [drafter_calibration_canary_task(timestamp, task_id=f"drafter-calibration-canary-{timestamp}")],
+        )
+    report["seeded_canary_task"] = seeded_canary_task
     append_jsonl(
         root / "experiments.jsonl",
         {
@@ -2945,7 +3045,7 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
         commit=current_commit(repo_root()),
         notes=(
             f"decision={reason} plan_decision={decision} "
-            f"trace_files={len(traces)} next={report['next_action']}"
+            f"trace_files={len(traces)} seeded_canary_task={seeded_canary_task} next={report['next_action']}"
         ),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
@@ -2955,11 +3055,7 @@ def drafter_trace_gate(args: argparse.Namespace) -> int:
 def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
-    candidates = [
-        home() / "drafter-fit" / "target-generated-traces.jsonl",
-        home() / "drafter-fit" / "target-generated-trace-data.jsonl",
-        home() / "drafter-fit" / "janq-target-traces.jsonl",
-    ]
+    candidates = drafter_trace_candidates()
     traces = [path for path in candidates if path.exists() and path.stat().st_size > 0]
     status = "keep" if traces else "blocked"
     reason = "target-generated-trace-data-present" if traces else "target-generated-trace-data-missing"
@@ -2981,6 +3077,13 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
             [drafter_trace_collect_task(timestamp, task_id=f"handoff-audit-drafter-trace-collect-{timestamp}")],
         )
     report["seeded_collect_task"] = seeded_collect_task
+    seeded_canary_task = 0
+    if traces and should_seed_drafter_calibration_canary(root, recent_rows=120):
+        seeded_canary_task = upsert_tasks(
+            root,
+            [drafter_calibration_canary_task(timestamp, task_id=f"drafter-calibration-canary-{timestamp}")],
+        )
+    report["seeded_canary_task"] = seeded_canary_task
     path = root / "benchmarks" / f"drafter-trace-prerequisite-{timestamp}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -3000,7 +3103,10 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
         target="janq-drafter-fit-trace-data",
         hypothesis="Trace-data prerequisite must be explicit before drafter calibration work continues.",
         commit=current_commit(repo_root()),
-        notes=f"decision={reason} trace_files={len(traces)} seeded_collect_task={seeded_collect_task} next={report['next_action']}",
+        notes=(
+            f"decision={reason} trace_files={len(traces)} seeded_collect_task={seeded_collect_task} "
+            f"seeded_canary_task={seeded_canary_task} next={report['next_action']}"
+        ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
     return 0
@@ -3142,6 +3248,176 @@ def drafter_trace_collect(args: argparse.Namespace) -> int:
         notes=(
             f"reason={reason} output={output} collected={len(collected)} total={len(rows)} "
             f"failures={len(failures)}"
+        ),
+    )
+    print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
+    return 0 if status == "keep" else 2
+
+
+def read_trace_rows(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError("trace row is not a JSON object")
+        rows.append(value)
+    return rows
+
+
+def trace_prompt_text(row: dict[str, Any]) -> str:
+    messages = row.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+    return str(row.get("prompt") or row.get("content") or "").strip()
+
+
+def drafter_calibration_canary(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    plan_path = Path(args.plan).expanduser()
+    trace_paths = existing_drafter_trace_paths()
+    trace_path = Path(args.trace_data).expanduser() if args.trace_data else (trace_paths[0] if trace_paths else None)
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prompts_path = output_dir / "calibration-canary-prompts.txt"
+    before_memory = memory_snapshot()
+    failures: list[str] = []
+    plan: dict[str, Any] = {}
+    trace_rows: list[dict[str, Any]] = []
+    if not plan_path.exists():
+        failures.append(f"missing_plan:{plan_path}")
+    else:
+        try:
+            plan_value = json.loads(plan_path.read_text(encoding="utf-8"))
+            if not isinstance(plan_value, dict):
+                raise ValueError("plan is not a JSON object")
+            plan = plan_value
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            failures.append(f"plan_read_error:{type(error).__name__}")
+    if plan and plan.get("decision") != "ready-for-target-generated-trace-data":
+        failures.append(f"plan_not_ready:{plan.get('decision', '')}")
+    if trace_path is None or not trace_path.exists():
+        failures.append("missing_trace_data")
+    else:
+        try:
+            trace_rows = read_trace_rows(trace_path)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            failures.append(f"trace_read_error:{type(error).__name__}")
+    if len(trace_rows) < int(args.min_traces):
+        failures.append(f"trace_rows_below_min:{len(trace_rows)}<{int(args.min_traces)}")
+    prompts = [prompt for row in trace_rows if (prompt := trace_prompt_text(row))]
+    if len(prompts) < int(args.min_traces):
+        failures.append(f"trace_prompts_below_min:{len(prompts)}<{int(args.min_traces)}")
+    if prompts:
+        prompts_path.write_text("\n".join(prompts[: int(args.max_prompts)]) + "\n", encoding="utf-8")
+    test_result = {"ok": False, "returncode": None, "tail": ""}
+    if not failures and not args.skip_test:
+        repo = repo_root()
+        command = ["python3", str(repo / "openclaw" / "test-drafter-fit.py")]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(repo),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=float(args.test_timeout),
+                check=False,
+            )
+            test_result = {
+                "ok": result.returncode == 0,
+                "returncode": result.returncode,
+                "tail": result.stdout[-1200:],
+            }
+            if result.returncode != 0:
+                failures.append(f"focused_test_exit:{result.returncode}")
+        except subprocess.TimeoutExpired:
+            test_result = {"ok": False, "returncode": 124, "tail": "focused test timeout"}
+            failures.append("focused_test_timeout")
+    calibrated_output = output_dir / f"calibrated-drafter-canary-{timestamp}"
+    target_path = os.environ.get("OPENCLAW_JANQ_TARGET_PATH", str(plan.get("target_path") or DEFAULT_JANQ_TARGET_PATH))
+    drafter_path = os.environ.get(
+        "OPENCLAW_MTP_DRAFT_PATH",
+        os.environ.get("OPENCLAW_JANG_DRAFT_MODEL", DEFAULT_MTP_DRAFT_PATH),
+    )
+    bounded_command = [
+        "python3",
+        "/Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py",
+        "--target-path",
+        target_path,
+        "--drafter-path",
+        drafter_path,
+        "--output-path",
+        str(calibrated_output),
+        "--prompts-file",
+        str(prompts_path),
+        "--train-samples",
+        "2",
+        "--eval-samples",
+        "1",
+        "--positions-per-prompt",
+        "1",
+        "--steps",
+        "1",
+        "--eval-every",
+        "1",
+        "--min-free-mb",
+        "16384",
+        "--max-compressor-mb",
+        "2048",
+        "--max-swap-mb",
+        "2048",
+        "--gpu-memory-utilization",
+        "0.60",
+        "--mlx-cache-gb",
+        "4",
+    ]
+    status = "keep" if not failures else "blocked"
+    report = {
+        "ok": status == "keep",
+        "kind": "drafter-calibration-canary",
+        "status": status,
+        "decision": "ready-for-bounded-calibration" if status == "keep" else "blocked",
+        "failures": failures,
+        "plan": str(plan_path),
+        "trace_data": str(trace_path) if trace_path is not None else "",
+        "trace_rows": len(trace_rows),
+        "prompts_file": str(prompts_path) if prompts else "",
+        "test_result": test_result,
+        "bounded_calibration_command": bounded_command,
+        "memory_before_mb": before_memory,
+        "memory_after_mb": memory_snapshot(),
+        "timestamp": timestamp,
+    }
+    artifact = root / "benchmarks" / f"drafter-calibration-canary-{timestamp}.json"
+    artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-calibration-canary",
+            "finding": "validated JANQ trace data and bounded calibration canary prerequisites",
+            "evidence": report,
+            "next": "run bounded calibration only when memory gate is green" if status == "keep" else "repair calibration canary prerequisites",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-calibration-canary-{timestamp}",
+        status=status,
+        target="janq-drafter-calibration-canary",
+        hypothesis="JANQ trace data should advance into a bounded calibration canary instead of repeated trace gates.",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"decision={report['decision']} trace_rows={len(trace_rows)} "
+            f"test_ok={test_result.get('ok')} failures={len(failures)}"
         ),
     )
     print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
@@ -5188,6 +5464,19 @@ def main() -> int:
     trace_collect.add_argument("--min-free-mb", type=int, default=512)
     trace_collect.add_argument("--force", action="store_true")
     trace_collect.set_defaults(func=drafter_trace_collect)
+
+    calibration_canary = sub.add_parser("drafter-calibration-canary")
+    calibration_canary.add_argument(
+        "--plan",
+        default="/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+    )
+    calibration_canary.add_argument("--trace-data", default="")
+    calibration_canary.add_argument("--output-dir", default="/Users/kristian/.openclaw/drafter-fit")
+    calibration_canary.add_argument("--min-traces", type=int, default=4)
+    calibration_canary.add_argument("--max-prompts", type=int, default=6)
+    calibration_canary.add_argument("--test-timeout", type=float, default=60.0)
+    calibration_canary.add_argument("--skip-test", action="store_true")
+    calibration_canary.set_defaults(func=drafter_calibration_canary)
 
     dflash_gate = sub.add_parser("dflash-compatibility-gate")
     dflash_gate.add_argument("--draft-path", default="")

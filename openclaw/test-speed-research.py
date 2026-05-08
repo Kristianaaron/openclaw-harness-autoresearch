@@ -396,6 +396,39 @@ def main() -> int:
                         )
                         assert prereq_report["status"] == "keep"
                         assert prereq_report["trace_data"]
+                        task_text = (root / "tasks.jsonl").read_text(encoding="utf-8")
+                        assert "drafter-calibration-canary-" in task_text
+                        assert "drafter-calibration-canary" in task_text
+                        plan_path = trace_home / "drafter-fit" / "gemma4-janq-dflash-fit-plan.json"
+                        plan_path.write_text(
+                            json.dumps(
+                                {
+                                    "decision": "ready-for-target-generated-trace-data",
+                                    "target_path": "/tmp/janq-target",
+                                }
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                        assert helper.drafter_calibration_canary(
+                            Namespace(
+                                plan=str(plan_path),
+                                trace_data=str(trace_output),
+                                output_dir=str(trace_home / "drafter-fit"),
+                                min_traces=4,
+                                max_prompts=4,
+                                test_timeout=1.0,
+                                skip_test=True,
+                            )
+                        ) == 0
+                        canary_report = json.loads(
+                            sorted((root / "benchmarks").glob("drafter-calibration-canary-*.json"))[-1].read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        assert canary_report["decision"] == "ready-for-bounded-calibration"
+                        assert canary_report["trace_rows"] == 4
+                        assert Path(canary_report["prompts_file"]).exists()
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
@@ -766,7 +799,9 @@ def main() -> int:
             )
             assert handoff_after_empty["seeded_bridge"] is False
             assert handoff_after_empty["seeded_prerequisite"] is True
-            assert "handoff-audit-drafter-trace-gate-" in "\n".join(handoff_after_empty["ready_deterministic_tasks"])
+            assert "handoff-audit-drafter-calibration-canary-" in "\n".join(
+                handoff_after_empty["ready_deterministic_tasks"]
+            )
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")

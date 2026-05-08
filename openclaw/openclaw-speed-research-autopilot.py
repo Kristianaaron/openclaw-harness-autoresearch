@@ -616,6 +616,15 @@ def is_supervisor_drafter_trace_collect_task(task: dict[str, object] | None) -> 
     )
 
 
+def is_supervisor_drafter_calibration_canary_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-calibration-canary"
+        or "openclaw-speed-research drafter-calibration-canary" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_dflash_compatibility_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -681,6 +690,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_drafter_trace_gate_task,
             is_supervisor_drafter_trace_prerequisite_task,
             is_supervisor_drafter_trace_collect_task,
+            is_supervisor_drafter_calibration_canary_task,
             is_supervisor_dflash_compatibility_task,
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
@@ -2518,6 +2528,52 @@ def run_supervisor_drafter_trace_collect_task(
     return 0, "" if status == "keep" else reason
 
 
+def run_supervisor_drafter_calibration_canary_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "drafter-calibration-canary"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter calibration canary "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER CALIBRATION CANARY TIMEOUT\n")
+            return 124, "supervisor drafter calibration canary timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
+    reason = str(parsed.get("decision") or parsed.get("reason") or f"supervisor drafter calibration canary exit {result.returncode}")
+    if status != "keep":
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-calibration-canary-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-calibration-canary")),
+            hypothesis=str(task.get("hypothesis", "validate bounded JANQ drafter calibration canary")),
+            commit=current_commit(),
+            notes=clean_tsv(reason),
+        )
+    complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_dflash_compatibility_task(
     args: argparse.Namespace,
     cycle: int,
@@ -3466,6 +3522,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_trace_prerequisite_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_trace_collect_task(selected_task):
             code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_calibration_canary_task(selected_task):
+            code, issue = run_supervisor_drafter_calibration_canary_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
             code, issue = run_supervisor_dflash_compatibility_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):

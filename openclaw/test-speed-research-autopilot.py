@@ -1256,6 +1256,32 @@ def main() -> int:
             )
         assert code == 0
         assert issue == ""
+        canary_helper = Path(tmp) / "calibration-canary-helper.py"
+        canary_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'status': 'keep', 'decision': 'ready-for-bounded-calibration'}))\n",
+            encoding="utf-8",
+        )
+        canary_helper.chmod(0o700)
+        canary_task = {
+            "id": "calibration-canary",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-canary",
+            "next_action": "openclaw-speed-research drafter-calibration-canary",
+        }
+        assert helper.is_supervisor_drafter_calibration_canary_task(canary_task)
+        assert helper.task_runs_without_model(canary_task)
+        code, issue = helper.run_supervisor_drafter_calibration_canary_task(
+            Namespace(research_helper_bin=str(canary_helper)),
+            14,
+            "nightly",
+            canary_task,
+            Path(tmp) / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
         bench_helper = Path(tmp) / "benchmark-helper.py"
         bench_helper.write_text(
             "#!/usr/bin/env python3\n"
