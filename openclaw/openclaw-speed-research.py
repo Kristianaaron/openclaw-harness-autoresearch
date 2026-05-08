@@ -169,6 +169,12 @@ DENIED_PATCH_FRAGMENTS = (
     ".pem",
     ".key",
 )
+SECRET_PATCH_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{12,}"),
+    re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+    re.compile(r"(?i)hf_[A-Za-z0-9]{20,}"),
+    re.compile(r"(?i)github_pat_[A-Za-z0-9_]{20,}"),
+)
 
 
 def home() -> Path:
@@ -3509,9 +3515,25 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "bridge-only",
         "duplicate calibration memory-stage",
     )
+    has_blocking_gap = any(term in gap for term in blocking_gap_terms for gap in gaps)
+    frontier_certified = (
+        overall >= 9.5
+        and not has_blocking_gap
+        and scores["crash_memory_safety"] >= 9.5
+        and scores["research_quality"] >= 9.4
+        and scores["implementation_handoff"] >= 9.5
+        and latest_quality_score is not None
+        and latest_quality_score >= 95.0
+        and latest_scorecard_overall is not None
+        and latest_scorecard_overall >= 95.0
+        and latest_quality_verdict == "healthy"
+        and contract.get("ok")
+    )
     readiness = (
-        "frontier-candidate"
-        if overall >= 9.0 and not any(term in gap for term in blocking_gap_terms for gap in gaps)
+        "frontier"
+        if frontier_certified
+        else "frontier-candidate"
+        if overall >= 9.0 and not has_blocking_gap
         else "needs-targeted-work"
     )
     return {
@@ -3520,6 +3542,18 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "timestamp": int(time.time()),
         "overall": overall,
         "readiness": readiness,
+        "frontier_certified": frontier_certified,
+        "frontier_requirements": {
+            "overall_at_least_9_5": overall >= 9.5,
+            "no_blocking_gaps": not has_blocking_gap,
+            "safety_at_least_9_5": scores["crash_memory_safety"] >= 9.5,
+            "research_quality_at_least_9_4": scores["research_quality"] >= 9.4,
+            "implementation_handoff_at_least_9_5": scores["implementation_handoff"] >= 9.5,
+            "latest_quality_score_at_least_95": latest_quality_score is not None and latest_quality_score >= 95.0,
+            "latest_quality_scorecard_at_least_95": latest_scorecard_overall is not None and latest_scorecard_overall >= 95.0,
+            "latest_quality_healthy": latest_quality_verdict == "healthy",
+            "task_contract_clean": bool(contract.get("ok")),
+        },
         "scores": scores,
         "decode_mean_tps": decode_mean,
         "active_window_rows": len(active_recent),
@@ -5358,6 +5392,15 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research patch-execute --patch-file /tmp/openclaw-audit.patch",
     }
     patch_template_contract = task_contract_issues(root, patch_template)
+    secret_fixture = (
+        "diff --git a/openclaw/sample.py b/openclaw/sample.py\n"
+        "--- a/openclaw/sample.py\n"
+        "+++ b/openclaw/sample.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+DUMMY_PASSWORD = 'placeholder-not-real-value-1234567890'\n"
+    )
+    secret_fixture_classification = classify_patch(secret_fixture, source_files=["openclaw/sample.py"])
     gates = {
         "deterministic_ready_task": bool(deterministic_ready),
         "implementation_candidates_present": len(candidates) >= 3,
@@ -5365,6 +5408,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "ready_contracts_clean": not contract_blockers,
         "patch_executor_contract_ready": not patch_template_contract.get("blockers"),
         "safe_patch_tests_allowlisted": all(command in set(DEFAULT_PATCH_TESTS) for command in DEFAULT_PATCH_TESTS),
+        "patch_executor_blocks_secret_content": not secret_fixture_classification["allowed"],
     }
     gaps = [name for name, ok in gates.items() if not ok]
     score = max(0, min(100, 100 - len(gaps) * 18 - min(30, len(contract_blockers) * 10)))
@@ -5385,6 +5429,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "scoped_candidates": [str(task.get("id", "")) for task in scoped_candidates],
         "contract_blockers": contract_blockers,
         "patch_template_contract": patch_template_contract,
+        "secret_fixture_classification": secret_fixture_classification,
         "next": "continue_autopilot_loop" if ok else "run implementation bridge or repair task contracts before research",
     }
     path = root / "benchmarks" / f"implementation-handoff-audit-{timestamp}.json"
@@ -5996,6 +6041,37 @@ def patch_files(patch_text: str) -> list[str]:
     return sorted(files)
 
 
+def patch_secret_findings(patch_text: str) -> list[str]:
+    findings: list[str] = []
+    for line in patch_text.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        for pattern in SECRET_PATCH_PATTERNS:
+            match = pattern.search(added)
+            if match:
+                findings.append(match.group(1) if match.groups() else "secret-pattern")
+                break
+    return findings
+
+
+def git_dirty_files(repo: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ["<git-status-timeout>"]
+    if result.returncode != 0:
+        return ["<git-status-unavailable>"]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def classify_patch(
     patch_text: str,
     *,
@@ -6006,6 +6082,7 @@ def classify_patch(
     additions = 0
     deletions = 0
     reasons: list[str] = []
+    secret_findings = patch_secret_findings(patch_text)
     source_allowlist = {normalize_patch_path(path) for path in source_files or [] if path}
     for line in patch_text.splitlines():
         if line.startswith("+") and not line.startswith("+++"):
@@ -6014,6 +6091,8 @@ def classify_patch(
             deletions += 1
     if not files:
         reasons.append("patch has no file changes")
+    if secret_findings:
+        reasons.append("patch adds possible secret material")
     for path in files:
         if path.startswith("/") or ".." in Path(path).parts:
             reasons.append(f"unsafe path: {path}")
@@ -6051,6 +6130,7 @@ def classify_patch(
         "auto_promote": auto_promote and not destructive,
         "allowed": not destructive,
         "reasons": reasons,
+        "secret_findings": secret_findings[:6],
     }
 
 
@@ -6200,34 +6280,42 @@ def patch_execute(args: argparse.Namespace) -> int:
                     status = "keep"
                     return_code = 0
                 else:
-                    main_check = subprocess.run(
-                        ["git", "-C", str(repo), "apply", "--check", str(patch_path)],
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=30,
-                        check=False,
-                    )
-                    artifact["main_apply_check"] = {"ok": main_check.returncode == 0, "stderr": main_check.stderr[-2000:]}
-                    if main_check.returncode != 0:
-                        reason = "patch no longer applies to main repo"
+                    dirty_files = git_dirty_files(repo)
+                    artifact["main_repo_dirty_files"] = dirty_files[:20]
+                    if dirty_files:
+                        reason = "main repo has uncommitted changes; refusing autonomous promotion"
                         artifact["reason"] = reason
+                        status = "blocked"
+                        return_code = 2
                     else:
-                        main_apply = subprocess.run(
-                            ["git", "-C", str(repo), "apply", str(patch_path)],
+                        main_check = subprocess.run(
+                            ["git", "-C", str(repo), "apply", "--check", str(patch_path)],
                             text=True,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             timeout=30,
                             check=False,
                         )
-                        artifact["main_apply"] = {"ok": main_apply.returncode == 0, "stderr": main_apply.stderr[-2000:]}
-                        artifact["promoted"] = main_apply.returncode == 0
-                        status = "keep" if artifact["promoted"] else "blocked"
-                        reason = "" if artifact["promoted"] else "main repo apply failed"
-                        if reason:
+                        artifact["main_apply_check"] = {"ok": main_check.returncode == 0, "stderr": main_check.stderr[-2000:]}
+                        if main_check.returncode != 0:
+                            reason = "patch no longer applies to main repo"
                             artifact["reason"] = reason
-                        return_code = 0 if artifact["promoted"] else 2
+                        else:
+                            main_apply = subprocess.run(
+                                ["git", "-C", str(repo), "apply", str(patch_path)],
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=30,
+                                check=False,
+                            )
+                            artifact["main_apply"] = {"ok": main_apply.returncode == 0, "stderr": main_apply.stderr[-2000:]}
+                            artifact["promoted"] = main_apply.returncode == 0
+                            status = "keep" if artifact["promoted"] else "blocked"
+                            reason = "" if artifact["promoted"] else "main repo apply failed"
+                            if reason:
+                                artifact["reason"] = reason
+                            return_code = 0 if artifact["promoted"] else 2
     except subprocess.CalledProcessError as error:
         reason = f"git canary setup failed: {error.stderr[-500:] if error.stderr else error}"
         artifact["reason"] = reason

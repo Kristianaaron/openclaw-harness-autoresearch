@@ -1014,6 +1014,8 @@ def main() -> int:
             assert eval_report["latest_quality_scorecard_overall"] <= 74
             assert eval_report["latest_quality_verdict"] == "needs-repair"
             assert eval_report["readiness"] == "needs-targeted-work"
+            assert eval_report["frontier_certified"] is False
+            assert eval_report["frontier_requirements"]["latest_quality_healthy"] is False
             assert any("latest quality review verdict is needs-repair" in gap for gap in eval_report["gaps"])
             assert "deliberate-drafter-trace-gate-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
@@ -1089,6 +1091,17 @@ def main() -> int:
             patch_file.write_text(diff.stdout, encoding="utf-8")
             subprocess.run(["git", "checkout", "--", "openclaw/sample.py"], cwd=patch_repo, check=True)
             assert helper.classify_patch(diff.stdout, source_files=["openclaw/sample.py"])["impact"] == "safe"
+            secret_diff = (
+                "diff --git a/openclaw/sample.py b/openclaw/sample.py\n"
+                "--- a/openclaw/sample.py\n"
+                "+++ b/openclaw/sample.py\n"
+                "@@ -1 +1 @@\n"
+                "-VALUE = 1\n"
+                "+DUMMY_PASSWORD = 'placeholder-not-real-value-1234567890'\n"
+            )
+            secret_classification = helper.classify_patch(secret_diff, source_files=["openclaw/sample.py"])
+            assert secret_classification["allowed"] is False
+            assert "patch adds possible secret material" in secret_classification["reasons"]
             assert helper.patch_execute(
                 Namespace(
                     patch_file=str(patch_file),
@@ -1105,6 +1118,28 @@ def main() -> int:
                 )
             ) == 0
             assert "patch-executor" in (root / "results.tsv").read_text(encoding="utf-8")
+            (patch_repo / "openclaw" / "dirty.py").write_text("DIRTY = True\n", encoding="utf-8")
+            assert helper.git_dirty_files(patch_repo)
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(patch_file),
+                    task_id="dirty-main-patch",
+                    hypothesis="dirty main patch",
+                    source_files="openclaw/sample.py",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=False,
+                    keep_canary=False,
+                    allow_architectural=False,
+                    architectural_approval_file="",
+                )
+            ) == 2
+            dirty_artifact = sorted((root / "experiments").glob("patch-executor-*-dirty-main-patch.json"))[-1]
+            dirty_data = json.loads(dirty_artifact.read_text(encoding="utf-8"))
+            assert dirty_data["reason"] == "main repo has uncommitted changes; refusing autonomous promotion"
+            assert (patch_repo / "openclaw" / "sample.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+            (patch_repo / "openclaw" / "dirty.py").unlink()
             (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'new'\n", encoding="utf-8")
             arch_patch_file = root / "patches" / "architectural.patch"
             arch_diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)
@@ -1171,6 +1206,23 @@ def main() -> int:
                     task_id="bad-patch",
                     hypothesis="bad patch",
                     source_files="",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=True,
+                    keep_canary=False,
+                    allow_architectural=False,
+                    architectural_approval_file="",
+                )
+            ) == 2
+            secret_patch_file = root / "patches" / "secret.patch"
+            secret_patch_file.write_text(secret_diff, encoding="utf-8")
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(secret_patch_file),
+                    task_id="secret-patch",
+                    hypothesis="secret patch",
+                    source_files="openclaw/sample.py",
                     tests="python3 openclaw/test-speed-research.py",
                     repo=str(patch_repo),
                     test_timeout=30.0,
