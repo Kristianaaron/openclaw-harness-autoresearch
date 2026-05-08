@@ -102,23 +102,28 @@ def memory_snapshot() -> dict[str, int]:
 def memory_block_reason(args: argparse.Namespace, *, phase: str) -> str:
     snap = memory_snapshot()
     pressure_free = int(snap.get("pressure_free_percent", -1))
-    if snap["free_mb"] and snap["free_mb"] < args.min_free_mb:
-        if pressure_free < 0 or pressure_free < args.min_pressure_free_percent:
+    min_pressure_free_percent = int(getattr(args, "min_pressure_free_percent", 20))
+    min_free_mb = int(getattr(args, "min_free_mb", 12288))
+    max_compressor_mb = int(getattr(args, "max_compressor_mb", 4096))
+    max_swap_mb = int(getattr(args, "max_swap_mb", 1024))
+    if snap["free_mb"] and snap["free_mb"] < min_free_mb:
+        if pressure_free < 0 or pressure_free < min_pressure_free_percent:
             return (
-                f"{phase}: free={snap['free_mb']}MB<{args.min_free_mb}MB "
-                f"pressureFree={pressure_free if pressure_free >= 0 else '?'}%<{args.min_pressure_free_percent}%"
+                f"{phase}: free={snap['free_mb']}MB<{min_free_mb}MB "
+                f"pressureFree={pressure_free if pressure_free >= 0 else '?'}%<{min_pressure_free_percent}%"
             )
-    if snap["compressor_mb"] >= args.max_compressor_mb:
-        return f"{phase}: compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB"
-    if snap["swap_used_mb"] >= args.max_swap_mb:
-        return f"{phase}: swap={snap['swap_used_mb']}MB>={args.max_swap_mb}MB"
+    if snap["compressor_mb"] >= max_compressor_mb:
+        return f"{phase}: compressor={snap['compressor_mb']}MB>={max_compressor_mb}MB"
+    if snap["swap_used_mb"] >= max_swap_mb:
+        return f"{phase}: swap={snap['swap_used_mb']}MB>={max_swap_mb}MB"
     return ""
 
 
 def require_memory_safe(args: argparse.Namespace, *, phase: str) -> None:
     try:
-        mx.clear_cache()
-        if hasattr(mx, "metal"):
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        elif hasattr(mx, "metal"):
             mx.metal.clear_cache()
     except Exception:
         pass
