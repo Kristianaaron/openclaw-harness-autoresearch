@@ -131,8 +131,14 @@ def check_prompt_and_routing_guards(helper) -> None:
     assert helper.is_supervisor_runtime_overhead_map_task(
         {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map"}
     )
+    assert helper.is_supervisor_calibration_memory_report_task(
+        {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research calibration-memory-report"}
+    )
     assert helper.task_runs_without_model(
         {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"}
+    )
+    assert helper.task_runs_without_model(
+        {"task_type": "supervisor", "supervisor_action": "calibration-memory-report"}
     )
     assert helper.task_runs_without_model(
         {"task_type": "supervisor", "supervisor_action": "drafter-trace-gate"}

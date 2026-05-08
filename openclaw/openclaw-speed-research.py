@@ -1864,6 +1864,39 @@ def record_calibration_fallback_plateau(root: Path, plateau: dict[str, Any], *, 
     )
 
 
+def calibration_memory_report_task(timestamp: int, *, task_id: str, priority: int = 96) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "calibration-memory-report",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "hypothesis": "Calibration is blocked after loading the JANQ target and drafter, so produce one no-model root-cause report before more overnight cycles.",
+        "metric": "calibration_memory_root_cause",
+        "guard_checks": ["no_model_load", "one_narrow_tool", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A report records the after-load memory blocker, relevant calibration knobs, and the next implementation gate.",
+        "rollback": "No runtime rollback needed; this is a read-only supervisor report.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research calibration-memory-report",
+    }
+
+
+def calibration_plateau_tasks(root: Path, plateau: dict[str, Any], timestamp: int, *, task_id: str) -> list[dict[str, Any]]:
+    record_calibration_fallback_plateau(root, plateau, task_id=task_id)
+    if recent_result_has_prefix(root, "calibration-memory-report-", recent_rows=240) or any_task_has_prefix(
+        root, "calibration-memory-report-"
+    ):
+        return []
+    return [
+        calibration_memory_report_task(
+            timestamp,
+            task_id=f"calibration-memory-report-{timestamp}",
+            priority=98,
+        )
+    ]
+
+
 def lane_contract_fallback_tasks(
     root: Path,
     rows: list[dict[str, str]] | None,
@@ -1880,8 +1913,10 @@ def lane_contract_fallback_tasks(
     if calibration_blocker and recent_lane_contract_decode_fallback_count(root, recent_rows=40) >= 3:
         plateau = recent_calibration_fallback_plateau(root, recent_rows=80)
         if plateau and plateau["no_model_escalations_done"]:
-            record_calibration_fallback_plateau(root, plateau, task_id="lane-contract-fallback-plateau")
-            return []
+            return filter_seedable_tasks(
+                root,
+                calibration_plateau_tasks(root, plateau, timestamp, task_id="lane-contract-fallback-plateau"),
+            )
         if not any_task_has_prefix(root, "lane-contract-runtime-overhead-map-after-fallback-"):
             return filter_seedable_tasks(
                 root,
@@ -2062,8 +2097,10 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
         elif calibration_blocker:
             plateau = recent_calibration_fallback_plateau(root, rows, recent_rows=100)
             if plateau:
-                record_calibration_fallback_plateau(root, plateau, task_id="handoff-audit-calibration-plateau")
-                return []
+                return filter_seedable_tasks(
+                    root,
+                    calibration_plateau_tasks(root, plateau, timestamp, task_id="handoff-audit-calibration-plateau"),
+                )
             tasks.append(
                 {
                     "id": f"handoff-audit-decode-remeasure-after-calibration-block-{timestamp}",
@@ -2938,6 +2975,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     plateau_pivot_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("plateau-pivot-")
     ]
+    calibration_memory_report_rows = [
+        row for row in active_recent if row.get("run_id", "").startswith("calibration-memory-report-")
+    ]
+    historical_calibration_memory_report_rows = [
+        row for row in recent if row.get("run_id", "").startswith("calibration-memory-report-")
+    ]
     quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
     historical_quality_rows = [row for row in recent if row.get("run_id", "").startswith("quality-review-")]
     quality_source_rows = quality_rows or historical_quality_rows
@@ -2962,6 +3005,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         (latest_scorecard_overall is not None and latest_scorecard_overall >= 85.0)
         or (latest_quality_score is not None and latest_quality_score >= 85.0)
     ) and latest_quality_interpretation == "high_quality_exhaustion_or_prerequisite_route"
+    terminal_calibration_plateau = bool(calibration_memory_report_rows or historical_calibration_memory_report_rows)
     decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
     contract = task_contract_report(root)
     artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
@@ -3018,7 +3062,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         scores["karpathy_core_loop"] += 0.4
         scores["research_quality"] += 0.3
         strengths.append("deliberate next action is queued instead of generic research churn")
-    if not deterministic_ready:
+    if not deterministic_ready and terminal_calibration_plateau:
+        scores["karpathy_core_loop"] += 0.1
+        scores["research_quality"] += 0.2
+        scores["self_improvement"] += 0.1
+        strengths.append("calibration plateau ended in a deterministic no-model root-cause report")
+    elif not deterministic_ready:
         scores["karpathy_core_loop"] -= 1.0
         gaps.append("no deterministic ready task is queued")
     if bridge_only_ready and bridge_zero:
@@ -3101,6 +3150,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_environment_snapshots": len(environment_snapshot_rows),
         "recent_evaluator_integrity_rows": len(evaluator_integrity_rows),
         "recent_plateau_pivot_rows": len(plateau_pivot_rows),
+        "recent_calibration_memory_reports": len(calibration_memory_report_rows),
         "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
         "historical_debt": {
@@ -3108,6 +3158,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             "empty_synthesis_rows": len(historical_empty_synthesis),
             "bridge_zero_rows": len(historical_bridge_zero),
             "memory_blocks": len(historical_memory_blocks),
+            "calibration_memory_reports": len(historical_calibration_memory_report_rows),
         },
         "latest_quality_score": latest_quality_score,
         "latest_quality_scorecard_overall": latest_scorecard_overall,
@@ -3119,6 +3170,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "next": (
             "run the queued deliberate supervisor task, then rerun frontier-eval"
             if deliberate_ready
+            else "calibration plateau is summarized; wait for a canary patch or new prerequisites"
+            if terminal_calibration_plateau and not deterministic_ready
             else "seed one deliberate task with synthesize --kind frontier or add a canary patch task"
         ),
     }
@@ -3441,6 +3494,77 @@ def runtime_overhead_map(args: argparse.Namespace) -> int:
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
     return 0
+
+
+def calibration_memory_report(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    repo = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))
+    source = repo / "openclaw" / "openclaw-mtp-drafter-calibrate.py"
+    rows = result_rows(root)
+    blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    plateau = recent_calibration_fallback_plateau(root, rows, recent_rows=160)
+    try:
+        lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        print(json.dumps({"ok": False, "reason": f"source unavailable: {error}"}, indent=2))
+        return 2
+    keywords = ("memory", "load", "target", "drafter", "cache", "gpu", "free", "compressor")
+    hits: list[dict[str, Any]] = []
+    for index, line in enumerate(lines, start=1):
+        lower = line.lower()
+        matched = [keyword for keyword in keywords if keyword in lower]
+        if matched:
+            hits.append({"line": index, "keywords": matched[:4], "text": line.strip()[:180]})
+    report = {
+        "ok": True,
+        "kind": "calibration-memory-report",
+        "timestamp": int(time.time()),
+        "source": str(source),
+        "blocker": blocker,
+        "plateau": plateau,
+        "source_hits": hits[:80],
+        "hit_count": len(hits),
+        "diagnosis": (
+            "bounded calibration is blocked after loading both the JANQ target and drafter; "
+            "the next useful work is a canary-only source change that reduces calibration load overlap "
+            "or lowers the calibration memory envelope before retrying training"
+            if blocker == "calibration-memory-after-load"
+            else "no current after-load memory blocker was detected in recent calibration rows"
+        ),
+        "next": (
+            "implementation-gate: propose a canary-only calibration memory patch with tests, or wait for more free memory"
+            if blocker
+            else "continue normal drafter-alignment tasks"
+        ),
+    }
+    path = root / "benchmarks" / f"calibration-memory-report-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "calibration-memory-report",
+            "finding": "supervisor mapped the JANQ drafter calibration memory blocker without loading a model",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"calibration-memory-report-{report['timestamp']}",
+        status="keep" if blocker else "blocked",
+        target="calibration-memory-report",
+        hypothesis="Calibration plateau should become a no-model root-cause report instead of repeated decode remeasurements.",
+        commit=current_commit(repo),
+        notes=(
+            f"blocker={blocker or 'none'} hit_count={len(hits)} "
+            f"plateau={str(bool(plateau)).lower()} "
+            f"best_clean_decode_tps={(plateau or {}).get('best_clean_decode_tps', '')}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2))
+    return 0 if blocker else 2
 
 
 def drafter_trace_gate(args: argparse.Namespace) -> int:
@@ -5953,6 +6077,9 @@ def main() -> int:
     overhead = sub.add_parser("runtime-overhead-map")
     overhead.add_argument("--recent-rows", type=int, default=160)
     overhead.set_defaults(func=runtime_overhead_map)
+
+    calibration_memory = sub.add_parser("calibration-memory-report")
+    calibration_memory.set_defaults(func=calibration_memory_report)
 
     trace_gate = sub.add_parser("drafter-trace-gate")
     trace_gate.add_argument(

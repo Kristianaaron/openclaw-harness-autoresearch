@@ -700,6 +700,15 @@ def is_supervisor_runtime_overhead_map_task(task: dict[str, object] | None) -> b
     )
 
 
+def is_supervisor_calibration_memory_report_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "calibration-memory-report"
+        or "openclaw-speed-research calibration-memory-report" in str(task.get("next_action", ""))
+    )
+
+
 def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -735,6 +744,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
             is_supervisor_runtime_overhead_map_task,
+            is_supervisor_calibration_memory_report_task,
             requires_profile_variant_runner,
             is_supervisor_benchmark_task,
         )
@@ -2952,6 +2962,44 @@ def run_supervisor_runtime_overhead_map_task(
     return 0, ""
 
 
+def run_supervisor_calibration_memory_report_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "calibration-memory-report"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor calibration memory report "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=45,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR CALIBRATION MEMORY REPORT TIMEOUT\n")
+            return 124, "supervisor calibration memory report timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("reason") or f"supervisor calibration memory report exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
     if is_gateway_issue(text) and "recovered" not in text.lower():
@@ -3716,6 +3764,8 @@ def main() -> int:
             code, issue = run_supervisor_gepa_policy_canary_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_runtime_overhead_map_task(selected_task):
             code, issue = run_supervisor_runtime_overhead_map_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_calibration_memory_report_task(selected_task):
+            code, issue = run_supervisor_calibration_memory_report_task(args, cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):
             code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
         elif is_supervisor_benchmark_task(selected_task):

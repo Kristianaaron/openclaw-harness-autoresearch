@@ -588,7 +588,8 @@ def main() -> int:
                             helper.result_rows(blocked_root),
                             123461,
                         )
-                        assert handoff_after_plateau == []
+                        assert len(handoff_after_plateau) == 1
+                        assert handoff_after_plateau[0]["supervisor_action"] == "calibration-memory-report"
                         assert "handoff-audit-calibration-plateau" in (
                             blocked_root / "findings.jsonl"
                         ).read_text(encoding="utf-8")
