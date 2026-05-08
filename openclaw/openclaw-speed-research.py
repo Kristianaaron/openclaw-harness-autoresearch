@@ -67,6 +67,57 @@ DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
 )
+DEFAULT_LANE_CONTRACTS: dict[str, Any] = {
+    "version": 1,
+    "lanes": {
+        "production-mtp": {
+            "purpose": "Measure and improve the normal OpenClaw TUI MTP decode path.",
+            "memory_class": "live_model",
+            "fallback": "decode-sample",
+            "promotion_gate": "paired benchmark must improve normal TUI decode TPS and preserve stream/tool guards",
+        },
+        "runtime-overhead": {
+            "purpose": "Separate backend decode speed from proxy, stream, tool, and watchdog overhead.",
+            "memory_class": "live_model_or_read_only",
+            "fallback": "decode-sample",
+            "promotion_gate": "artifact must name a patchable boundary before source changes are proposed",
+        },
+        "drafter-alignment": {
+            "purpose": "Fit the drafter to the JANQ target without changing the target model.",
+            "memory_class": "bounded_training",
+            "fallback": "trace-prerequisite-or-decode-sample",
+            "hard_blockers": [
+                "calibration-memory-after-load",
+                "calibration-runtime-missing-speculative",
+            ],
+            "promotion_gate": "target-generated traces, calibration canary, acceptance lift, and paired decode benchmark",
+        },
+        "frontier-dflash": {
+            "purpose": "Evaluate DFlash compatibility only after structural JANQ compatibility is proven.",
+            "memory_class": "no_model_load_until_compatible",
+            "fallback": "runtime-overhead",
+            "hard_blockers": [
+                "draft_model_type_mismatch",
+                "dflash_draft_config_missing",
+                "draft_target_layer_ids_missing",
+                "lane-exhausted",
+            ],
+            "promotion_gate": "compatibility artifact, canary, loop guards, then paired TUI decode improvement",
+        },
+        "mtp-decode": {
+            "purpose": "Bounded MTP sweep lane; retire once block-size evidence converges.",
+            "memory_class": "live_model",
+            "fallback": "production-mtp",
+            "promotion_gate": "winner must beat control outside observed variance",
+        },
+        "implementation-gate": {
+            "purpose": "Convert evidence into canary-only source patches with rollback.",
+            "memory_class": "no_model_load",
+            "fallback": "deterministic-bridge",
+            "promotion_gate": "allowed paths, py_compile/tests, no opencode or secret files, rollback recorded",
+        },
+    },
+}
 DEFAULT_TRACE_PROMPTS = (
     (
         "coding-small",
@@ -194,14 +245,41 @@ def git_available() -> bool:
 
 
 def write_if_missing(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(content, encoding="utf-8")
 
 
 def write_if_changed(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text(encoding="utf-8") == content:
         return
     path.write_text(content, encoding="utf-8")
+
+
+def ensure_lane_contracts(root: Path) -> dict[str, Any]:
+    """Keep lane routing explicit so the loop has a deterministic fallback."""
+    path = root / "lane-contracts.json"
+    if not path.exists():
+        write_if_missing(path, json.dumps(DEFAULT_LANE_CONTRACTS, indent=2, sort_keys=True) + "\n")
+        return DEFAULT_LANE_CONTRACTS
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        loaded = {}
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("lanes"), dict):
+        write_if_changed(path, json.dumps(DEFAULT_LANE_CONTRACTS, indent=2, sort_keys=True) + "\n")
+        return DEFAULT_LANE_CONTRACTS
+    changed = False
+    lanes = loaded.setdefault("lanes", {})
+    for lane, contract in DEFAULT_LANE_CONTRACTS["lanes"].items():
+        if lane not in lanes:
+            lanes[lane] = contract
+            changed = True
+    if changed:
+        loaded.setdefault("version", DEFAULT_LANE_CONTRACTS["version"])
+        write_if_changed(path, json.dumps(loaded, indent=2, sort_keys=True) + "\n")
+    return loaded
 
 
 def ensure_section(path: Path, marker: str, section: str) -> None:
@@ -940,6 +1018,7 @@ def setup_workspace(args: argparse.Namespace) -> int:
     root = workspace_root()
     root.mkdir(parents=True, exist_ok=True)
     ensure_research_state(root)
+    ensure_lane_contracts(root)
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
     write_if_changed(root / "program.md", program_md())
@@ -1677,8 +1756,82 @@ def default_dflash_draft_path() -> Path:
     ).expanduser()
 
 
+def lane_contract_decode_task(timestamp: int, *, task_id: str, reason: str, priority: int = 99) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "runtime-overhead",
+        "task_type": "supervisor",
+        "target": "decode-sample",
+        "hypothesis": reason,
+        "metric": "decode_tps",
+        "benchmark_mode": "decode-sample",
+        "guard_checks": ["memory_gate", "no_live_profile_change", "no_opencode_changes", "stream_guard"],
+        "acceptance": "A fresh decode benchmark records wall-clock and server tok/s without loading a second JANQ target.",
+        "rollback": "No rollback needed; benchmark-only task.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+    }
+
+
+def lane_contract_fallback_tasks(
+    root: Path,
+    rows: list[dict[str, str]] | None,
+    timestamp: int,
+    *,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Return one deterministic fallback task when a lane stalls or exhausts."""
+    ensure_lane_contracts(root)
+    recent_rows = rows if rows is not None else result_rows(root)
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
+    tasks: list[dict[str, Any]] = []
+    if recent_drafter_fit_plan_ready(root, recent_rows=240) and not calibration_blocker:
+        if existing_drafter_trace_paths():
+            tasks.append(
+                drafter_calibration_canary_task(
+                    timestamp,
+                    task_id=f"lane-contract-drafter-calibration-canary-{timestamp}",
+                    priority=99,
+                )
+            )
+        elif recent_drafter_trace_missing(root, recent_rows=160):
+            tasks.append(
+                drafter_trace_prerequisite_task(
+                    timestamp,
+                    task_id=f"lane-contract-drafter-trace-prerequisite-{timestamp}",
+                    priority=99,
+                )
+            )
+        else:
+            tasks.append(
+                drafter_trace_gate_task(
+                    timestamp,
+                    task_id=f"lane-contract-drafter-trace-gate-{timestamp}",
+                    priority=99,
+                )
+            )
+    if not tasks:
+        suffix = "calibration-block" if calibration_blocker else "dflash-block" if dflash_blocked else "ready-work-gap"
+        tasks.append(
+            lane_contract_decode_task(
+                timestamp,
+                task_id=f"lane-contract-decode-remeasure-{suffix}-{timestamp}",
+                priority=99,
+                reason=(
+                    f"{reason}; calibration_blocker={calibration_blocker or 'none'} "
+                    f"dflash_blocked={str(dflash_blocked).lower()}. "
+                    "Continue with the safe normal-TUI decode metric while blocked lanes wait for new evidence."
+                ),
+            )
+        )
+    return filter_seedable_tasks(root, tasks)
+
+
 def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop tasks from retired lanes before they enter the durable queue."""
+    ensure_lane_contracts(root)
     exhausted = exhausted_lanes(root)
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
@@ -2100,6 +2253,7 @@ def research_quality_scorecard(
 def quality_review(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
+    ensure_lane_contracts(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     blocked = [row for row in recent if row.get("status") == "blocked"]
@@ -2388,6 +2542,17 @@ def quality_review(args: argparse.Namespace) -> int:
                 "guard_checks": ["no_live_profile_change", "evidence_required", "no_model_turn_required"],
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
             }
+        )
+    deterministic_ready = [task for task in active_tasks if is_deterministic_research_task(task)]
+    if not deterministic_ready:
+        recommendations.append("no deterministic ready task remained after review; seeded one lane-contract fallback.")
+        seeded_tasks.extend(
+            lane_contract_fallback_tasks(
+                root,
+                rows,
+                int(time.time()),
+                reason="Quality review found no deterministic ready work",
+            )
         )
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
@@ -2803,6 +2968,7 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Seed one deterministic repair lane when the frontier score is below target."""
     timestamp = int(report.get("timestamp") or time.time())
     root = workspace_root()
+    ensure_lane_contracts(root)
     rows = result_rows(root)
     tasks: list[dict[str, Any]] = []
     gaps = [str(gap) for gap in report.get("gaps", [])]
@@ -2831,6 +2997,15 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
     elif has_gap("bridge-only") or has_gap("empty synthesis") or has_gap("no deterministic ready task") or has_gap("implementation bridge"):
         if recent_empty_bridge_rows(root, rows, recent_rows=120) or has_gap("bridge-only"):
             tasks.extend(concrete_handoff_prerequisite_tasks(root, rows, timestamp))
+        elif has_gap("no deterministic ready task") or has_gap("empty synthesis"):
+            tasks.extend(
+                lane_contract_fallback_tasks(
+                    root,
+                    rows,
+                    timestamp,
+                    reason="Frontier eval found no deterministic ready task",
+                )
+            )
         else:
             tasks.append(
                 {
@@ -2873,6 +3048,7 @@ def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
 def frontier_eval(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
+    ensure_lane_contracts(root)
     report = score_frontier_system(root, recent_rows=args.recent_rows)
     seeded_tasks = 0
     if report["overall"] < args.min_score:
@@ -4039,6 +4215,7 @@ def implementation_candidate_tasks(rows: list[dict[str, str]]) -> list[dict[str,
 def synthesize(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
+    ensure_lane_contracts(root)
     compact_workspace(root)
     rows = result_rows(root)
     ideas = synthesis_ideas(rows)
@@ -4155,9 +4332,18 @@ def synthesize(args: argparse.Namespace) -> int:
         candidate_tasks,
     )
     deliberate_tasks: list[dict[str, Any]] = []
+    contract_tasks: list[dict[str, Any]] = []
     if seeded == 0:
         deliberate_tasks = filter_seedable_tasks(root, synthesis_deliberate_action_tasks(root, rows, int(time.time())))
         seeded = upsert_tasks(root, deliberate_tasks) if deliberate_tasks else 0
+    if seeded == 0:
+        contract_tasks = lane_contract_fallback_tasks(
+            root,
+            rows,
+            int(time.time()),
+            reason="Synthesis had no seedable implementation or deliberate tasks",
+        )
+        seeded = upsert_tasks(root, contract_tasks) if contract_tasks else 0
     append_jsonl(
         root / "findings.jsonl",
         {
@@ -4177,6 +4363,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 if task.get("task_type") in {"implementation", "supervisor"}
             ],
             "deliberate_actions": [task["id"] for task in deliberate_tasks],
+            "contract_actions": [task["id"] for task in contract_tasks],
             "seeded_tasks": seeded,
             "kind": args.kind,
         },
@@ -4190,7 +4377,8 @@ def synthesize(args: argparse.Namespace) -> int:
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind} "
-            f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)}"
+            f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)} "
+            f"contract_actions={','.join(task['id'] for task in contract_tasks)}"
         ),
     )
     print(
@@ -4200,6 +4388,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 "ideas": len(ideas),
                 "seeded_tasks": seeded,
                 "deliberate_actions": [task["id"] for task in deliberate_tasks],
+                "contract_actions": [task["id"] for task in contract_tasks],
                 "ideas_path": str(ideas_path),
             },
             indent=2,
@@ -4211,6 +4400,7 @@ def synthesize(args: argparse.Namespace) -> int:
 def implementation_handoff_audit(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
+    ensure_lane_contracts(root)
     rows = result_rows(root)
     tasks = read_jsonl(root / "tasks.jsonl")
     ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]

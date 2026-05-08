@@ -38,6 +38,7 @@ def main() -> int:
             assert (root / "insight-rubric.json").exists()
             assert (root / "research-profile.json").exists()
             assert (root / "evaluator-policy.json").exists()
+            assert (root / "lane-contracts.json").exists()
             assert (root / "replay-buffer.jsonl").exists()
             manifest = json.loads((root / "benchmark-manifest.json").read_text(encoding="utf-8"))
             assert manifest["locked"] is True
@@ -51,6 +52,9 @@ def main() -> int:
             policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
             assert "benchmark-manifest.json" in policy["immutable_paths"]
             assert "replay-buffer.jsonl" in policy["immutable_paths"]
+            lane_contracts = json.loads((root / "lane-contracts.json").read_text(encoding="utf-8"))
+            assert "drafter-alignment" in lane_contracts["lanes"]
+            assert "calibration-memory-after-load" in lane_contracts["lanes"]["drafter-alignment"]["hard_blockers"]
             replay_cases = (root / "replay-buffer.jsonl").read_text(encoding="utf-8")
             assert "decode-token-source-required" in replay_cases
             assert "profile-variant-paired-control" in replay_cases
@@ -463,6 +467,27 @@ def main() -> int:
                         assert helper.recent_calibration_run_hard_blocker(blocked_root) == "calibration-memory-after-load"
                         assert not helper.should_seed_drafter_calibration_canary(blocked_root)
                         assert not helper.should_seed_drafter_calibration_run(blocked_root)
+                        blocked_root_contracts = helper.ensure_lane_contracts(blocked_root)
+                        assert "drafter-alignment" in blocked_root_contracts["lanes"]
+                        filtered_calibration = helper.filter_seedable_tasks(
+                            blocked_root,
+                            [
+                                helper.drafter_calibration_canary_task(
+                                    123456,
+                                    task_id="drafter-calibration-canary-blocked",
+                                )
+                            ],
+                        )
+                        assert filtered_calibration == []
+                        contract_fallback = helper.lane_contract_fallback_tasks(
+                            blocked_root,
+                            helper.result_rows(blocked_root),
+                            123457,
+                            reason="unit no ready task",
+                        )
+                        assert len(contract_fallback) == 1
+                        assert contract_fallback[0]["benchmark_mode"] == "decode-sample"
+                        assert "calibration-memory-after-load" in contract_fallback[0]["hypothesis"]
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
