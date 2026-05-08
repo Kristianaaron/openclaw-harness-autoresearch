@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 
 HELPER_PATH = Path(__file__).with_name("openclaw-speed-research.py")
+CALIBRATOR_PATH = Path(__file__).with_name("openclaw-mtp-drafter-calibrate.py")
 
 
 def load_helper():
@@ -25,8 +26,31 @@ def load_helper():
     return module
 
 
+def load_calibrator():
+    spec = importlib.util.spec_from_file_location("openclaw_mtp_drafter_calibrate", CALIBRATOR_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {CALIBRATOR_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> int:
     helper = load_helper()
+    calibrator = load_calibrator()
+    gate_args = Namespace(min_free_mb=16384, min_pressure_free_percent=20, max_compressor_mb=2048, max_swap_mb=2048)
+    with patch.object(
+        calibrator,
+        "memory_snapshot",
+        return_value={"free_mb": 795, "compressor_mb": 1200, "swap_used_mb": 1600, "pressure_free_percent": 71},
+    ):
+        assert calibrator.memory_block_reason(gate_args, phase="after-load") == ""
+    with patch.object(
+        calibrator,
+        "memory_snapshot",
+        return_value={"free_mb": 795, "compressor_mb": 1200, "swap_used_mb": 1600, "pressure_free_percent": 5},
+    ):
+        assert "pressureFree=5%<20%" in calibrator.memory_block_reason(gate_args, phase="after-load")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "research" / "speed"
         with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(root)}, clear=False):

@@ -58,7 +58,7 @@ def log(message: str) -> None:
 
 
 def memory_snapshot() -> dict[str, int]:
-    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0}
+    snapshot = {"free_mb": 0, "compressor_mb": 0, "swap_used_mb": 0, "pressure_free_percent": -1}
     try:
         vm_stat = subprocess.check_output(["/usr/bin/vm_stat"], text=True, stderr=subprocess.DEVNULL)
         page_size = 16384
@@ -88,13 +88,26 @@ def memory_snapshot() -> dict[str, int]:
                 snapshot["swap_used_mb"] = int(float(parts[used_index + 2]))
     except Exception:
         pass
+    try:
+        pressure = subprocess.check_output(["/usr/bin/memory_pressure"], text=True, stderr=subprocess.DEVNULL)
+        for line in pressure.splitlines():
+            if "System-wide memory free percentage:" in line:
+                snapshot["pressure_free_percent"] = int(line.rsplit(":", 1)[1].strip().rstrip("%"))
+                break
+    except Exception:
+        pass
     return snapshot
 
 
 def memory_block_reason(args: argparse.Namespace, *, phase: str) -> str:
     snap = memory_snapshot()
+    pressure_free = int(snap.get("pressure_free_percent", -1))
     if snap["free_mb"] and snap["free_mb"] < args.min_free_mb:
-        return f"{phase}: free={snap['free_mb']}MB<{args.min_free_mb}MB"
+        if pressure_free < 0 or pressure_free < args.min_pressure_free_percent:
+            return (
+                f"{phase}: free={snap['free_mb']}MB<{args.min_free_mb}MB "
+                f"pressureFree={pressure_free if pressure_free >= 0 else '?'}%<{args.min_pressure_free_percent}%"
+            )
     if snap["compressor_mb"] >= args.max_compressor_mb:
         return f"{phase}: compressor={snap['compressor_mb']}MB>={args.max_compressor_mb}MB"
     if snap["swap_used_mb"] >= args.max_swap_mb:
@@ -103,6 +116,12 @@ def memory_block_reason(args: argparse.Namespace, *, phase: str) -> str:
 
 
 def require_memory_safe(args: argparse.Namespace, *, phase: str) -> None:
+    try:
+        mx.clear_cache()
+        if hasattr(mx, "metal"):
+            mx.metal.clear_cache()
+    except Exception:
+        pass
     reason = memory_block_reason(args, phase=phase)
     if reason:
         raise RuntimeError(f"calibration memory gate blocked: {reason}")
@@ -392,6 +411,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-free-mb", type=int, default=12288)
     parser.add_argument("--max-compressor-mb", type=int, default=4096)
     parser.add_argument("--max-swap-mb", type=int, default=1024)
+    parser.add_argument("--min-pressure-free-percent", type=int, default=20)
     parser.add_argument("--memory-check-every", type=int, default=2)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
