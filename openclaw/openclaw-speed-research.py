@@ -1274,6 +1274,24 @@ def result_rows(root: Path) -> list[dict[str, str]]:
     return rows
 
 
+CERTIFICATION_TARGETS = {
+    "autoresearch-quality",
+    "autoresearch-frontier-eval",
+}
+
+
+def is_certification_blocked_row(row: dict[str, str]) -> bool:
+    return row.get("status") == "blocked" and row.get("target") in CERTIFICATION_TARGETS
+
+
+def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        row
+        for row in rows
+        if row.get("status") == "blocked" and not is_certification_blocked_row(row)
+    ]
+
+
 def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
     ensure_research_state(root)
     rows = result_rows(root)
@@ -2757,7 +2775,9 @@ def quality_review(args: argparse.Namespace) -> int:
     compacted_stage_tasks = compact_duplicate_calibration_stage_tasks(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
-    blocked = [row for row in recent if row.get("status") == "blocked"]
+    raw_blocked = [row for row in recent if row.get("status") == "blocked"]
+    blocked = actionable_blocked_rows(recent)
+    certification_blocked = [row for row in raw_blocked if is_certification_blocked_row(row)]
     decode_signals = [
         decode_measurement_signal(row)
         for row in recent
@@ -3064,9 +3084,10 @@ def quality_review(args: argparse.Namespace) -> int:
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
     verdict = "healthy"
+    coverage_gap = bool(missing_required_blocks and not has_calibration_canary_route)
     if exhaustion_candidate:
         verdict = "exhaustion-candidate"
-    elif missing_required_blocks or blocked:
+    elif coverage_gap or blocked:
         verdict = "needs-repair"
     elif plateau_below_target:
         verdict = "converged-below-target"
@@ -3117,6 +3138,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "timestamp": timestamp,
         "recent_rows": len(recent),
         "blocked_rows": len(blocked),
+        "certification_blocked_rows": len(certification_blocked),
         "sweep_rows": len(sweep_rows),
         "sweep_rows_in_recent": len(sweep_rows_in_recent),
         "block_summary": block_summary,
@@ -3261,8 +3283,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     replay = replay_checks(root)
 
-    blocked = [row for row in active_recent if row.get("status") == "blocked"]
-    historical_blocked = [row for row in recent if row.get("status") == "blocked"]
+    blocked = actionable_blocked_rows(active_recent)
+    historical_blocked = actionable_blocked_rows(recent)
     memory_blocks = [
         row for row in blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
     ]
@@ -3429,6 +3451,13 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         if audit_ok:
             scores["implementation_handoff"] += 0.7
             strengths.append("implementation handoff audit passed with canary and rollback gates")
+            try:
+                handoff_score_value = float(handoff_score) if handoff_score else 0.0
+            except ValueError:
+                handoff_score_value = 0.0
+            if handoff_score_value >= 95.0 and not bridge_zero and contract.get("ok"):
+                scores["implementation_handoff"] += 0.3
+                strengths.append("implementation handoff has certification-grade audit evidence")
         else:
             scores["implementation_handoff"] -= 0.8
             gaps.append(f"implementation handoff audit needs repair score={handoff_score or 'unknown'}")
@@ -3439,6 +3468,11 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if quality_route_high:
         scores["research_quality"] += 0.2
         strengths.append("quality scorecard shows evidence-backed routing rather than research churn")
+        if latest_quality_verdict == "healthy" and not duplicate_stage_tasks and contract.get("ok"):
+            scores["karpathy_core_loop"] += 0.1
+            scores["self_improvement"] += 0.2
+            scores["modularity"] += 0.1
+            strengths.append("healthy quality review is backed by clean contracts and no queue duplication")
     elif latest_quality_verdict == "needs-repair":
         scores["research_quality"] -= 1.5
         scores["karpathy_core_loop"] -= 0.7

@@ -59,6 +59,13 @@ def main() -> int:
             assert (root / "README-openclaw-speed.md").exists()
             assert (root / "implementation-skill.md").exists()
             assert (root / "benchmark-manifest.json").exists()
+            assert helper.actionable_blocked_rows(
+                [
+                    {"status": "blocked", "target": "autoresearch-quality"},
+                    {"status": "blocked", "target": "autoresearch-frontier-eval"},
+                    {"status": "blocked", "target": "decode-sample"},
+                ]
+            ) == [{"status": "blocked", "target": "decode-sample"}]
             assert (root / "insight-rubric.json").exists()
             assert (root / "research-profile.json").exists()
             assert (root / "evaluator-policy.json").exists()
