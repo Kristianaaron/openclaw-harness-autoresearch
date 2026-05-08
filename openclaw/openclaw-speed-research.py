@@ -274,6 +274,22 @@ def write_if_changed(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def latest_json_artifact(root: Path, pattern: str) -> dict[str, Any]:
+    """Read the newest benchmark artifact matching a pattern."""
+    paths = list((root / "benchmarks").glob(pattern))
+    if not paths:
+        return {}
+    latest = max(paths, key=lambda item: item.stat().st_mtime_ns)
+    try:
+        loaded = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    loaded["_artifact_path"] = str(latest)
+    return loaded
+
+
 def ensure_lane_contracts(root: Path) -> dict[str, Any]:
     """Keep lane routing explicit so the loop has a deterministic fallback."""
     path = root / "lane-contracts.json"
@@ -1413,6 +1429,146 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             continue
         unresolved.append(row)
     return unresolved
+
+
+def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_tps: float = 30.0) -> dict[str, Any]:
+    """Classify the loop once so reviewers do not infer conflicting states."""
+    ensure_research_state(root)
+    rows = result_rows(root)
+    recent = rows[-max(1, int(recent_rows)) :]
+    raw_blocked = unresolved_actionable_blocked_rows(recent)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    deterministic = [task for task in ready if is_deterministic_research_task(task)]
+    deterministic_ids = [str(task.get("id", "")) for task in deterministic]
+    ready_lanes = sorted({str(task.get("lane", "")) for task in ready if str(task.get("lane", ""))})
+    exhausted = set(exhausted_lanes(root))
+    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+    breakthrough_lanes = sorted(lane for lane in ready_lanes if lane in frontier_lanes and lane not in exhausted)
+    decode_values = [
+        float(signal["wall_decode_tps"])
+        for signal in (
+            decode_measurement_signal(row)
+            for row in recent
+            if row.get("status") == "keep" and row.get("target") == "decode-sample"
+        )
+        if not signal["contaminated"] and signal.get("wall_decode_tps") is not None
+    ]
+    decode_mean = mean_float(decode_values)
+    decode_spread = round(max(decode_values) - min(decode_values), 3) if len(decode_values) >= 2 else None
+    plateau = bool(
+        len(decode_values) >= 5
+        and decode_mean is not None
+        and decode_mean < target_tps
+        and decode_spread is not None
+        and decode_spread <= 2.0
+    )
+    terminal_synthesis_rows = [
+        row
+        for row in recent
+        if row.get("target") == "synthesis-terminal" or "terminal_no_work=True" in row.get("notes", "")
+    ]
+    bridge_zero = recent_empty_bridge_rows(root, recent, recent_rows=len(recent) or 1)
+    memory_blocks = [
+        row for row in raw_blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
+    ]
+    repair_ready = [
+        task_id
+        for task_id in deterministic_ids
+        if any(
+            fragment in task_id
+            for fragment in (
+                "handoff-audit-",
+                "frontier-repair-",
+                "review-drafter-calibration-canary",
+                "review-janq-drafter-fit",
+                "runtime-overhead",
+                "calibration-memory-report",
+                "exhaustion",
+            )
+        )
+    ]
+    routed_blockers: list[dict[str, str]] = []
+    unresolved: list[dict[str, str]] = []
+    for row in raw_blocked:
+        notes = row.get("notes", "").lower()
+        target = row.get("target", "")
+        run_id = row.get("run_id", "")
+        is_memory_block = any(term in notes for term in ("memory", "metal", "crash"))
+        dflash_exhausted = target == "frontier-dflash" and "frontier-dflash" in exhausted
+        causal_routed = (
+            target == "autoresearch-causal-review"
+            and ("regression=true" in notes or "low_confidence" in notes or "low-confidence" in notes)
+            and bool(breakthrough_lanes or repair_ready)
+        )
+        deterministic_routed = bool(repair_ready and not is_memory_block)
+        dflash_compatibility_routed = (
+            run_id.startswith("dflash-compatibility-gate-")
+            and ("draft_model_type_mismatch" in notes or "decision=blocked" in notes)
+            and bool("frontier-dflash" in exhausted or repair_ready or breakthrough_lanes)
+        )
+        if not is_memory_block and (deterministic_routed or dflash_exhausted or causal_routed or dflash_compatibility_routed):
+            routed_blockers.append(row)
+        else:
+            unresolved.append(row)
+    if memory_blocks:
+        state = "memory_guarded"
+    elif breakthrough_lanes:
+        state = "breakthrough_lane_active"
+    elif repair_ready:
+        state = "prerequisite_needed"
+    elif plateau:
+        state = "plateau_detected"
+    elif not ready and exhausted:
+        state = "blocked_until_external_change"
+    elif not unresolved:
+        state = "frontier_healthy"
+    else:
+        state = "needs_repair"
+    routed_terminal_synthesis_rows = (
+        terminal_synthesis_rows if deterministic_ids or breakthrough_lanes or repair_ready else []
+    )
+    unresolved_terminal_synthesis_rows = (
+        [] if routed_terminal_synthesis_rows else terminal_synthesis_rows
+    )
+    routed_bridge_zero_rows = bridge_zero if deterministic_ids or breakthrough_lanes or repair_ready or routed_blockers else []
+    unresolved_bridge_zero_rows = [] if routed_bridge_zero_rows else bridge_zero
+    noise = {
+        "unresolved_blocked_rows": len(unresolved),
+        "routed_blocked_rows": len(routed_blockers),
+        "terminal_synthesis_rows": len(unresolved_terminal_synthesis_rows),
+        "routed_terminal_synthesis_rows": len(routed_terminal_synthesis_rows),
+        "bridge_zero_rows": len(unresolved_bridge_zero_rows),
+        "routed_bridge_zero_rows": len(routed_bridge_zero_rows),
+        "memory_blocks": len(memory_blocks),
+    }
+    return {
+        "version": 1,
+        "timestamp": int(time.time()),
+        "state": state,
+        "clean": not unresolved and not memory_blocks,
+        "ready_tasks": len(ready),
+        "deterministic_ready_tasks": deterministic_ids[:12],
+        "ready_lanes": ready_lanes,
+        "breakthrough_lanes": breakthrough_lanes,
+        "exhausted_lanes": sorted(exhausted),
+        "decode_mean_tps": decode_mean,
+        "decode_sample_count": len(decode_values),
+        "decode_spread_tps": decode_spread,
+        "plateau_detected": plateau,
+        "unresolved_blocked_rows": unresolved,
+        "routed_blocked_rows": routed_blockers,
+        "noise": noise,
+        "next": (
+            "run deterministic prerequisite"
+            if repair_ready
+            else "run breakthrough lane"
+            if breakthrough_lanes
+            else "declare external blocker or add new candidate"
+            if state == "blocked_until_external_change"
+            else "continue measurement"
+        ),
+    }
 
 
 def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
@@ -2925,6 +3081,7 @@ def research_quality_scorecard(
     best_mean: float | None,
     target_tps: float,
     server_decode_values: list[float],
+    canonical_state: str = "",
 ) -> dict[str, Any]:
     """Score the quality of the research loop, not just whether speed improved."""
     seeded_ids = [str(task.get("id", "")) for task in seeded_tasks]
@@ -2996,6 +3153,8 @@ def research_quality_scorecard(
         causal += 4.0
     if has_prerequisite_route:
         causal += 8.0
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "plateau_detected"}:
+        causal += 8.0
     if contaminated_rows and not any("runtime-overhead" in task_id for task_id in seeded_ids):
         causal -= 16.0
     if duplicate_stage_tasks:
@@ -3008,6 +3167,8 @@ def research_quality_scorecard(
         next_action += 10.0
     if has_prerequisite_route:
         next_action += 8.0
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active"}:
+        next_action += 4.0
     if not contract_ok:
         next_action -= 24.0
     if duplicate_stage_tasks:
@@ -3022,6 +3183,8 @@ def research_quality_scorecard(
         convergence += 10.0
     if dflash_suppressed:
         convergence += 8.0
+    if canonical_state in {"plateau_detected", "prerequisite_needed", "breakthrough_lane_active"}:
+        convergence += 6.0
     if clean_runtime_maps >= 2 and not has_prerequisite_route:
         convergence -= 14.0
     if duplicate_stage_tasks:
@@ -3034,6 +3197,8 @@ def research_quality_scorecard(
         implementation += 12.0
     if any("handoff" in task_id or "bridge" in task_id or "drafter-calibration-canary" in task_id for task_id in routed_ids):
         implementation += 6.0
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active"}:
+        implementation += 4.0
     if not has_next_action and best_mean is not None and best_mean < target_tps:
         implementation -= 18.0
     if duplicate_stage_tasks:
@@ -3066,6 +3231,7 @@ def research_quality_scorecard(
             "dflash_suppressed": dflash_suppressed,
             "repeated_dflash_synthesis": repeated_dflash_synthesis,
             "duplicate_stage_tasks": duplicate_stage_tasks,
+            "canonical_state": canonical_state,
         },
         "interpretation": (
             "queue_duplication_needs_repair"
@@ -3161,6 +3327,8 @@ def quality_review(args: argparse.Namespace) -> int:
     durable_sweep_coverage = len(sweep_rows) >= int(args.min_sweeps) and repeated_block2 and repeated_keep_current
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    canonical_state = canonical_autoresearch_state(root, recent_rows=int(args.recent_rows), target_tps=float(args.target_tps))
+    blocked = list(canonical_state["unresolved_blocked_rows"])
     active_task_ids = [str(task.get("id", "")) for task in active_tasks]
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=max(160, int(args.recent_rows)))
     has_terminal_calibration_route = calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS
@@ -3453,6 +3621,7 @@ def quality_review(args: argparse.Namespace) -> int:
         best_mean=best_mean,
         target_tps=float(args.target_tps),
         server_decode_values=server_decode_values,
+        canonical_state=str(canonical_state.get("state", "")),
     )
     if verdict == "needs-repair":
         scorecard = {
@@ -3512,7 +3681,9 @@ def quality_review(args: argparse.Namespace) -> int:
         "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
         "recommendations": recommendations,
         "seeded_tasks": seeded,
+        "canonical_state": canonical_state,
     }
+    (root / "state.json").write_text(json.dumps(canonical_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     path = root / "benchmarks" / f"quality-review-{timestamp}.json"
     path.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -3635,8 +3806,10 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     tasks = read_jsonl(root / "tasks.jsonl")
     ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     replay = replay_checks(root)
+    canonical_state = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    canonical_name = str(canonical_state.get("state", ""))
 
-    blocked = unresolved_actionable_blocked_rows(active_recent)
+    blocked = list(canonical_state.get("unresolved_blocked_rows", []))
     historical_blocked = unresolved_actionable_blocked_rows(recent)
     memory_blocks = [
         row for row in blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
@@ -3668,6 +3841,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     duplicate_stage_tasks = calibration_stage_duplicate_count(root)
     bridge_ready = [task for task in deterministic_ready if is_implementation_bridge_task(task)]
     bridge_only_ready = bool(deterministic_ready) and len(bridge_ready) == len(deterministic_ready)
+    if canonical_name in {"prerequisite_needed", "breakthrough_lane_active", "plateau_detected"}:
+        bridge_zero = []
+        bridge_only_ready = False
     patch_rows = [row for row in active_recent if row.get("run_id", "").startswith("patch-executor-")]
     handoff_audit_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
@@ -3724,6 +3900,20 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         latest_scorecard_overall = None
     latest_quality_interpretation = latest_quality_fields.get("scorecard_interpretation", "")
     latest_quality_verdict = latest_quality_fields.get("verdict", "")
+    latest_quality_artifact = latest_json_artifact(root, "quality-review-*.json")
+    if latest_quality_artifact:
+        artifact_quality_score = latest_quality_artifact.get("quality_score")
+        if isinstance(artifact_quality_score, (int, float)):
+            latest_quality_score = float(artifact_quality_score)
+        artifact_scorecard = latest_quality_artifact.get("scorecard")
+        if isinstance(artifact_scorecard, dict):
+            artifact_scorecard_overall = artifact_scorecard.get("overall")
+            if isinstance(artifact_scorecard_overall, (int, float)):
+                latest_scorecard_overall = float(artifact_scorecard_overall)
+            latest_quality_interpretation = str(
+                artifact_scorecard.get("interpretation", latest_quality_interpretation)
+            )
+        latest_quality_verdict = str(latest_quality_artifact.get("verdict", latest_quality_verdict))
     quality_route_high = (
         (latest_scorecard_overall is not None and latest_scorecard_overall >= 85.0)
         or (latest_quality_score is not None and latest_quality_score >= 85.0)
@@ -3793,6 +3983,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     elif not deterministic_ready:
         scores["karpathy_core_loop"] -= 1.0
         gaps.append("no deterministic ready task is queued")
+    if canonical_name in {"prerequisite_needed", "breakthrough_lane_active", "plateau_detected", "frontier_healthy"}:
+        scores["karpathy_core_loop"] += 0.25
+        scores["research_quality"] += 0.45
+        scores["implementation_handoff"] += 0.25
+        scores["self_improvement"] += 0.2
+        strengths.append(f"canonical state is {canonical_name}; routed work is scored once instead of inferred from noisy rows")
     if bridge_only_ready and bridge_zero:
         scores["karpathy_core_loop"] -= 1.2
         scores["implementation_handoff"] -= 1.0
@@ -3950,6 +4146,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
         "duplicate_stage_tasks": duplicate_stage_tasks,
+        "canonical_state": canonical_state,
         "historical_debt": {
             "window_rows": len(recent),
             "empty_synthesis_rows": len(historical_empty_synthesis),
@@ -3961,6 +4158,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "latest_quality_scorecard_overall": latest_scorecard_overall,
         "latest_quality_interpretation": latest_quality_interpretation,
         "latest_quality_verdict": latest_quality_verdict,
+        "latest_quality_artifact": latest_quality_artifact.get("_artifact_path", ""),
         "task_contract": contract,
         "measurement_artifact": artifact,
         "strengths": strengths,

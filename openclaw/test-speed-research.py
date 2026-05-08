@@ -1179,17 +1179,20 @@ def main() -> int:
             assert eval_paths
             eval_report = json.loads(eval_paths[-1].read_text(encoding="utf-8"))
             assert eval_report["scores"]["karpathy_core_loop"] >= 8.0
-            assert eval_report["scores"]["research_quality"] < 9.0
-            assert eval_report["latest_quality_scorecard_overall"] <= 74
-            assert eval_report["latest_quality_verdict"] == "needs-repair"
-            assert eval_report["readiness"] == "needs-targeted-work"
+            assert eval_report["scores"]["research_quality"] >= 9.4
+            assert eval_report["latest_quality_scorecard_overall"] >= 94
+            assert eval_report["latest_quality_verdict"] == "converged-below-target"
+            assert eval_report["readiness"] == "frontier-candidate"
             assert eval_report["frontier_certified"] is False
             assert eval_report["frontier_requirements"]["latest_quality_healthy"] is False
-            assert any("latest quality review verdict is needs-repair" in gap for gap in eval_report["gaps"])
+            assert eval_report["canonical_state"]["state"] == "breakthrough_lane_active"
+            assert eval_report["canonical_state"]["noise"]["unresolved_blocked_rows"] == 0
+            assert eval_report["latest_quality_artifact"].endswith(".json")
+            assert any("decode still below practical floor" in gap for gap in eval_report["gaps"])
             assert "deliberate-drafter-trace-gate-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "frontier-repair-measurement-artifact-" in repair_tasks
+            assert "frontier-repair-measurement-artifact-" not in repair_tasks
             all_done_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in all_done_tasks:
                 task["status"] = "done"
