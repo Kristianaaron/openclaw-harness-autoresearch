@@ -1352,16 +1352,27 @@ def gepa_escalation_report(
     exhausted = exhausted_lanes(root)
     asi = gepa_actionable_side_information(root, rows, artifact=artifact, exhausted=exhausted)
     triggers: list[dict[str, Any]] = []
+    actionable_trigger_names: set[str] = set()
     if len(blocked) >= min_blocked:
         triggers.append({"name": "blocked_rows", "value": len(blocked), "threshold": min_blocked})
+        actionable_trigger_names.add("blocked_rows")
     if len(rework) >= min_rework:
         triggers.append({"name": "rework_tasks", "value": len(rework), "threshold": min_rework})
+        actionable_trigger_names.add("rework_tasks")
     if len(trajectory) >= min_trajectory:
         triggers.append({"name": "trajectory_cases", "value": len(trajectory), "threshold": min_trajectory})
     if low_quality >= min_low_quality:
         triggers.append({"name": "low_quality_reviews", "value": low_quality, "threshold": min_low_quality})
+        actionable_trigger_names.add("low_quality_reviews")
     if artifact.get("artifact_suspected"):
         triggers.append({"name": "measurement_artifact", "value": True, "threshold": "false"})
+        actionable_trigger_names.add("measurement_artifact")
+    if int(asi.get("empty_synthesis_rows") or 0) > 0:
+        actionable_trigger_names.add("empty_synthesis_rows")
+    if int(asi.get("handoff_blocked_rows") or 0) > 0:
+        actionable_trigger_names.add("handoff_blocked_rows")
+    if int(asi.get("frontier_blocked_rows") or 0) > 0:
+        actionable_trigger_names.add("frontier_blocked_rows")
 
     target = choose_gepa_policy_target(
         blocked_rows=len(blocked),
@@ -1371,17 +1382,18 @@ def gepa_escalation_report(
         artifact_suspected=bool(artifact.get("artifact_suspected")),
         exhausted_count=len(exhausted),
     )
-    needed = bool(triggers)
+    needed = bool(triggers) and bool(actionable_trigger_names)
     active_canary = active_gepa_policy_canary_exists(root)
     latest_certified = latest_certification_is_healthy(rows)
-    if active_canary or latest_certified:
-        needed = False
-    trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
     existing_candidate_count = sum(
         1
         for candidate in read_jsonl(root / "gepa-candidates.jsonl")
         if str((candidate.get("candidate") or {}).get("target") or candidate.get("target") or "") == target
     )
+    repeated_non_promotable_target = target != "insight-rubric.json" and existing_candidate_count >= 3
+    if active_canary or latest_certified or repeated_non_promotable_target:
+        needed = False
+    trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
     candidate_id = f"gepa-policy-canary-{slugify(target)}-{existing_candidate_count + 1}-{slugify(trigger_signature)}"
     candidate = {
         "id": candidate_id,
@@ -1428,12 +1440,16 @@ def gepa_escalation_report(
         "exhausted_lanes": sorted(exhausted),
         "measurement_artifact": artifact,
         "actionable_side_information": asi,
+        "actionable_triggers": sorted(actionable_trigger_names),
+        "repeated_non_promotable_target": repeated_non_promotable_target,
         "latest_certification_healthy": latest_certified,
         "next": (
             "run_existing_gepa_policy_canary"
             if active_canary
             else "continue_default_supervisor_route_after_frontier_certification"
             if latest_certified
+            else "suppress_repeated_gepa_canaries_until_policy_patch"
+            if repeated_non_promotable_target
             else ("write_canary_candidate" if needed else "continue_default_supervisor_route")
         ),
     }
