@@ -1482,6 +1482,43 @@ def compact_duplicate_calibration_stage_tasks(root: Path) -> int:
     return compacted
 
 
+def compact_stale_calibration_canary_tasks(root: Path) -> int:
+    """Complete canary tasks once their downstream memory-stage is already ready."""
+    active_stages = active_calibration_memory_stage_tasks(root)
+    if not active_stages:
+        return 0
+    tasks = read_jsonl(root / "tasks.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    compacted = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        task_id = str(task.get("id", ""))
+        action = str(task.get("supervisor_action", ""))
+        if action != "drafter-calibration-canary" and "drafter-calibration-canary" not in task_id:
+            continue
+        task["status"] = "done"
+        task["completed_at"] = now
+        task["supervisor_summary"] = {
+            "reason": "stale calibration canary suppressed because memory-stage is already ready",
+            "active_stage_task_ids": [str(item.get("id", "")) for item in active_stages],
+        }
+        compacted += 1
+    if compacted:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": now,
+                "task_id": "calibration-canary-compaction",
+                "finding": "completed stale calibration canary tasks after a downstream memory-stage was queued",
+                "evidence": {"compacted": compacted},
+                "next": "execute the queued calibration memory-stage",
+            },
+        )
+    return compacted
+
+
 def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     path = root / "tasks.jsonl"
     existing = read_jsonl(path)
@@ -2798,6 +2835,7 @@ def quality_review(args: argparse.Namespace) -> int:
     ensure_research_state(root)
     ensure_lane_contracts(root)
     compacted_stage_tasks = compact_duplicate_calibration_stage_tasks(root)
+    compacted_canary_tasks = compact_stale_calibration_canary_tasks(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     raw_blocked = [row for row in recent if row.get("status") == "blocked"]
@@ -3215,6 +3253,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "task_contract": contract,
         "duplicate_stage_tasks": duplicate_stage_tasks,
         "compacted_stage_tasks": compacted_stage_tasks,
+        "compacted_canary_tasks": compacted_canary_tasks,
         "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
         "recommendations": recommendations,
         "seeded_tasks": seeded,

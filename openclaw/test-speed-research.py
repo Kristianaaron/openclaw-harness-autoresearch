@@ -80,6 +80,8 @@ def main() -> int:
             profile = json.loads((root / "research-profile.json").read_text(encoding="utf-8"))
             assert profile["name"] == "openclaw-speed"
             assert "decode_tps" in profile["metrics"]["primary"]
+            assert "policy-optimization" in profile["scope"]["allowed_lanes"]
+            assert "autoresearch_quality_delta" in profile["metrics"]["secondary"]
             policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
             assert "benchmark-manifest.json" in policy["immutable_paths"]
             assert "replay-buffer.jsonl" in policy["immutable_paths"]
@@ -988,6 +990,26 @@ def main() -> int:
                 root,
                 [helper.drafter_calibration_canary_task(123463, task_id="drafter-calibration-canary-suppressed")],
             ) == []
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    helper.drafter_calibration_canary_task(
+                        123463,
+                        task_id="drafter-calibration-canary-stale",
+                    ),
+                    *helper.active_calibration_memory_stage_tasks(root),
+                ],
+            )
+            assert helper.compact_stale_calibration_canary_tasks(root) == 1
+            compacted_queue = helper.read_jsonl(root / "tasks.jsonl")
+            assert any(
+                task["id"] == "drafter-calibration-canary-stale" and task["status"] == "done"
+                for task in compacted_queue
+            )
+            assert any(
+                helper.calibration_memory_stage_name(task) and task["status"] == "ready"
+                for task in compacted_queue
+            )
             helper.write_jsonl(root / "tasks.jsonl", [])
             assert helper.mark_lane_exhausted(
                 root,

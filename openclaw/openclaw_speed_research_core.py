@@ -134,6 +134,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "runtime-overhead",
             "frontier-dflash",
             "implementation-gate",
+            "policy-optimization",
             "causal-repair",
             "safety",
             "exhaustion-report",
@@ -152,6 +153,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "bottleneck_evidence",
             "memory_guard_replay",
             "promotion_confidence",
+            "autoresearch_quality_delta",
         ],
     },
     "implementation_contract": {
@@ -583,6 +585,18 @@ def ensure_research_state(root: Path) -> None:
     except (OSError, json.JSONDecodeError):
         profile = {}
     if isinstance(profile, dict):
+        scope = profile.setdefault("scope", {})
+        if isinstance(scope, dict):
+            changed_profile = False
+            lanes = scope.setdefault("allowed_lanes", [])
+            default_lanes = DEFAULT_RESEARCH_PROFILE.get("scope", {}).get("allowed_lanes", [])
+            if isinstance(lanes, list) and isinstance(default_lanes, list):
+                for item in default_lanes:
+                    if item not in lanes:
+                        lanes.append(item)
+                        changed_profile = True
+            if changed_profile:
+                profile_path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         metrics = profile.setdefault("metrics", {})
         if isinstance(metrics, dict):
             changed_profile = False
