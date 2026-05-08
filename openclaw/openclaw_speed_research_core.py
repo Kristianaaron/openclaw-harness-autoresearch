@@ -1638,6 +1638,32 @@ def task_contract_report(root: Path) -> dict[str, Any]:
     }
 
 
+def is_calibration_canary_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    return (
+        task.get("supervisor_action") == "drafter-calibration-canary"
+        or "drafter-calibration-canary" in task_id
+        or "openclaw-speed-research drafter-calibration-canary" in str(task.get("next_action", ""))
+    )
+
+
+def is_calibration_memory_stage_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    return (
+        task.get("supervisor_action") == "drafter-calibration-memory-stage"
+        or "drafter-calibration-memory-stage" in task_id
+        or "openclaw-speed-research drafter-calibration-memory-stage" in str(task.get("next_action", ""))
+    )
+
+
+def has_active_calibration_memory_stage(root: Path) -> bool:
+    return any(
+        is_calibration_memory_stage_task(task)
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    )
+
+
 def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     rows = all_result_rows(root)
     recent = rows[-120:]
@@ -1667,6 +1693,12 @@ def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
             reasons.append("initial decode baseline is required before higher-risk tuning")
     if lane in {"drafter-alignment", "runtime-overhead", "frontier-dflash"}:
         score += 8
+    if is_calibration_memory_stage_task(task):
+        score += 80
+        reasons.append("calibration stage is the next prerequisite after a passing canary")
+    elif is_calibration_canary_task(task) and has_active_calibration_memory_stage(root):
+        score -= 90
+        reasons.append("calibration canary is suppressed while a memory-stage task is ready")
     if "tests_pass" in guard_checks:
         score += 4
     if "memory_gate" in guard_checks or "memory_ok" in guard_checks:
@@ -2172,6 +2204,9 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
     contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]
     if contract_clean:
         filtered = contract_clean
+    stage_ready = [task for task in filtered if is_calibration_memory_stage_task(task)]
+    if stage_ready:
+        filtered = [task for task in filtered if not is_calibration_canary_task(task)]
     journal = read_jsonl(root / "journal.jsonl")
     lane_scores: dict[str, float] = {}
     for entry in journal[-250:]:

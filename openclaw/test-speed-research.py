@@ -984,6 +984,46 @@ def main() -> int:
             assert helper.compact_duplicate_calibration_stage_tasks(root) == 1
             assert helper.calibration_stage_duplicate_count(root) == 0
             assert len(helper.active_calibration_memory_stage_tasks(root)) == 1
+            assert helper.filter_seedable_tasks(
+                root,
+                [helper.drafter_calibration_canary_task(123463, task_id="drafter-calibration-canary-suppressed")],
+            ) == []
+            helper.write_jsonl(root / "tasks.jsonl", [])
+            assert helper.mark_lane_exhausted(
+                root,
+                lane="frontier-dflash",
+                reason="regression-test dflash blocked",
+                evidence={"source": "unit-test"},
+            ) is False
+            blocked_fallback = helper.filter_seedable_tasks(
+                root,
+                [
+                    helper.lane_contract_decode_task(
+                        123464,
+                        task_id="lane-contract-decode-remeasure-dflash-block-123464",
+                        priority=99,
+                        reason="unit-test",
+                    )
+                ],
+            )
+            assert blocked_fallback == []
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    helper.drafter_calibration_memory_stage_task(
+                        123465,
+                        stage="metadata",
+                        task_id="drafter-calibration-memory-stage-metadata-ready",
+                        bounded_command=["true"],
+                    )
+                ],
+            )
+            assert helper.lane_contract_fallback_tasks(
+                root,
+                [],
+                123466,
+                reason="unit-test dflash blocked with active calibration stage",
+            ) == []
             helper.write_jsonl(root / "tasks.jsonl", [])
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths

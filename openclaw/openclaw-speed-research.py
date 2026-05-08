@@ -2306,7 +2306,19 @@ def lane_contract_fallback_tasks(
                 )
             )
     if not tasks:
-        suffix = "calibration-block" if calibration_blocker else "dflash-block" if dflash_blocked else "ready-work-gap"
+        if dflash_blocked and active_calibration_memory_stage_tasks(root):
+            append_jsonl(
+                root / "findings.jsonl",
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "lane-contract-dflash-fallback-suppressed",
+                    "finding": "DFlash is blocked and calibration memory-stage work is already ready; suppress decode remeasure churn.",
+                    "reason": reason,
+                    "next": "run_active_calibration_memory_stage",
+                },
+            )
+            return []
+        suffix = "calibration-block" if calibration_blocker else "ready-work-gap"
         tasks.append(
             lane_contract_decode_task(
                 timestamp,
@@ -2331,6 +2343,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     active_calibration_stages = {
         calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
     }
+    has_active_calibration_stage = bool(active_calibration_stages - {""})
     completed_calibration_stages = completed_calibration_memory_stages(root)
     seedable: list[dict[str, Any]] = []
     for task in tasks:
@@ -2346,6 +2359,11 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             lane == "frontier-dflash"
             or action == "dflash-compatibility-gate"
             or "dflash-compatibility" in task_id
+            or "lane-contract-decode-remeasure-dflash-block" in task_id
+        ):
+            continue
+        if has_active_calibration_stage and (
+            action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
         ):
             continue
         calibration_blocked_action = action == "drafter-calibration-run" or "drafter-calibration-run" in task_id
@@ -2638,6 +2656,7 @@ def research_quality_scorecard(
         for task_id in routed_ids
         for fragment in (
             "drafter-calibration-canary",
+            "drafter-calibration-memory-stage",
             "drafter-trace-gate",
             "drafter-fit",
             "runtime-overhead",
@@ -2853,7 +2872,23 @@ def quality_review(args: argparse.Namespace) -> int:
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     active_task_ids = [str(task.get("id", "")) for task in active_tasks]
-    has_calibration_canary_route = any("drafter-calibration-canary" in task_id for task_id in active_task_ids)
+    has_calibration_stage_route = any(
+        str(task.get("supervisor_action", "")) == "drafter-calibration-memory-stage"
+        or "drafter-calibration-memory-stage" in str(task.get("id", ""))
+        for task in active_tasks
+    )
+    has_calibration_canary_route = (
+        not has_calibration_stage_route
+        and any("drafter-calibration-canary" in task_id for task_id in active_task_ids)
+    )
+    has_calibration_route = has_calibration_canary_route or has_calibration_stage_route
+    repeated_canary_ready_no_stage = [
+        row
+        for row in recent[-60:]
+        if row.get("run_id", "").startswith("drafter-calibration-canary-")
+        and "decision=ready-for-bounded-calibration" in row.get("notes", "")
+        and "seeded_stage_task=0" in row.get("notes", "")
+    ]
     exhausted = exhausted_lanes(root)
     active_lanes = {
         str(task.get("lane", ""))
@@ -2876,7 +2911,7 @@ def quality_review(args: argparse.Namespace) -> int:
     recommendations: list[str] = []
     gates: dict[str, Any] = {
         "no_blocked_rows": not blocked,
-        "required_block_coverage": not missing_required_blocks or has_calibration_canary_route,
+        "required_block_coverage": not missing_required_blocks or has_calibration_route,
         "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
         "has_frontier_next_lane": bool(frontier_ready),
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
@@ -2906,13 +2941,18 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append("repeated DFlash synthesis detected without new compatibility evidence; route to prerequisite evidence or retire the lane.")
     if blocked:
         quality_score -= 30
-    if missing_required_blocks and not has_calibration_canary_route:
+    if len(repeated_canary_ready_no_stage) >= 3 and has_calibration_stage_route:
+        quality_score -= 25
+        recommendations.append(
+            "calibration canary has repeatedly confirmed readiness without advancing; run the queued memory-stage before any new canary."
+        )
+    if missing_required_blocks and not has_calibration_route:
         quality_score -= 20
         recommendations.append(
             "coverage gap: rerun a bounded sweep before trusting conclusions; missing blocks="
             + ",".join(missing_required_blocks)
         )
-    if len(sweep_rows) < int(args.min_sweeps) and not has_calibration_canary_route:
+    if len(sweep_rows) < int(args.min_sweeps) and not has_calibration_route:
         quality_score -= 15
         recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
         if should_seed_action(root, "review-drafter-sweep-next", recent_rows=20):
@@ -3090,7 +3130,7 @@ def quality_review(args: argparse.Namespace) -> int:
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
     verdict = "healthy"
-    coverage_gap = bool(missing_required_blocks and not has_calibration_canary_route)
+    coverage_gap = bool(missing_required_blocks and not has_calibration_route)
     if exhaustion_candidate:
         verdict = "exhaustion-candidate"
     elif coverage_gap or blocked:
@@ -3175,6 +3215,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "task_contract": contract,
         "duplicate_stage_tasks": duplicate_stage_tasks,
         "compacted_stage_tasks": compacted_stage_tasks,
+        "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
         "recommendations": recommendations,
         "seeded_tasks": seeded,
     }

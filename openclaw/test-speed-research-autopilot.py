@@ -487,6 +487,38 @@ def main() -> int:
         assert advancement["sample_count"] == 3
         assert advancement["mean_decode_tps"] == 14.567
         assert helper.select_next_task(helper.WORKSPACE)["id"] == "mtp-acceptance-log-review"
+        original_tasks = helper.read_jsonl(helper.TASKS)
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "review-drafter-calibration-canary-test",
+                    "status": "ready",
+                    "priority": 98,
+                    "lane": "drafter-alignment",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-calibration-canary",
+                    "next_action": "openclaw-speed-research drafter-calibration-canary",
+                },
+                {
+                    "id": "drafter-calibration-memory-stage-metadata-test",
+                    "status": "ready",
+                    "priority": 98,
+                    "lane": "drafter-alignment",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-calibration-memory-stage",
+                    "stage": "metadata",
+                    "next_action": "openclaw-speed-research drafter-calibration-memory-stage --stage metadata",
+                },
+            ],
+        )
+        assert helper.select_next_task(helper.WORKSPACE)["id"] == "drafter-calibration-memory-stage-metadata-test"
+        assert helper.suppress_ready_calibration_canaries("unit-test-stage-ready", {"status": "keep"}) == 1
+        assert all(
+            task["status"] == "done" or task["id"] == "drafter-calibration-memory-stage-metadata-test"
+            for task in helper.read_jsonl(helper.TASKS)
+        )
+        helper.write_jsonl(helper.TASKS, original_tasks)
         selected_tool = helper.select_next_task(helper.WORKSPACE)
         before_claim = helper.durable_snapshot()
         selected_tool = helper.claim_task_evidence_window(helper.WORKSPACE, selected_tool, helper.results_line_count())
@@ -1314,6 +1346,20 @@ def main() -> int:
         }
         assert helper.is_supervisor_drafter_calibration_canary_task(canary_task)
         assert helper.task_runs_without_model(canary_task)
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                canary_task,
+                {
+                    "id": "calibration-stage-ready",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-calibration-memory-stage",
+                    "stage": "metadata",
+                    "next_action": "openclaw-speed-research drafter-calibration-memory-stage --stage metadata",
+                },
+            ],
+        )
         code, issue = helper.run_supervisor_drafter_calibration_canary_task(
             Namespace(research_helper_bin=str(canary_helper)),
             14,
@@ -1323,6 +1369,13 @@ def main() -> int:
         )
         assert code == 0
         assert issue == ""
+        queue_after_canary = helper.read_jsonl(helper.TASKS)
+        assert any(task["id"] == "calibration-stage-ready" and task["status"] == "ready" for task in queue_after_canary)
+        assert all(
+            task["status"] == "done"
+            for task in queue_after_canary
+            if helper.is_supervisor_drafter_calibration_canary_task(task)
+        )
         calibration_stage_helper = Path(tmp) / "calibration-stage-helper.py"
         calibration_stage_helper.write_text(
             "#!/usr/bin/env python3\n"

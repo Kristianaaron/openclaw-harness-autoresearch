@@ -673,6 +673,47 @@ def is_supervisor_drafter_calibration_memory_stage_task(task: dict[str, object] 
     )
 
 
+def suppress_ready_calibration_canaries(reason: str, summary: dict[str, object]) -> int:
+    tasks = read_jsonl(TASKS)
+    has_stage = any(
+        task.get("status", "ready") in {"ready", "rework"}
+        and is_supervisor_drafter_calibration_memory_stage_task(task)
+        for task in tasks
+    )
+    if not has_stage:
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    suppressed = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if not is_supervisor_drafter_calibration_canary_task(task):
+            continue
+        task["status"] = "done"
+        task["completed_at"] = now
+        task["completion_commit"] = current_commit()
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": reason,
+            "suppressed_by": "active_calibration_memory_stage",
+            "source_summary": summary,
+        }
+        suppressed += 1
+    if suppressed:
+        write_jsonl(TASKS, tasks)
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": now,
+                "task_id": "calibration-canary-suppression",
+                "finding": "suppressed ready calibration canaries because a calibration memory-stage is now queued",
+                "suppressed": suppressed,
+                "next": "select_calibration_memory_stage",
+            },
+        )
+    return suppressed
+
+
 def is_supervisor_dflash_compatibility_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -2649,7 +2690,10 @@ def run_supervisor_drafter_calibration_canary_task(
             commit=current_commit(),
             notes=clean_tsv(reason),
         )
-    complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
+    summary = parsed or {"reason": reason}
+    complete_supervisor_task(task, status=status, summary=summary, commit=current_commit())
+    if status == "keep" and str(parsed.get("decision", "")) == "ready-for-bounded-calibration":
+        suppress_ready_calibration_canaries("ready-for-bounded-calibration", summary)
     return 0, "" if status == "keep" else reason
 
 
