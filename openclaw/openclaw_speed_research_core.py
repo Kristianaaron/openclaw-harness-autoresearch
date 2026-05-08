@@ -1143,6 +1143,159 @@ def count_low_quality_rows(rows: list[dict[str, str]]) -> int:
     return count
 
 
+def active_gepa_policy_canary_exists(root: Path) -> bool:
+    for task in read_jsonl(root / "tasks.jsonl"):
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("supervisor_action") == "gepa-policy-canary":
+            return True
+        if str(task.get("id", "")).startswith("gepa-policy-canary-"):
+            return True
+    return False
+
+
+def gepa_actionable_side_information(
+    root: Path,
+    rows: list[dict[str, str]],
+    *,
+    artifact: dict[str, Any],
+    exhausted: set[str],
+) -> dict[str, Any]:
+    low_quality_rows = [
+        row
+        for row in rows
+        if row.get("target") == "autoresearch-quality"
+        and (row.get("status") == "blocked" or (parse_float(parse_note_fields(row.get("notes", "")).get("score")) or 100) < 70)
+    ]
+    empty_synthesis_rows = [
+        row
+        for row in rows
+        if row.get("target") == "synthesis"
+        and "seeded_tasks=0" in row.get("notes", "")
+        and "deliberate_actions=deliberate-" not in row.get("notes", "")
+        and "contract_actions=" in row.get("notes", "")
+    ]
+    handoff_blocked_rows = [
+        row
+        for row in rows
+        if row.get("target") == "autoresearch-implementation-handoff" and row.get("status") == "blocked"
+    ]
+    frontier_blocked_rows = [
+        row
+        for row in rows
+        if row.get("target") == "autoresearch-frontier-eval" and row.get("status") == "blocked"
+    ]
+    latest_quality_fields = parse_note_fields(low_quality_rows[-1].get("notes", "")) if low_quality_rows else {}
+    latest_frontier_fields = parse_note_fields(frontier_blocked_rows[-1].get("notes", "")) if frontier_blocked_rows else {}
+    return {
+        "empty_synthesis_rows": len(empty_synthesis_rows),
+        "low_quality_rows": len(low_quality_rows),
+        "handoff_blocked_rows": len(handoff_blocked_rows),
+        "frontier_blocked_rows": len(frontier_blocked_rows),
+        "exhausted_lanes": sorted(exhausted),
+        "latest_quality": {
+            "score": latest_quality_fields.get("score", ""),
+            "verdict": latest_quality_fields.get("verdict", ""),
+            "recommendation": latest_quality_fields.get("recommendation", ""),
+        },
+        "latest_frontier": {
+            "overall": latest_frontier_fields.get("overall", ""),
+            "readiness": latest_frontier_fields.get("readiness", ""),
+            "gaps": latest_frontier_fields.get("gaps", ""),
+        },
+        "measurement_artifact": {
+            "artifact_suspected": bool(artifact.get("artifact_suspected")),
+            "reason": artifact.get("reason", ""),
+        },
+    }
+
+
+def gepa_policy_delta_instruction(candidate: dict[str, Any]) -> str:
+    """Turn GEPA side information into one narrow policy mutation prompt.
+
+    GEPA's useful signal is not the scalar score by itself; it is the textual
+    feedback from failed trajectories. Keep that feedback executable here by
+    asking for one bounded policy delta, not another broad research essay.
+    """
+    asi = candidate.get("actionable_side_information")
+    if not isinstance(asi, dict):
+        asi = {}
+    artifact = asi.get("measurement_artifact")
+    if not isinstance(artifact, dict):
+        artifact = {}
+    clauses: list[str] = []
+    if int(asi.get("empty_synthesis_rows") or 0) > 0:
+        clauses.append(
+            "Reject empty synthesis as non-progress; synthesis must seed one measurable task, "
+            "one GEPA canary, or one terminal exhaustion report."
+        )
+    if int(asi.get("low_quality_rows") or 0) > 0:
+        clauses.append(
+            "Use the latest quality-review recommendation as feedback and route the next action "
+            "toward the failing scorecard dimension instead of repeating generic synthesis."
+        )
+    if int(asi.get("handoff_blocked_rows") or 0) > 0:
+        clauses.append(
+            "When implementation handoff is blocked, seed exactly one scoped prerequisite or bridge "
+            "with acceptance and rollback, then suppress duplicate bridge tasks until it runs."
+        )
+    if int(asi.get("frontier_blocked_rows") or 0) > 0:
+        clauses.append(
+            "When frontier evaluation is blocked, convert the named gap into one deterministic "
+            "repair task before scheduling more model-bound research."
+        )
+    if artifact.get("artifact_suspected"):
+        clauses.append(
+            "Separate backend server tok/s from wall-clock proxy overhead before making any speed "
+            "claim or promoting any decode-speed patch."
+        )
+    if asi.get("exhausted_lanes"):
+        clauses.append(
+            "Respect exhausted lanes until their prerequisites change; do not reseed equivalent "
+            "DFlash, block-sweep, or drafter tasks just to create activity."
+        )
+    if not clauses:
+        clauses.append(
+            "Mutate one reviewer or routing policy using recent trajectory feedback while preserving "
+            "frozen benchmark and replay gates."
+        )
+    clauses.append(
+        "Preserve OpenClaw-only scope, the selected model, canary-first promotion, replay checks, "
+        "memory/Metal guards, and explicit rollback."
+    )
+    return " ".join(clauses)
+
+
+def latest_certification_is_healthy(rows: list[dict[str, str]]) -> bool:
+    latest_quality: dict[str, str] | None = None
+    latest_frontier: dict[str, str] | None = None
+    for row in rows:
+        if row.get("target") == "autoresearch-quality":
+            latest_quality = row
+        elif row.get("target") == "autoresearch-frontier-eval":
+            latest_frontier = row
+    if not latest_quality or not latest_frontier:
+        return False
+
+    quality_fields = parse_note_fields(latest_quality.get("notes", ""))
+    frontier_fields = parse_note_fields(latest_frontier.get("notes", ""))
+    try:
+        quality_score = float(quality_fields.get("score", "0") or 0)
+        quality_overall = float(quality_fields.get("scorecard_overall", "0") or 0)
+        frontier_overall = float(frontier_fields.get("overall", "0") or 0)
+    except ValueError:
+        return False
+    return (
+        latest_quality.get("status") == "keep"
+        and quality_fields.get("verdict") == "healthy"
+        and quality_score >= 95
+        and quality_overall >= 95
+        and latest_frontier.get("status") == "keep"
+        and frontier_overall >= 9.5
+        and frontier_fields.get("readiness") == "frontier"
+    )
+
+
 def choose_gepa_policy_target(
     *,
     blocked_rows: int,
@@ -1172,14 +1325,21 @@ def gepa_escalation_report(
     min_trajectory: int = 2,
     min_low_quality: int = 2,
 ) -> dict[str, Any]:
-    """Detect when normal routing is stuck and draft a bounded policy canary.
+    """Detect when normal routing is stuck and draft a bounded GEPA policy canary.
 
-    This is GEPA-inspired: optimize textual policies/rubrics from trajectory
-    evidence. It intentionally avoids a live dependency or runtime mutation.
+    This mirrors GEPA's control shape locally: collect execution traces and
+    textual feedback, mutate one text policy candidate, and let promotion gates
+    decide whether it joins the retained policy pool. It intentionally avoids
+    live runtime mutation or model changes.
     """
     ensure_research_state(root)
     rows = all_result_rows(root)[-max(1, recent_rows) :]
-    blocked = [row for row in rows if row.get("status") == "blocked"]
+    blocked = [
+        row
+        for row in rows
+        if row.get("status") == "blocked"
+        and row.get("target") not in {"autoresearch-quality", "autoresearch-frontier-eval"}
+    ]
     low_quality = count_low_quality_rows(rows)
     tasks = read_jsonl(root / "tasks.jsonl")
     rework = [
@@ -1190,6 +1350,7 @@ def gepa_escalation_report(
     trajectory = read_jsonl(root / "trajectory-corpus.jsonl")[-max(1, recent_rows) :]
     artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
     exhausted = exhausted_lanes(root)
+    asi = gepa_actionable_side_information(root, rows, artifact=artifact, exhausted=exhausted)
     triggers: list[dict[str, Any]] = []
     if len(blocked) >= min_blocked:
         triggers.append({"name": "blocked_rows", "value": len(blocked), "threshold": min_blocked})
@@ -1210,25 +1371,35 @@ def gepa_escalation_report(
         artifact_suspected=bool(artifact.get("artifact_suspected")),
         exhausted_count=len(exhausted),
     )
-    promoted_targets = {
-        str(row.get("target", ""))
-        for row in read_jsonl(root / "gepa-promotions.jsonl")[-5:]
-        if row.get("promoted")
-    }
     needed = bool(triggers)
-    if target in promoted_targets:
+    active_canary = active_gepa_policy_canary_exists(root)
+    latest_certified = latest_certification_is_healthy(rows)
+    if active_canary or latest_certified:
         needed = False
     trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
-    candidate_id = f"gepa-policy-canary-{slugify(target)}-{slugify(trigger_signature)}"
+    existing_candidate_count = sum(
+        1
+        for candidate in read_jsonl(root / "gepa-candidates.jsonl")
+        if str((candidate.get("candidate") or {}).get("target") or candidate.get("target") or "") == target
+    )
+    candidate_id = f"gepa-policy-canary-{slugify(target)}-{existing_candidate_count + 1}-{slugify(trigger_signature)}"
     candidate = {
         "id": candidate_id,
         "target": target,
         "allowed_targets": list(GEPA_POLICY_TARGETS),
-        "policy_kind": "gepa-inspired-text-policy-canary",
+        "policy_kind": "gepa-text-policy-canary",
         "objective": (
             "Improve autoresearch routing, rubric quality, and implementation handoff using "
             "recent blocked/rework trajectories while preserving OpenClaw runtime behavior."
         ),
+        "actionable_side_information": asi,
+        "pareto_objectives": [
+            "raise_quality_scorecard",
+            "reduce_empty_synthesis_rows",
+            "preserve_memory_safety",
+            "preserve_implementation_handoff",
+            "increase_decode_tps_when_safe",
+        ],
         "constraints": [
             "OpenClaw only; do not touch opencode.",
             "Do not change the selected model.",
@@ -1256,9 +1427,13 @@ def gepa_escalation_report(
         "trajectory_cases": len(trajectory),
         "exhausted_lanes": sorted(exhausted),
         "measurement_artifact": artifact,
+        "actionable_side_information": asi,
+        "latest_certification_healthy": latest_certified,
         "next": (
-            "continue_default_supervisor_route_after_recent_policy_promotion"
-            if target in promoted_targets
+            "run_existing_gepa_policy_canary"
+            if active_canary
+            else "continue_default_supervisor_route_after_frontier_certification"
+            if latest_certified
             else ("write_canary_candidate" if needed else "continue_default_supervisor_route")
         ),
     }
@@ -1280,7 +1455,7 @@ def seed_gepa_canary_task(root: Path, report: dict[str, Any]) -> bool:
         "task_type": "supervisor",
         "supervisor_action": "gepa-policy-canary",
         "target": target,
-        "hypothesis": "A bounded GEPA-style policy canary can improve routing quality after repeated blocked/rework trajectories.",
+        "hypothesis": "A bounded GEPA policy canary can improve routing quality after repeated blocked/rework trajectories.",
         "metric": "autoresearch_quality_delta",
         "guard_checks": [
             "no_runtime_mutation",
@@ -1299,7 +1474,7 @@ def seed_gepa_canary_task(root: Path, report: dict[str, Any]) -> bool:
             {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "task_id": task_id,
-                "finding": "GEPA-style supervisor escalation seeded a bounded policy canary task",
+                "finding": "GEPA supervisor escalation seeded a bounded policy canary task",
                 "evidence": report,
                 "next": "run_gepa_policy_canary",
             },
@@ -1314,7 +1489,7 @@ def write_gepa_policy_canary(root: Path, task: dict[str, Any]) -> dict[str, Any]
         candidate = {
             "id": str(task.get("id", "gepa-policy-canary")),
             "target": str(task.get("target", "program.md")),
-            "policy_kind": "gepa-inspired-text-policy-canary",
+            "policy_kind": "gepa-text-policy-canary",
             "constraints": ["canary_only"],
             "promotion_gates": ["replay_checks_ok"],
         }
@@ -1336,11 +1511,9 @@ def write_gepa_policy_canary(root: Path, task: dict[str, Any]) -> dict[str, Any]
         "proposed_policy_delta": {
             "target": target,
             "change_type": "text_policy_candidate",
-            "instruction": (
-                "Use the recent trajectory failures to tighten one policy/rubric decision. "
-                "The candidate must make the next cycle more deterministic without widening file access, "
-                "changing the model, or bypassing canary/promotion gates."
-            ),
+            "actionable_side_information": candidate.get("actionable_side_information", {}),
+            "pareto_objectives": candidate.get("pareto_objectives", []),
+            "instruction": gepa_policy_delta_instruction(candidate),
         },
         "promotion": {
             "auto_promote": False,

@@ -184,7 +184,7 @@ def main() -> int:
             assert "## Implementation Gate" in program
             assert "implementation-skill.md" in program
             assert "## Dynamic Policy Optimization" in program
-            assert "GEPA-style policy optimization is a supervisor reflex" in program
+            assert "GEPA policy optimization is a supervisor reflex" in program
             implementation = (root / "implementation-skill.md").read_text(encoding="utf-8")
             assert "OpenClaw Speed Implementation Skill" in implementation
             assert "Do not touch opencode" in implementation
@@ -885,9 +885,11 @@ def main() -> int:
             assert "gepa-policy-canary" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert helper.gepa_policy_canary(Namespace(task_id=gepa["candidate"]["id"])) == 0
             assert list((root / "gepa-canaries").glob("*.json"))
-            assert "GEPA policy candidates remain canary-only" in (root / "gepa-candidates.jsonl").read_text(
-                encoding="utf-8"
-            )
+            gepa_candidates_text = (root / "gepa-candidates.jsonl").read_text(encoding="utf-8")
+            assert "GEPA policy candidates remain canary-only" in gepa_candidates_text
+            assert "actionable_side_information" in gepa_candidates_text
+            assert "pareto_objectives" in gepa_candidates_text
+            assert "Preserve OpenClaw-only scope" in gepa_candidates_text
             assert helper.gepa_policy_promote(Namespace(min_candidates=99)) == 0
             assert root.joinpath("results.tsv").read_text(encoding="utf-8").splitlines()[-1].split("\t")[2] == "keep"
             for index in range(3):

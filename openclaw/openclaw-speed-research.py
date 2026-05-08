@@ -1009,13 +1009,13 @@ Before pushing, run a staged diff secret scan and confirm no `.env`, passwords, 
 def dynamic_policy_optimization_section() -> str:
     return """## Dynamic Policy Optimization
 
-GEPA-style policy optimization is a supervisor reflex, not a default mode.
+GEPA policy optimization is a supervisor reflex, not a default mode.
 
 The deterministic supervisor may run `gepa-escalation` after quality and frontier review. It should only escalate when recent evidence shows repeated blocked rows, rework tasks, trajectory failures, low-quality reviews, or measurement artifacts.
 
 Escalation creates a bounded policy canary for `program.md`, `STRATEGY.md`, `insight-rubric.json`, `implementation-skill.md`, or `tasks.jsonl`. It must not mutate live runtime code, model profiles, opencode, or the selected model.
 
-Promotion requires replay checks, quality review, no new broad tool commands, no memory/Metal regression, and the existing patch/approval gates. If those gates are not met, keep the canary as evidence and continue the default supervisor route.
+The canary must include actionable side information from actual failures, explicit Pareto objectives, and one narrow text-policy delta. Promotion requires replay checks, quality review, no new broad tool commands, no memory/Metal regression, and the existing patch/approval gates. If those gates are not met, keep the canary as evidence and continue the default supervisor route.
 """
 
 
@@ -1349,6 +1349,47 @@ def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         and not is_certification_blocked_row(row)
         and not is_known_terminal_calibration_blocked_row(row)
     ]
+
+
+def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return blockers that are still relevant inside the review window.
+
+    Failed handoff/bridge rows are useful evidence, but once a later handoff
+    audit passes with a clean deterministic task, those older rows are resolved
+    debt. Keeping them as active blockers makes the reviewer look broken and
+    drives duplicate repair work.
+    """
+    blocked = actionable_blocked_rows(rows)
+    latest_clean_handoff_index = -1
+    for index, row in enumerate(rows):
+        if row.get("target") != "autoresearch-implementation-handoff":
+            continue
+        if row.get("status") != "keep":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("ok") not in {"True", "true"}:
+            continue
+        try:
+            score = float(fields.get("score", "0") or 0)
+        except ValueError:
+            score = 0.0
+        if score >= 90:
+            latest_clean_handoff_index = index
+
+    if latest_clean_handoff_index < 0:
+        return blocked
+
+    unresolved: list[dict[str, str]] = []
+    for index, row in enumerate(rows):
+        if row not in blocked:
+            continue
+        if index < latest_clean_handoff_index and (
+            row.get("target") == "autoresearch-implementation-handoff"
+            or row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        ):
+            continue
+        unresolved.append(row)
+    return unresolved
 
 
 def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
@@ -3026,7 +3067,7 @@ def quality_review(args: argparse.Namespace) -> int:
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     raw_blocked = [row for row in recent if row.get("status") == "blocked"]
-    blocked = actionable_blocked_rows(recent)
+    blocked = unresolved_actionable_blocked_rows(recent)
     certification_blocked = [row for row in raw_blocked if is_certification_blocked_row(row)]
     decode_signals = [
         decode_measurement_signal(row)
@@ -3559,8 +3600,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     replay = replay_checks(root)
 
-    blocked = actionable_blocked_rows(active_recent)
-    historical_blocked = actionable_blocked_rows(recent)
+    blocked = unresolved_actionable_blocked_rows(active_recent)
+    historical_blocked = unresolved_actionable_blocked_rows(recent)
     memory_blocks = [
         row for row in blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
     ]
@@ -3794,7 +3835,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         strengths.append("frontier lanes remain available: " + ",".join(sorted(frontier_lanes)))
     if any(row.get("run_id", "").startswith("gepa-policy-promotion-") for row in recent):
         scores["self_improvement"] += 0.2
-        strengths.append("GEPA-style reviewer policy path is active")
+        strengths.append("GEPA reviewer policy path is active")
     if decode_mean is not None and decode_mean < 20:
         gaps.append(f"decode still below practical floor: {decode_mean} tok/s")
         if not deterministic_ready:
@@ -4086,7 +4127,7 @@ def gepa_escalation(args: argparse.Namespace) -> int:
         {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "task_id": "gepa-escalation",
-            "finding": "supervisor checked whether GEPA-style policy optimization is needed",
+            "finding": "supervisor checked whether GEPA policy optimization is needed",
             "evidence": artifact,
             "next": artifact["next"],
         },
@@ -5560,12 +5601,32 @@ def synthesize(args: argparse.Namespace) -> int:
             reason="Synthesis had no seedable implementation or deliberate tasks",
         )
         seeded = upsert_tasks(root, contract_tasks) if contract_tasks else 0
+    gepa_report: dict[str, Any] = {}
+    gepa_action = ""
+    if seeded == 0:
+        gepa_report = gepa_escalation_report(
+            root,
+            recent_rows=160,
+            min_blocked=1,
+            min_rework=1,
+            min_trajectory=1,
+            min_low_quality=1,
+        )
+        if seed_gepa_canary_task(root, gepa_report):
+            gepa_action = str((gepa_report.get("candidate") or {}).get("id", ""))
+            seeded = 1
+    status = "keep" if seeded else "blocked"
+    progress_note = (
+        "seeded measurable follow-up tasks"
+        if seeded
+        else "could not seed a safe follow-up task; supervisor must repair the routing contract"
+    )
     append_jsonl(
         root / "findings.jsonl",
         {
             "timestamp": generated_at,
             "task_id": "synthesize-speed-ideas",
-            "finding": "benchmark queue exhausted; synthesized ranked speed ideas and seeded measurable follow-up tasks",
+            "finding": f"benchmark queue exhausted; synthesized ranked speed ideas and {progress_note}",
             "ideas": [
                 {
                     "id": idea["id"],
@@ -5580,6 +5641,8 @@ def synthesize(args: argparse.Namespace) -> int:
             ],
             "deliberate_actions": [task["id"] for task in deliberate_tasks],
             "contract_actions": [task["id"] for task in contract_tasks],
+            "gepa_action": gepa_action,
+            "gepa_report": gepa_report,
             "seeded_tasks": seeded,
             "kind": args.kind,
         },
@@ -5587,30 +5650,33 @@ def synthesize(args: argparse.Namespace) -> int:
     append_result(
         root,
         run_id=f"synthesis-{int(time.time())}",
-        status="keep",
+        status=status,
         target="synthesis",
         hypothesis="exhausted benchmark queues must generate ranked speed ideas and next tasks",
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind} "
             f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)} "
-            f"contract_actions={','.join(task['id'] for task in contract_tasks)}"
+            f"contract_actions={','.join(task['id'] for task in contract_tasks)} "
+            f"gepa_action={gepa_action}"
         ),
     )
     print(
         json.dumps(
             {
-                "ok": True,
+                "ok": bool(seeded),
                 "ideas": len(ideas),
                 "seeded_tasks": seeded,
                 "deliberate_actions": [task["id"] for task in deliberate_tasks],
                 "contract_actions": [task["id"] for task in contract_tasks],
+                "gepa_action": gepa_action,
+                "status": status,
                 "ideas_path": str(ideas_path),
             },
             indent=2,
         )
     )
-    return 0
+    return 0 if seeded else 2
 
 
 def implementation_handoff_audit(args: argparse.Namespace) -> int:
