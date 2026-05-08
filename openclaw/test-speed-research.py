@@ -460,8 +460,47 @@ def main() -> int:
                         assert canary_report["bounded_calibration_command"][0] == helper.calibration_python()
                         assert Path(canary_report["prompts_file"]).exists()
                         task_text = (root / "tasks.jsonl").read_text(encoding="utf-8")
-                        assert "drafter-calibration-run-" in task_text
-                        assert "openclaw-mtp-drafter-calibrate.py" in task_text
+                        assert "drafter-calibration-memory-stage-metadata-" in task_text
+                        assert "drafter-calibration-memory-stage" in task_text
+                        fake_calibrator = trace_home / "fake-calibrator.py"
+                        fake_calibrator.write_text(
+                            "#!/usr/bin/env python3\n"
+                            "import argparse, json, pathlib, time\n"
+                            "p=argparse.ArgumentParser(); p.add_argument('--output-path', required=True); "
+                            "p.add_argument('--probe-stage', required=True); p.add_argument('--target-path'); "
+                            "p.add_argument('--drafter-path'); p.add_argument('--prompts-file'); "
+                            "p.add_argument('--train-samples'); p.add_argument('--eval-samples'); "
+                            "p.add_argument('--positions-per-prompt'); p.add_argument('--steps'); "
+                            "p.add_argument('--eval-every'); p.add_argument('--min-free-mb'); "
+                            "p.add_argument('--max-compressor-mb'); p.add_argument('--max-swap-mb'); "
+                            "p.add_argument('--min-pressure-free-percent'); p.add_argument('--gpu-memory-utilization'); "
+                            "p.add_argument('--mlx-cache-gb'); a=p.parse_args(); "
+                            "out=pathlib.Path(a.output_path); out.mkdir(parents=True, exist_ok=True); "
+                            "payload={'ok': True, 'status': 'keep', 'stage': a.probe_stage, 'timestamp': int(time.time())}; "
+                            "(out / f'openclaw-calibration-probe-{a.probe_stage}.json').write_text(json.dumps(payload)); "
+                            "print(json.dumps(payload))\n",
+                            encoding="utf-8",
+                        )
+                        fake_calibrator.chmod(0o700)
+                        with patch.dict(os.environ, {"OPENCLAW_MTP_CALIBRATOR_SCRIPT": str(fake_calibrator)}, clear=False):
+                            assert helper.drafter_calibration_memory_stage(
+                                Namespace(
+                                    stage="metadata",
+                                    plan=str(plan_path),
+                                    trace_data=str(trace_output),
+                                    output_dir=str(trace_home / "drafter-fit"),
+                                    min_traces=4,
+                                    max_prompts=4,
+                                )
+                            ) == 0
+                        stage_report = json.loads(
+                            sorted((root / "benchmarks").glob("drafter-calibration-memory-stage-metadata-*.json"))[
+                                -1
+                            ].read_text(encoding="utf-8")
+                        )
+                        assert stage_report["decision"] == "advance"
+                        task_text = (root / "tasks.jsonl").read_text(encoding="utf-8")
+                        assert "drafter-calibration-memory-stage-drafter-load-" in task_text
                         fake_python = trace_home / "missing-speculative-python"
                         fake_python.write_text(
                             "#!/usr/bin/env python3\n"
@@ -489,16 +528,17 @@ def main() -> int:
                             notes="calibration memory gate blocked: after-load: free=795MB<16384MB",
                         )
                         assert helper.recent_calibration_run_hard_blocker(blocked_root) == "calibration-memory-after-load"
-                        assert not helper.should_seed_drafter_calibration_canary(blocked_root)
+                        assert helper.should_seed_drafter_calibration_canary(blocked_root)
                         assert not helper.should_seed_drafter_calibration_run(blocked_root)
                         blocked_root_contracts = helper.ensure_lane_contracts(blocked_root)
                         assert "drafter-alignment" in blocked_root_contracts["lanes"]
                         filtered_calibration = helper.filter_seedable_tasks(
                             blocked_root,
                             [
-                                helper.drafter_calibration_canary_task(
+                                helper.drafter_calibration_run_task(
                                     123456,
-                                    task_id="drafter-calibration-canary-blocked",
+                                    task_id="drafter-calibration-run-blocked",
+                                    bounded_command=["python3", "calibrate.py"],
                                 )
                             ],
                         )

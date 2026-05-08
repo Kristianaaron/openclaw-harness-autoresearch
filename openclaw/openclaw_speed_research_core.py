@@ -147,6 +147,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "server_wall_decode_gap",
             "drafter_fit_gate",
             "acceptance_delta",
+            "calibration_stage_gate",
             "compatibility_decision_then_decode_tps",
             "bottleneck_evidence",
             "memory_guard_replay",

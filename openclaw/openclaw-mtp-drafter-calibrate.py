@@ -152,12 +152,21 @@ def copy_metadata(source: Path, destination: Path) -> None:
             shutil.copy2(src, destination / name)
 
 
-def load_target_and_drafter(target_path: str, drafter_path: str) -> tuple[Any, Any, Any]:
+def load_target(target_path: str) -> tuple[Any, Any]:
     from jang_tools.loader import load_jang_vlm_model
+
+    return load_jang_vlm_model(target_path)
+
+
+def load_mtp_drafter(drafter_path: str) -> Any:
     from mlx_vlm.speculative.drafters import load_drafter
 
-    model, processor = load_jang_vlm_model(target_path)
-    drafter = load_drafter(drafter_path, kind="mtp")
+    return load_drafter(drafter_path, kind="mtp")
+
+
+def load_target_and_drafter(target_path: str, drafter_path: str) -> tuple[Any, Any, Any]:
+    model, processor = load_target(target_path)
+    drafter = load_mtp_drafter(drafter_path)
     drafter.bind(model)
     return model, processor, drafter
 
@@ -381,6 +390,95 @@ def train(args: argparse.Namespace) -> int:
     return 0
 
 
+def write_probe_artifact(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    output = Path(args.output_path).expanduser()
+    output.mkdir(parents=True, exist_ok=True)
+    stage = str(payload.get("stage", "unknown")).replace("/", "-")
+    (output / f"openclaw-calibration-probe-{stage}.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def probe_stage(args: argparse.Namespace) -> int:
+    """Run one bounded calibration readiness stage.
+
+    This keeps the overnight supervisor from jumping straight into a full
+    target+drafter training load when the previous blocker was after-load
+    memory pressure.
+    """
+    stage = args.probe_stage
+    started = time.monotonic()
+    payload: dict[str, Any] = {
+        "ok": False,
+        "stage": stage,
+        "timestamp": int(time.time()),
+        "target_path": str(Path(args.target_path).expanduser()),
+        "drafter_path": str(Path(args.drafter_path).expanduser()),
+        "memory_before_mb": memory_snapshot(),
+    }
+    require_memory_safe(args, phase=f"{stage}:preflight")
+    configure_mlx_limits(args)
+
+    if stage == "metadata":
+        target = Path(args.target_path).expanduser()
+        drafter = Path(args.drafter_path).expanduser()
+        missing = [
+            str(path)
+            for path in (
+                target / "config.json",
+                target / "tokenizer_config.json",
+                drafter / "config.json",
+            )
+            if not path.exists()
+        ]
+        if missing:
+            raise RuntimeError("calibration metadata gate blocked: missing=" + ",".join(missing))
+    elif stage == "drafter-load":
+        log("probe drafter-only load")
+        drafter = load_mtp_drafter(args.drafter_path)
+        mx.eval(drafter.parameters())
+        require_memory_safe(args, phase="drafter-load:after-drafter")
+        del drafter
+    elif stage == "target-load":
+        log("probe target-only load")
+        model, processor = load_target(args.target_path)
+        _ = processor
+        require_memory_safe(args, phase="target-load:after-target")
+        del model, processor
+    elif stage == "combined-load":
+        log("probe target+drafter load")
+        model, processor, drafter = load_target_and_drafter(args.target_path, args.drafter_path)
+        _ = processor
+        require_memory_safe(args, phase="combined-load:after-load")
+        del model, processor, drafter
+    elif stage == "micro-step":
+        args.train_samples = min(args.train_samples, 1)
+        args.eval_samples = min(args.eval_samples, 1)
+        args.positions_per_prompt = min(args.positions_per_prompt, 1)
+        args.steps = min(args.steps, 1)
+        args.eval_every = 1
+        code = train(args)
+        payload["train_returncode"] = code
+        if code != 0:
+            payload["memory_after_mb"] = memory_snapshot()
+            payload["elapsed_seconds"] = round(time.monotonic() - started, 3)
+            write_probe_artifact(args, payload)
+            return code
+    else:
+        raise RuntimeError(f"unknown calibration probe stage: {stage}")
+
+    try:
+        mx.clear_cache()
+        if hasattr(mx, "metal"):
+            mx.metal.clear_cache()
+    except Exception:
+        pass
+    payload["ok"] = True
+    payload["memory_after_mb"] = memory_snapshot()
+    payload["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    write_probe_artifact(args, payload)
+    log(json.dumps(payload, indent=2))
+    return 0
+
+
 def write_blocked(output_path: str, reason: str) -> None:
     try:
         output = Path(output_path).expanduser()
@@ -415,11 +513,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-check-every", type=int, default=2)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
+    parser.add_argument(
+        "--probe-stage",
+        choices=["metadata", "drafter-load", "target-load", "combined-load", "micro-step"],
+        default="",
+    )
     return parser.parse_args(argv)
 
 
 def run_with_args(args: argparse.Namespace) -> int:
     try:
+        if args.probe_stage:
+            return probe_stage(args)
         return train(args)
     except RuntimeError as error:
         reason = str(error)

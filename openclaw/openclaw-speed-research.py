@@ -63,6 +63,10 @@ DEFAULT_JANQ_TARGET_PATH = (
 )
 DEFAULT_MTP_DRAFT_PATH = "/Users/kristian/.openclaw/models/gemma-4-31B-it-assistant-mlx-4bit"
 DEFAULT_RUNTIME_SITE = Path.home() / ".openclaw" / "runtime" / "rapid-mlx" / "site"
+DEFAULT_MTP_CALIBRATOR_SCRIPT = (
+    "/Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py"
+)
+CALIBRATION_MEMORY_STAGES = ("metadata", "drafter-load", "target-load", "combined-load", "micro-step")
 DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
@@ -1582,6 +1586,173 @@ def drafter_calibration_run_task(
     }
 
 
+def calibration_probe_command(
+    stage: str,
+    *,
+    target_path: str,
+    drafter_path: str,
+    output_path: Path,
+    prompts_path: Path,
+) -> list[str]:
+    script = os.environ.get("OPENCLAW_MTP_CALIBRATOR_SCRIPT", DEFAULT_MTP_CALIBRATOR_SCRIPT)
+    return [
+        calibration_python(),
+        script,
+        "--target-path",
+        target_path,
+        "--drafter-path",
+        drafter_path,
+        "--output-path",
+        str(output_path),
+        "--prompts-file",
+        str(prompts_path),
+        "--train-samples",
+        "1",
+        "--eval-samples",
+        "1",
+        "--positions-per-prompt",
+        "1",
+        "--steps",
+        "1",
+        "--eval-every",
+        "1",
+        "--min-free-mb",
+        "8192",
+        "--max-compressor-mb",
+        "8192",
+        "--max-swap-mb",
+        "4096",
+        "--min-pressure-free-percent",
+        "20",
+        "--gpu-memory-utilization",
+        "0.50",
+        "--mlx-cache-gb",
+        "1",
+        "--probe-stage",
+        stage,
+    ]
+
+
+def calibration_full_run_command(
+    *,
+    target_path: str,
+    drafter_path: str,
+    output_path: Path,
+    prompts_path: Path,
+) -> list[str]:
+    script = os.environ.get("OPENCLAW_MTP_CALIBRATOR_SCRIPT", DEFAULT_MTP_CALIBRATOR_SCRIPT)
+    return [
+        calibration_python(),
+        script,
+        "--target-path",
+        target_path,
+        "--drafter-path",
+        drafter_path,
+        "--output-path",
+        str(output_path),
+        "--prompts-file",
+        str(prompts_path),
+        "--train-samples",
+        "2",
+        "--eval-samples",
+        "1",
+        "--positions-per-prompt",
+        "1",
+        "--steps",
+        "1",
+        "--eval-every",
+        "1",
+        "--min-free-mb",
+        "8192",
+        "--max-compressor-mb",
+        "8192",
+        "--max-swap-mb",
+        "4096",
+        "--min-pressure-free-percent",
+        "20",
+        "--gpu-memory-utilization",
+        "0.55",
+        "--mlx-cache-gb",
+        "2",
+    ]
+
+
+def calibration_stage_helper_command(
+    stage: str,
+    *,
+    plan: str,
+    trace_data: str,
+    output_dir: str,
+    min_traces: int = 4,
+    max_prompts: int = 6,
+) -> list[str]:
+    command = [
+        "/Users/kristian/.openclaw/bin/openclaw-speed-research",
+        "drafter-calibration-memory-stage",
+        "--stage",
+        stage,
+        "--plan",
+        plan,
+        "--output-dir",
+        output_dir,
+        "--min-traces",
+        str(min_traces),
+        "--max-prompts",
+        str(max_prompts),
+    ]
+    if trace_data:
+        command.extend(["--trace-data", trace_data])
+    return command
+
+
+def next_calibration_memory_stage(stage: str) -> str:
+    try:
+        index = CALIBRATION_MEMORY_STAGES.index(stage)
+    except ValueError:
+        return ""
+    if index + 1 >= len(CALIBRATION_MEMORY_STAGES):
+        return ""
+    return CALIBRATION_MEMORY_STAGES[index + 1]
+
+
+def drafter_calibration_memory_stage_task(
+    timestamp: int,
+    *,
+    stage: str,
+    task_id: str,
+    bounded_command: list[str],
+    priority: int = 98,
+) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-calibration-memory-stage",
+        "stage": stage,
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-speed-research.py"],
+        "hypothesis": (
+            "JANQ drafter calibration should advance through isolated memory stages before any full "
+            "target+drafter training run is allowed."
+        ),
+        "metric": "calibration_stage_gate",
+        "guard_checks": [
+            "stop_live_model_first",
+            "memory_gate",
+            "bounded_stage",
+            "no_live_profile_change",
+            "no_opencode_changes",
+        ],
+        "acceptance": f"The {stage} probe writes a keep artifact without Python, MLX, Metal, or memory-gate failure.",
+        "rollback": "Discard the probe output directory; no OpenClaw model profile or live drafter path is changed.",
+        "bounded_command": bounded_command,
+        "next_action": " ".join(bounded_command),
+        "created_at": timestamp,
+    }
+
+
 def drafter_trace_candidates() -> list[Path]:
     return [
         home() / "drafter-fit" / "target-generated-traces.jsonl",
@@ -1595,7 +1766,7 @@ def existing_drafter_trace_paths() -> list[Path]:
 
 
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
-    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows):
+    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) == "calibration-runtime-missing-speculative":
         return False
     return bool(existing_drafter_trace_paths()) and should_seed_action(
         root,
@@ -2038,11 +2209,12 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             or "dflash-compatibility" in task_id
         ):
             continue
-        if calibration_blocker and (
-            action in {"drafter-calibration-canary", "drafter-calibration-run"}
-            or "drafter-calibration-canary" in task_id
-            or "drafter-calibration-run" in task_id
-        ):
+        calibration_blocked_action = action == "drafter-calibration-run" or "drafter-calibration-run" in task_id
+        if calibration_blocker == "calibration-runtime-missing-speculative":
+            calibration_blocked_action = calibration_blocked_action or (
+                action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
+            )
+        if calibration_blocker and calibration_blocked_action:
             continue
         seedable.append(task)
     return seedable
@@ -3996,38 +4168,12 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "OPENCLAW_MTP_DRAFT_PATH",
         os.environ.get("OPENCLAW_JANG_DRAFT_MODEL", DEFAULT_MTP_DRAFT_PATH),
     )
-    bounded_command = [
-        runtime_python,
-        "/Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py",
-        "--target-path",
-        target_path,
-        "--drafter-path",
-        drafter_path,
-        "--output-path",
-        str(calibrated_output),
-        "--prompts-file",
-        str(prompts_path),
-        "--train-samples",
-        "2",
-        "--eval-samples",
-        "1",
-        "--positions-per-prompt",
-        "1",
-        "--steps",
-        "1",
-        "--eval-every",
-        "1",
-        "--min-free-mb",
-        "16384",
-        "--max-compressor-mb",
-        "2048",
-        "--max-swap-mb",
-        "2048",
-        "--gpu-memory-utilization",
-        "0.60",
-        "--mlx-cache-gb",
-        "4",
-    ]
+    bounded_command = calibration_full_run_command(
+        target_path=target_path,
+        drafter_path=drafter_path,
+        output_path=calibrated_output,
+        prompts_path=prompts_path,
+    )
     status = "keep" if not failures else "blocked"
     report = {
         "ok": status == "keep",
@@ -4047,19 +4193,28 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "memory_after_mb": memory_snapshot(),
         "timestamp": timestamp,
     }
-    seeded_run_task = 0
-    if status == "keep" and should_seed_drafter_calibration_run(root, recent_rows=120):
-        seeded_run_task = upsert_tasks(
+    seeded_stage_task = 0
+    if status == "keep":
+        stage_command = calibration_stage_helper_command(
+            "metadata",
+            plan=str(plan_path),
+            trace_data=str(trace_path) if trace_path is not None else "",
+            output_dir=str(output_dir),
+            min_traces=int(args.min_traces),
+            max_prompts=int(args.max_prompts),
+        )
+        seeded_stage_task = upsert_tasks(
             root,
             [
-                drafter_calibration_run_task(
+                drafter_calibration_memory_stage_task(
                     timestamp,
-                    task_id=f"drafter-calibration-run-{timestamp}",
-                    bounded_command=bounded_command,
+                    stage="metadata",
+                    task_id=f"drafter-calibration-memory-stage-metadata-{timestamp}",
+                    bounded_command=stage_command,
                 )
             ],
         )
-    report["seeded_run_task"] = seeded_run_task
+    report["seeded_stage_task"] = seeded_stage_task
     artifact = root / "benchmarks" / f"drafter-calibration-canary-{timestamp}.json"
     artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -4069,7 +4224,11 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
             "task_id": "drafter-calibration-canary",
             "finding": "validated JANQ trace data and bounded calibration canary prerequisites",
             "evidence": report,
-            "next": "run bounded calibration only when memory gate is green" if status == "keep" else "repair calibration canary prerequisites",
+            "next": (
+                "advance through staged calibration memory gates before full calibration"
+                if status == "keep"
+                else "repair calibration canary prerequisites"
+            ),
         },
     )
     append_result(
@@ -4081,7 +4240,183 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         commit=current_commit(repo_root()),
         notes=(
             f"decision={report['decision']} trace_rows={len(trace_rows)} "
-            f"test_ok={test_result.get('ok')} failures={len(failures)} seeded_run_task={seeded_run_task}"
+            f"test_ok={test_result.get('ok')} failures={len(failures)} seeded_stage_task={seeded_stage_task}"
+        ),
+    )
+    print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
+    return 0 if status == "keep" else 2
+
+
+def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    stage = str(args.stage)
+    plan_path = Path(args.plan).expanduser()
+    trace_paths = existing_drafter_trace_paths()
+    trace_path = Path(args.trace_data).expanduser() if args.trace_data else (trace_paths[0] if trace_paths else None)
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prompts_path = output_dir / "calibration-canary-prompts.txt"
+    failures: list[str] = []
+    plan: dict[str, Any] = {}
+    trace_rows: list[dict[str, Any]] = []
+    if stage not in CALIBRATION_MEMORY_STAGES:
+        failures.append(f"unknown_stage:{stage}")
+    if not plan_path.exists():
+        failures.append(f"missing_plan:{plan_path}")
+    else:
+        try:
+            loaded = json.loads(plan_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("plan is not a JSON object")
+            plan = loaded
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            failures.append(f"plan_read_error:{type(error).__name__}")
+    if trace_path is None or not trace_path.exists():
+        failures.append("missing_trace_data")
+    else:
+        try:
+            trace_rows = read_trace_rows(trace_path)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            failures.append(f"trace_read_error:{type(error).__name__}")
+    prompts = [prompt for row in trace_rows if (prompt := trace_prompt_text(row))]
+    if len(prompts) < int(args.min_traces):
+        failures.append(f"trace_prompts_below_min:{len(prompts)}<{int(args.min_traces)}")
+    if prompts:
+        prompts_path.write_text("\n".join(prompts[: int(args.max_prompts)]) + "\n", encoding="utf-8")
+    target_path = os.environ.get("OPENCLAW_JANQ_TARGET_PATH", str(plan.get("target_path") or DEFAULT_JANQ_TARGET_PATH))
+    drafter_path = os.environ.get(
+        "OPENCLAW_MTP_DRAFT_PATH",
+        os.environ.get("OPENCLAW_JANG_DRAFT_MODEL", DEFAULT_MTP_DRAFT_PATH),
+    )
+    stage_output = output_dir / f"calibration-stage-{stage}-{timestamp}"
+    command = calibration_probe_command(
+        stage,
+        target_path=target_path,
+        drafter_path=drafter_path,
+        output_path=stage_output,
+        prompts_path=prompts_path,
+    )
+    timeout = {
+        "metadata": 90.0,
+        "drafter-load": 600.0,
+        "target-load": 900.0,
+        "combined-load": 1200.0,
+        "micro-step": 1800.0,
+    }.get(stage, 300.0)
+    stdout = ""
+    returncode = 2
+    if not failures:
+        try:
+            result = subprocess.run(
+                command,
+                env=calibration_python_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+            stdout = result.stdout
+            returncode = result.returncode
+            if result.returncode != 0:
+                failures.append(f"probe_exit:{result.returncode}")
+        except subprocess.TimeoutExpired as error:
+            stdout = (error.stdout or "") if isinstance(error.stdout, str) else ""
+            failures.append("probe_timeout")
+            returncode = 124
+        except OSError as error:
+            failures.append(f"probe_exec_error:{type(error).__name__}")
+    status = "keep" if not failures and returncode == 0 else "blocked"
+    next_stage = next_calibration_memory_stage(stage) if status == "keep" else ""
+    seeded_next_stage = 0
+    seeded_run_task = 0
+    if status == "keep" and next_stage:
+        next_command = calibration_stage_helper_command(
+            next_stage,
+            plan=str(plan_path),
+            trace_data=str(trace_path) if trace_path is not None else "",
+            output_dir=str(output_dir),
+            min_traces=int(args.min_traces),
+            max_prompts=int(args.max_prompts),
+        )
+        seeded_next_stage = upsert_tasks(
+            root,
+            [
+                drafter_calibration_memory_stage_task(
+                    timestamp,
+                    stage=next_stage,
+                    task_id=f"drafter-calibration-memory-stage-{next_stage}-{timestamp}",
+                    bounded_command=next_command,
+                )
+            ],
+        )
+    elif status == "keep" and not next_stage and should_seed_drafter_calibration_run(root, recent_rows=120):
+        calibrated_output = output_dir / f"calibrated-drafter-{timestamp}"
+        run_command = calibration_full_run_command(
+            target_path=target_path,
+            drafter_path=drafter_path,
+            output_path=calibrated_output,
+            prompts_path=prompts_path,
+        )
+        seeded_run_task = upsert_tasks(
+            root,
+            [
+                drafter_calibration_run_task(
+                    timestamp,
+                    task_id=f"drafter-calibration-run-{timestamp}",
+                    bounded_command=run_command,
+                )
+            ],
+        )
+    decision = "blocked"
+    if status == "keep":
+        decision = "advance" if next_stage else "ready-for-bounded-calibration"
+    report = {
+        "ok": status == "keep",
+        "kind": "drafter-calibration-memory-stage",
+        "stage": stage,
+        "status": status,
+        "decision": decision,
+        "failures": failures,
+        "command": command,
+        "returncode": returncode,
+        "output_tail": stdout[-1600:],
+        "stage_output": str(stage_output),
+        "trace_rows": len(trace_rows),
+        "prompts_file": str(prompts_path) if prompts else "",
+        "seeded_next_stage": seeded_next_stage,
+        "seeded_run_task": seeded_run_task,
+        "memory_after_mb": memory_snapshot(),
+        "timestamp": timestamp,
+    }
+    artifact = root / "benchmarks" / f"drafter-calibration-memory-stage-{stage}-{timestamp}.json"
+    artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": f"drafter-calibration-memory-stage-{stage}",
+            "finding": f"ran staged JANQ drafter calibration memory gate: {stage}",
+            "evidence": report,
+            "next": (
+                f"run next calibration memory stage: {next_stage}"
+                if seeded_next_stage
+                else "run bounded calibration task" if seeded_run_task else "repair or wait on calibration stage blocker"
+            ),
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-calibration-memory-stage-{stage}-{timestamp}",
+        status=status,
+        target="janq-drafter-calibration-memory-stage",
+        hypothesis="Staged calibration probes should isolate memory/runtime blockers before full JANQ drafter fitting.",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"stage={stage} decision={decision} failures={len(failures)} "
+            f"seeded_next_stage={seeded_next_stage} seeded_run_task={seeded_run_task}"
         ),
     )
     print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
@@ -6158,6 +6493,18 @@ def main() -> int:
     calibration_canary.add_argument("--test-timeout", type=float, default=60.0)
     calibration_canary.add_argument("--skip-test", action="store_true")
     calibration_canary.set_defaults(func=drafter_calibration_canary)
+
+    calibration_stage = sub.add_parser("drafter-calibration-memory-stage")
+    calibration_stage.add_argument("--stage", choices=list(CALIBRATION_MEMORY_STAGES), required=True)
+    calibration_stage.add_argument(
+        "--plan",
+        default="/Users/kristian/.openclaw/drafter-fit/gemma4-janq-dflash-fit-plan.json",
+    )
+    calibration_stage.add_argument("--trace-data", default="")
+    calibration_stage.add_argument("--output-dir", default="/Users/kristian/.openclaw/drafter-fit")
+    calibration_stage.add_argument("--min-traces", type=int, default=4)
+    calibration_stage.add_argument("--max-prompts", type=int, default=6)
+    calibration_stage.set_defaults(func=drafter_calibration_memory_stage)
 
     dflash_gate = sub.add_parser("dflash-compatibility-gate")
     dflash_gate.add_argument("--draft-path", default="")

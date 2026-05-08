@@ -1323,6 +1323,35 @@ def main() -> int:
         )
         assert code == 0
         assert issue == ""
+        calibration_stage_helper = Path(tmp) / "calibration-stage-helper.py"
+        calibration_stage_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'status': 'keep', 'decision': 'advance', 'stage': 'metadata'}))\n",
+            encoding="utf-8",
+        )
+        calibration_stage_helper.chmod(0o700)
+        calibration_stage_task = {
+            "id": "calibration-stage",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-memory-stage",
+            "stage": "metadata",
+            "bounded_command": [str(calibration_stage_helper)],
+            "next_action": "openclaw-speed-research drafter-calibration-memory-stage --stage metadata",
+        }
+        assert helper.is_supervisor_drafter_calibration_memory_stage_task(calibration_stage_task)
+        assert helper.task_runs_without_model(calibration_stage_task)
+        with patch.object(helper, "model_ready", return_value=False), patch.object(helper, "wait_for_memory", return_value=(True, "")):
+            code, issue = helper.run_supervisor_drafter_calibration_memory_stage_task(
+                Namespace(),
+                141,
+                "nightly",
+                calibration_stage_task,
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == ""
         calibration_run_helper = Path(tmp) / "calibration-run-helper.py"
         calibration_run_helper.write_text(
             "#!/usr/bin/env python3\n"

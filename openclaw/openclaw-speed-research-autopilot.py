@@ -664,6 +664,15 @@ def is_supervisor_drafter_calibration_run_task(task: dict[str, object] | None) -
     )
 
 
+def is_supervisor_drafter_calibration_memory_stage_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-calibration-memory-stage"
+        or "openclaw-speed-research drafter-calibration-memory-stage" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_dflash_compatibility_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -739,6 +748,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_drafter_trace_prerequisite_task,
             is_supervisor_drafter_trace_collect_task,
             is_supervisor_drafter_calibration_canary_task,
+            is_supervisor_drafter_calibration_memory_stage_task,
             is_supervisor_drafter_calibration_run_task,
             is_supervisor_dflash_compatibility_task,
             is_supervisor_focused_test_task,
@@ -2643,6 +2653,108 @@ def run_supervisor_drafter_calibration_canary_task(
     return 0, "" if status == "keep" else reason
 
 
+def run_supervisor_drafter_calibration_memory_stage_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    command = task.get("bounded_command")
+    if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+        command = [args.research_helper_bin, "drafter-calibration-memory-stage", "--stage", str(task.get("stage", ""))]
+    if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+        reason = "drafter calibration memory stage missing bounded_command"
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason}, commit=current_commit())
+        return 2, reason
+    if model_ready() and str(task.get("stage", "")) != "metadata":
+        stop_openclaw_model_for_memory_recovery(
+            args,
+            reason=f"supervisor drafter calibration memory stage needs exclusive RAM: task={task.get('id', 'unknown')}",
+        )
+    ready, memory_issue = wait_for_memory(args)
+    if not ready:
+        complete_supervisor_task(
+            task,
+            status="blocked",
+            summary={"reason": memory_issue, "deferred": True},
+            commit=current_commit(),
+        )
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-calibration-memory-stage-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-calibration-memory-stage")),
+            hypothesis=str(task.get("hypothesis", "run staged JANQ drafter calibration memory gate")),
+            commit=current_commit(),
+            notes=clean_tsv(memory_issue),
+        )
+        return 75, memory_issue
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter calibration memory stage "
+            f"task={task.get('id', 'unknown')} stage={task.get('stage', '')} =====\n"
+        )
+        file.write("$ " + " ".join(command) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                command,
+                env=calibration_subprocess_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=2100,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER CALIBRATION MEMORY STAGE TIMEOUT\n")
+            complete_supervisor_task(
+                task,
+                status="blocked",
+                summary={"reason": "supervisor drafter calibration memory stage timeout"},
+                commit=current_commit(),
+            )
+            return 124, "supervisor drafter calibration memory stage timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
+    memory_gate_issue = calibration_memory_gate_issue(result.stdout)
+    runtime_issue = missing_speculative_runtime_issue(result.stdout)
+    reason = (
+        runtime_issue
+        or memory_gate_issue
+        or str(parsed.get("decision") or parsed.get("reason") or f"supervisor drafter calibration memory stage exit {result.returncode}")
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-drafter-calibration-memory-stage-{cycle}",
+        status=status,
+        target=str(task.get("target", "drafter-calibration-memory-stage")),
+        hypothesis=str(task.get("hypothesis", "run staged JANQ drafter calibration memory gate")),
+        commit=current_commit(),
+        notes=clean_tsv(
+            f"stage={task.get('stage', '')} reason={reason} output_tail={result.stdout[-500:]}"
+        ),
+    )
+    complete_supervisor_task(
+        task,
+        status=status,
+        summary={
+            "reason": reason,
+            "returncode": result.returncode,
+            "runtime_issue": runtime_issue,
+            "memory_gate_issue": memory_gate_issue,
+            "parsed": parsed,
+            "output_tail": result.stdout[-1200:],
+            "command": command,
+        },
+        commit=current_commit(),
+    )
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_drafter_calibration_run_task(
     args: argparse.Namespace,
     cycle: int,
@@ -3746,6 +3858,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_canary_task(selected_task):
             code, issue = run_supervisor_drafter_calibration_canary_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_calibration_memory_stage_task(selected_task):
+            code, issue = run_supervisor_drafter_calibration_memory_stage_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_run_task(selected_task):
             code, issue = run_supervisor_drafter_calibration_run_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
