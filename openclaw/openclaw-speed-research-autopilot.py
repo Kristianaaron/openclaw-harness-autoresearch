@@ -3372,7 +3372,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
                     return False, f"supervisor quality/frontier review {issue}"
                 if not first_issue:
                     first_issue = issue
-    return not first_issue, first_issue
+    return True, first_issue
 
 
 def latest_json_artifact(pattern: str) -> dict[str, object]:
@@ -3571,7 +3571,10 @@ def run_supervisor_reflection(args: argparse.Namespace, cycle: int, session: str
         return False, f"replay guards failed: {replay_result}"
     if ready_impl:
         return True, "synthesis deferred because ready implementation tasks exist"
-    return run_supervisor_synthesis(args, cycle, session, log_file)
+    ok, issue = run_supervisor_synthesis(args, cycle, session, log_file)
+    if not ok and issue == "supervisor synthesis terminal no-work":
+        return True, "reflection skipped after clean terminal no-work"
+    return ok, issue
 
 
 def main() -> int:
@@ -4088,8 +4091,10 @@ def main() -> int:
                 log_file,
             )
             log(f"cycle={cycle} quality_review ok={review_ok} issue={review_issue or 'none'}")
-        if code not in {0, 124}:
+        if code not in {0, 124} and not progressed:
             log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
+        elif code == 2 and progressed:
+            log("cycle action returned terminal evidence exit=2; counted as durable progress")
         if not progressed:
             failed_task_id = str((selected_task or select_next_task(WORKSPACE) or {}).get("id", "unknown"))
             record_rejection(

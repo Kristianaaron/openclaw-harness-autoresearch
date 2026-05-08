@@ -46,6 +46,7 @@ from openclaw_speed_research_core import (
     replay_checks,
     score_insight,
     seed_gepa_canary_task,
+    suppress_stale_gepa_policy_canaries,
     task_contract_issues,
     task_contract_report,
     variance_analysis,
@@ -3543,6 +3544,18 @@ def quality_review(args: argparse.Namespace) -> int:
             f"recommendation={recommendations[0]}"
         ),
     )
+    suppressed_gepa = suppress_stale_gepa_policy_canaries(root)
+    if suppressed_gepa:
+        append_result(
+            root,
+            run_id=f"gepa-suppression-{timestamp}",
+            status="keep",
+            target="autoresearch-gepa-suppression",
+            hypothesis="healthy quality review should suppress stale GEPA canaries instead of letting old trajectory noise run",
+            commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+            notes=f"suppressed={suppressed_gepa} reason=healthy_quality_no_fresh_actionable_trigger",
+        )
+        artifact["suppressed_gepa_canaries"] = suppressed_gepa
     print(json.dumps({"ok": True, "path": str(path), **artifact}, indent=2))
     return 0
 
@@ -3636,12 +3649,16 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     empty_synthesis = [
         row
         for row in synthesis_rows
-        if "seeded_tasks=0" in row.get("notes", "") and "deliberate_actions=deliberate-" not in row.get("notes", "")
+        if "seeded_tasks=0" in row.get("notes", "")
+        and "deliberate_actions=deliberate-" not in row.get("notes", "")
+        and "terminal_no_work=True" not in row.get("notes", "")
     ]
     historical_empty_synthesis = [
         row
         for row in historical_synthesis_rows
-        if "seeded_tasks=0" in row.get("notes", "") and "deliberate_actions=deliberate-" not in row.get("notes", "")
+        if "seeded_tasks=0" in row.get("notes", "")
+        and "deliberate_actions=deliberate-" not in row.get("notes", "")
+        and "terminal_no_work=True" not in row.get("notes", "")
     ]
     bridge_zero = recent_empty_bridge_rows(root, active_recent, recent_rows=len(active_recent) or 1)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, active_recent, recent_rows=len(active_recent) or 1)
@@ -5638,11 +5655,18 @@ def synthesize(args: argparse.Namespace) -> int:
         if seed_gepa_canary_task(root, gepa_report):
             gepa_action = str((gepa_report.get("candidate") or {}).get("id", ""))
             seeded = 1
-    status = "keep" if seeded else "blocked"
+    terminal_no_work = seeded == 0
+    status = "keep" if seeded else "discard"
+    result_target = "synthesis" if seeded else "synthesis-terminal"
+    result_hypothesis = (
+        "exhausted benchmark queues must generate ranked speed ideas and next tasks"
+        if seeded
+        else "synthesis reached a clean terminal no-work state after deterministic fallbacks"
+    )
     progress_note = (
         "seeded measurable follow-up tasks"
         if seeded
-        else "could not seed a safe follow-up task; supervisor must repair the routing contract"
+        else "found no safe follow-up task after deterministic fallbacks; supervisor should pause instead of reseeding noise"
     )
     append_jsonl(
         root / "findings.jsonl",
@@ -5674,14 +5698,14 @@ def synthesize(args: argparse.Namespace) -> int:
         root,
         run_id=f"synthesis-{int(time.time())}",
         status=status,
-        target="synthesis",
-        hypothesis="exhausted benchmark queues must generate ranked speed ideas and next tasks",
+        target=result_target,
+        hypothesis=result_hypothesis,
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
         notes=(
             f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind} "
             f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)} "
             f"contract_actions={','.join(task['id'] for task in contract_tasks)} "
-            f"gepa_action={gepa_action}"
+            f"gepa_action={gepa_action} terminal_no_work={terminal_no_work}"
         ),
     )
     print(
@@ -5694,6 +5718,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 "contract_actions": [task["id"] for task in contract_tasks],
                 "gepa_action": gepa_action,
                 "status": status,
+                "terminal_no_work": terminal_no_work,
                 "ideas_path": str(ideas_path),
             },
             indent=2,

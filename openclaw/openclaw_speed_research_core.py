@@ -1154,6 +1154,20 @@ def active_gepa_policy_canary_exists(root: Path) -> bool:
     return False
 
 
+def non_gepa_ready_work_exists(root: Path) -> bool:
+    """Return true when normal deterministic work can advance without GEPA."""
+    for task in read_jsonl(root / "tasks.jsonl"):
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("supervisor_action") == "gepa-policy-canary":
+            continue
+        if str(task.get("id", "")).startswith("gepa-policy-canary-"):
+            continue
+        if task.get("benchmark_mode") or task.get("task_type") in {"supervisor", "implementation"}:
+            return True
+    return False
+
+
 def gepa_actionable_side_information(
     root: Path,
     rows: list[dict[str, str]],
@@ -1174,6 +1188,7 @@ def gepa_actionable_side_information(
         and "seeded_tasks=0" in row.get("notes", "")
         and "deliberate_actions=deliberate-" not in row.get("notes", "")
         and "contract_actions=" in row.get("notes", "")
+        and "terminal_no_work=True" not in row.get("notes", "")
     ]
     handoff_blocked_rows = [
         row
@@ -1296,6 +1311,68 @@ def latest_certification_is_healthy(rows: list[dict[str, str]]) -> bool:
     )
 
 
+def latest_healthy_quality_index(rows: list[dict[str, str]]) -> int:
+    checkpoint = -1
+    for index, row in enumerate(rows):
+        if row.get("target") != "autoresearch-quality" or row.get("status") != "keep":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("verdict") != "healthy":
+            continue
+        try:
+            score = float(fields.get("score", "0") or 0)
+        except ValueError:
+            score = 0.0
+        if score >= 95:
+            checkpoint = index
+    return checkpoint
+
+
+def rows_after_latest_healthy_quality(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Use the latest healthy quality review as the GEPA trigger checkpoint."""
+    checkpoint = latest_healthy_quality_index(rows)
+    return rows[checkpoint + 1 :] if checkpoint >= 0 else rows
+
+
+def suppress_stale_gepa_policy_canaries(root: Path) -> int:
+    """Quarantine ready GEPA canaries after a healthy review clears the issue window."""
+    rows = all_result_rows(root)
+    checkpoint = latest_healthy_quality_index(rows)
+    if checkpoint < 0:
+        return 0
+    trigger_rows = rows[checkpoint + 1 :]
+    artifact = measurement_artifact_analysis(root, recent_rows=max(1, len(trigger_rows)))
+    has_fresh_issue = (
+        count_low_quality_rows(trigger_rows) > 0
+        or bool(artifact.get("artifact_suspected"))
+        or any(
+            row.get("status") == "blocked"
+            and row.get("target") not in {"autoresearch-quality", "autoresearch-frontier-eval"}
+            for row in trigger_rows
+        )
+    )
+    if has_fresh_issue:
+        return 0
+
+    tasks = read_jsonl(root / "tasks.jsonl")
+    changed = 0
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("supervisor_action") != "gepa-policy-canary" and not str(task.get("id", "")).startswith(
+            "gepa-policy-canary-"
+        ):
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = timestamp
+        task["blocked_reason"] = "suppressed after healthy quality review; no fresh actionable trigger"
+        changed += 1
+    if changed:
+        write_jsonl(root / "tasks.jsonl", tasks)
+    return changed
+
+
 def choose_gepa_policy_target(
     *,
     blocked_rows: int,
@@ -1334,13 +1411,14 @@ def gepa_escalation_report(
     """
     ensure_research_state(root)
     rows = all_result_rows(root)[-max(1, recent_rows) :]
+    trigger_rows = rows_after_latest_healthy_quality(rows)
     blocked = [
         row
-        for row in rows
+        for row in trigger_rows
         if row.get("status") == "blocked"
         and row.get("target") not in {"autoresearch-quality", "autoresearch-frontier-eval"}
     ]
-    low_quality = count_low_quality_rows(rows)
+    low_quality = count_low_quality_rows(trigger_rows)
     tasks = read_jsonl(root / "tasks.jsonl")
     rework = [
         task
@@ -1348,9 +1426,9 @@ def gepa_escalation_report(
         if task.get("status") == "rework" or int(task.get("rework_attempts") or 0) > 0
     ]
     trajectory = read_jsonl(root / "trajectory-corpus.jsonl")[-max(1, recent_rows) :]
-    artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
+    artifact = measurement_artifact_analysis(root, recent_rows=max(1, len(trigger_rows)))
     exhausted = exhausted_lanes(root)
-    asi = gepa_actionable_side_information(root, rows, artifact=artifact, exhausted=exhausted)
+    asi = gepa_actionable_side_information(root, trigger_rows, artifact=artifact, exhausted=exhausted)
     triggers: list[dict[str, Any]] = []
     actionable_trigger_names: set[str] = set()
     if len(blocked) >= min_blocked:
@@ -1384,14 +1462,15 @@ def gepa_escalation_report(
     )
     needed = bool(triggers) and bool(actionable_trigger_names)
     active_canary = active_gepa_policy_canary_exists(root)
+    ready_work = non_gepa_ready_work_exists(root)
     latest_certified = latest_certification_is_healthy(rows)
     existing_candidate_count = sum(
         1
         for candidate in read_jsonl(root / "gepa-candidates.jsonl")
         if str((candidate.get("candidate") or {}).get("target") or candidate.get("target") or "") == target
     )
-    repeated_non_promotable_target = target != "insight-rubric.json" and existing_candidate_count >= 3
-    if active_canary or latest_certified or repeated_non_promotable_target:
+    repeated_target = existing_candidate_count >= 3
+    if active_canary or ready_work or latest_certified or repeated_target:
         needed = False
     trigger_signature = "-".join(f"{item['name']}-{item['value']}" for item in triggers) if triggers else "none"
     candidate_id = f"gepa-policy-canary-{slugify(target)}-{existing_candidate_count + 1}-{slugify(trigger_signature)}"
@@ -1433,6 +1512,7 @@ def gepa_escalation_report(
         "triggers": triggers,
         "candidate": candidate if needed else {},
         "recent_rows": len(rows),
+        "trigger_rows": len(trigger_rows),
         "blocked_rows": len(blocked),
         "low_quality_reviews": low_quality,
         "rework_tasks": len(rework),
@@ -1441,15 +1521,19 @@ def gepa_escalation_report(
         "measurement_artifact": artifact,
         "actionable_side_information": asi,
         "actionable_triggers": sorted(actionable_trigger_names),
-        "repeated_non_promotable_target": repeated_non_promotable_target,
+        "repeated_target": repeated_target,
+        "repeated_non_promotable_target": repeated_target and target != "insight-rubric.json",
+        "non_gepa_ready_work_exists": ready_work,
         "latest_certification_healthy": latest_certified,
         "next": (
             "run_existing_gepa_policy_canary"
             if active_canary
+            else "continue_ready_deterministic_work"
+            if ready_work
             else "continue_default_supervisor_route_after_frontier_certification"
             if latest_certified
             else "suppress_repeated_gepa_canaries_until_policy_patch"
-            if repeated_non_promotable_target
+            if repeated_target
             else ("write_canary_candidate" if needed else "continue_default_supervisor_route")
         ),
     }

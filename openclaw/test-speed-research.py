@@ -880,9 +880,27 @@ def main() -> int:
             gepa_paths = list((root / "benchmarks").glob("gepa-escalation-*.json"))
             assert gepa_paths
             gepa = json.loads(gepa_paths[-1].read_text(encoding="utf-8"))
+            assert gepa["needed"] is False
+            assert gepa["non_gepa_ready_work_exists"] is True
+            original_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            temporarily_done_tasks = [dict(task) for task in original_tasks]
+            for task in temporarily_done_tasks:
+                if task.get("status", "ready") in {"ready", "rework"}:
+                    task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", temporarily_done_tasks)
+            assert helper.gepa_escalation(
+                Namespace(recent_rows=80, min_blocked=1, min_rework=1, min_trajectory=1, min_low_quality=1)
+            ) == 0
+            gepa = json.loads(max((root / "benchmarks").glob("gepa-escalation-*.json"), key=lambda path: path.stat().st_mtime_ns).read_text())
             assert gepa["needed"] is True
             assert gepa["candidate"]["target"] in {"program.md", "insight-rubric.json", "STRATEGY.md", "tasks.jsonl"}
             assert "gepa-policy-canary" in (root / "tasks.jsonl").read_text(encoding="utf-8")
+            canary_task = next(
+                task
+                for task in helper.read_jsonl(root / "tasks.jsonl")
+                if task.get("id") == gepa["candidate"]["id"]
+            )
+            helper.write_jsonl(root / "tasks.jsonl", [*original_tasks, canary_task])
             assert helper.gepa_policy_canary(Namespace(task_id=gepa["candidate"]["id"])) == 0
             assert list((root / "gepa-canaries").glob("*.json"))
             gepa_candidates_text = (root / "gepa-candidates.jsonl").read_text(encoding="utf-8")

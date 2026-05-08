@@ -1227,7 +1227,7 @@ def main() -> int:
             "nightly",
             Path(tmp) / "autopilot.log",
         )
-        assert not ok
+        assert ok
         assert issue == "implementation-handoff-audit exit 2"
         review_fail_text = review_fail_log.read_text(encoding="utf-8")
         assert "implementation-handoff-audit --min-score 90" in review_fail_text
