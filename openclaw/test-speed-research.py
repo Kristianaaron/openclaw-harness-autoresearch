@@ -352,6 +352,50 @@ def main() -> int:
                         assert after_retry_rows.count("schema_issue=decode-sample too short") == before_retry_rows.count(
                             "schema_issue=decode-sample too short"
                         )
+                    trace_home = root / "home"
+                    trace_output = trace_home / "drafter-fit" / "target-generated-traces.jsonl"
+
+                    def fake_trace_request(_base_url, payload, _timeout):
+                        prompt = payload["messages"][0]["content"]
+                        content = f"target completion for {prompt[:24]}"
+                        return (
+                            0.2,
+                            json.dumps(
+                                {
+                                    "choices": [{"message": {"content": content}}],
+                                    "usage": {"completion_tokens": 12},
+                                }
+                            ).encode("utf-8"),
+                        )
+
+                    with patch.dict(os.environ, {"OPENCLAW_HOME": str(trace_home)}, clear=False):
+                        with patch.object(helper, "model_request", side_effect=fake_trace_request):
+                            assert helper.drafter_trace_collect(
+                                Namespace(
+                                    base_url="http://127.0.0.1:8091/v1",
+                                    model="",
+                                    output=str(trace_output),
+                                    samples=4,
+                                    min_traces=4,
+                                    max_tokens=48,
+                                    timeout=1.0,
+                                    min_free_mb=0,
+                                    force=False,
+                                )
+                            ) == 0
+                        trace_rows = [json.loads(line) for line in trace_output.read_text(encoding="utf-8").splitlines()]
+                        assert len(trace_rows) == 4
+                        assert trace_rows[0]["schema_version"] == 1
+                        assert trace_rows[0]["completion_tokens"] == 12
+                        assert "drafter-trace-collect" in (root / "results.tsv").read_text(encoding="utf-8")
+                        assert helper.drafter_trace_prerequisite(Namespace()) == 0
+                        prereq_report = json.loads(
+                            sorted((root / "benchmarks").glob("drafter-trace-prerequisite-*.json"))[-1].read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        assert prereq_report["status"] == "keep"
+                        assert prereq_report["trace_data"]
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}

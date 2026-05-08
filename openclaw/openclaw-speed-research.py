@@ -59,6 +59,32 @@ DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
 )
+DEFAULT_TRACE_PROMPTS = (
+    (
+        "coding-small",
+        "In one concise paragraph, explain how to reduce repeated tool-call loops in a local coding agent.",
+    ),
+    (
+        "speed-small",
+        "Give a short implementation note for improving perceived latency in a local MLX model server.",
+    ),
+    (
+        "tool-json-small",
+        "Return a compact JSON object with keys diagnosis, safe_next_step, and rollback for a stalled benchmark loop.",
+    ),
+    (
+        "reasoning-guard-small",
+        "Summarize how to keep model reasoning separate from tool JSON in a terminal agent harness.",
+    ),
+    (
+        "memory-small",
+        "Write a short checklist for avoiding macOS memory pressure while testing a 31B local model.",
+    ),
+    (
+        "research-small",
+        "Propose one measurable experiment for improving decode tokens per second without changing the target model.",
+    ),
+)
 ALLOWED_PATCH_PREFIXES = (
     "openclaw/",
     "docs/case-studies/",
@@ -1336,11 +1362,29 @@ def drafter_trace_prerequisite_task(timestamp: int, *, task_id: str, priority: i
         "supervisor_action": "drafter-trace-prerequisite",
         "target": "/Users/kristian/.openclaw/drafter-fit/target-generated-traces.jsonl",
         "hypothesis": "JANQ drafter fitting is blocked on target-generated trace data; record the exact prerequisite instead of repeating trace gates.",
-        "metric": "target_trace_data_presence",
+        "metric": "drafter_fit_gate",
         "guard_checks": ["no_model_load", "no_live_profile_change", "no_opencode_changes"],
         "acceptance": "A prerequisite artifact lists the expected trace files and marks the lane blocked until data exists.",
         "rollback": "No runtime rollback needed; this is a read-only prerequisite report.",
         "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-prerequisite",
+    }
+
+
+def drafter_trace_collect_task(timestamp: int, *, task_id: str, priority: int = 99) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-trace-collect",
+        "target": "/Users/kristian/.openclaw/drafter-fit/target-generated-traces.jsonl",
+        "hypothesis": "JANQ drafter fitting needs a small target-generated trace set before calibration can be evaluated.",
+        "metric": "drafter_fit_gate",
+        "guard_checks": ["memory_gate", "bounded_samples", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A JSONL trace file contains bounded OpenClaw prompts and JANQ target completions with usage metadata.",
+        "rollback": "Delete the trace file if collection is malformed; no runtime profile or source setting is changed.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-collect --samples 6",
     }
 
 
@@ -2930,6 +2974,13 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
         "next_action": "run_candidate_drafter_calibration_canary" if traces else "collect_target_generated_trace_data",
         "timestamp": timestamp,
     }
+    seeded_collect_task = 0
+    if not traces:
+        seeded_collect_task = upsert_tasks(
+            root,
+            [drafter_trace_collect_task(timestamp, task_id=f"handoff-audit-drafter-trace-collect-{timestamp}")],
+        )
+    report["seeded_collect_task"] = seeded_collect_task
     path = root / "benchmarks" / f"drafter-trace-prerequisite-{timestamp}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -2949,10 +3000,152 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
         target="janq-drafter-fit-trace-data",
         hypothesis="Trace-data prerequisite must be explicit before drafter calibration work continues.",
         commit=current_commit(repo_root()),
-        notes=f"decision={reason} trace_files={len(traces)} next={report['next_action']}",
+        notes=f"decision={reason} trace_files={len(traces)} seeded_collect_task={seeded_collect_task} next={report['next_action']}",
     )
     print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
     return 0
+
+
+def drafter_trace_collect(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    before_memory = memory_snapshot()
+    if before_memory.get("free_mb", 0) < int(args.min_free_mb):
+        reason = f"memory_free_mb_below_min:{before_memory.get('free_mb', 0)}<{int(args.min_free_mb)}"
+        print(json.dumps({"ok": False, "status": "blocked", "reason": reason, "memory_before_mb": before_memory}, indent=2))
+        append_result(
+            root,
+            run_id=f"drafter-trace-collect-{int(time.time())}",
+            status="blocked",
+            target="janq-drafter-fit-trace-data",
+            hypothesis="Collect bounded target-generated traces for JANQ drafter fitting.",
+            commit=current_commit(repo_root()),
+            notes=reason,
+        )
+        return 2
+    base_url = args.base_url
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=3) as response:
+            models = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        reason = f"model endpoint unavailable: {error}"
+        print(json.dumps({"ok": False, "status": "blocked", "reason": reason}, indent=2))
+        append_result(
+            root,
+            run_id=f"drafter-trace-collect-{int(time.time())}",
+            status="blocked",
+            target="janq-drafter-fit-trace-data",
+            hypothesis="Collect bounded target-generated traces for JANQ drafter fitting.",
+            commit=current_commit(repo_root()),
+            notes=reason,
+        )
+        return 2
+    data = models.get("data") if isinstance(models, dict) else None
+    model = args.model or (data[0].get("id") if isinstance(data, list) and data and isinstance(data[0], dict) else "local-model")
+    existing: list[dict[str, Any]] = []
+    if output.exists() and not args.force:
+        for line in output.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                existing.append(item)
+    existing_ids = {str(item.get("prompt_id", "")) for item in existing}
+    prompts = list(DEFAULT_TRACE_PROMPTS)[: max(1, int(args.samples))]
+    collected: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for prompt_id, prompt in prompts:
+        if prompt_id in existing_ids:
+            continue
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": int(args.max_tokens),
+            "stream": False,
+        }
+        try:
+            wall_s, body = model_request(base_url, payload, float(args.timeout))
+            parsed = json.loads(body.decode("utf-8"))
+            content = str(parsed.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+            completion_tokens, token_source = completion_tokens_from_response(parsed, content)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError) as error:
+            failures.append(f"{prompt_id}:{type(error).__name__}")
+            continue
+        if not content:
+            failures.append(f"{prompt_id}:empty_completion")
+            continue
+        collected.append(
+            {
+                "schema_version": 1,
+                "created": int(time.time()),
+                "model": model,
+                "prompt_id": prompt_id,
+                "prompt_class": "openclaw-agentic",
+                "messages": [{"role": "user", "content": prompt}],
+                "completion": content,
+                "completion_tokens": completion_tokens,
+                "completion_token_source": token_source,
+                "wall_s": round(wall_s, 3),
+                "max_tokens": int(args.max_tokens),
+                "temperature": 0,
+            }
+        )
+    rows = existing + collected if not args.force else collected
+    if rows:
+        output.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n", encoding="utf-8")
+    after_memory = memory_snapshot()
+    status = "keep" if len(rows) >= int(args.min_traces) else "blocked"
+    reason = "target-generated-trace-data-present" if status == "keep" else "insufficient-target-generated-traces"
+    timestamp = int(time.time())
+    report = {
+        "ok": status == "keep",
+        "kind": "drafter-trace-collect",
+        "status": status,
+        "reason": reason,
+        "output": str(output),
+        "model": model,
+        "existing_rows": len(existing),
+        "collected_rows": len(collected),
+        "total_rows": len(rows),
+        "failures": failures,
+        "memory_before_mb": before_memory,
+        "memory_after_mb": after_memory,
+        "timestamp": timestamp,
+    }
+    artifact = root / "benchmarks" / f"drafter-trace-collect-{timestamp}.json"
+    artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-trace-collect",
+            "finding": "collected bounded JANQ target-generated traces for drafter-fit calibration",
+            "evidence": report,
+            "next": "rerun drafter-trace-gate" if status == "keep" else "fix model endpoint or collect more traces",
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-trace-collect-{timestamp}",
+        status=status,
+        target="janq-drafter-fit-trace-data",
+        hypothesis="Collect bounded target-generated traces for JANQ drafter fitting.",
+        wall_s=round(sum(float(row.get("wall_s") or 0) for row in collected), 3) if collected else "",
+        memory_gb=round(after_memory.get("compressor_mb", 0) / 1024, 3) if after_memory else "",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"reason={reason} output={output} collected={len(collected)} total={len(rows)} "
+            f"failures={len(failures)}"
+        ),
+    )
+    print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
+    return 0 if status == "keep" else 2
 
 
 def dflash_compatibility_gate(args: argparse.Namespace) -> int:
@@ -4983,6 +5176,18 @@ def main() -> int:
 
     trace_prereq = sub.add_parser("drafter-trace-prerequisite")
     trace_prereq.set_defaults(func=drafter_trace_prerequisite)
+
+    trace_collect = sub.add_parser("drafter-trace-collect")
+    trace_collect.add_argument("--base-url", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_URL", DEFAULT_MODEL_URL))
+    trace_collect.add_argument("--model", default="")
+    trace_collect.add_argument("--output", default="/Users/kristian/.openclaw/drafter-fit/target-generated-traces.jsonl")
+    trace_collect.add_argument("--samples", type=int, default=6)
+    trace_collect.add_argument("--min-traces", type=int, default=4)
+    trace_collect.add_argument("--max-tokens", type=int, default=96)
+    trace_collect.add_argument("--timeout", type=float, default=120.0)
+    trace_collect.add_argument("--min-free-mb", type=int, default=512)
+    trace_collect.add_argument("--force", action="store_true")
+    trace_collect.set_defaults(func=drafter_trace_collect)
 
     dflash_gate = sub.add_parser("dflash-compatibility-gate")
     dflash_gate.add_argument("--draft-path", default="")

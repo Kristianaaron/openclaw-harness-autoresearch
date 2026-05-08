@@ -1230,6 +1230,32 @@ def main() -> int:
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
         assert "implementation-recorded" in helper.EXPERIMENTS.read_text(encoding="utf-8")
         assert "impl" in (helper.WORKSPACE / "promotion-decisions.jsonl").read_text(encoding="utf-8")
+        collect_helper = Path(tmp) / "trace-collect-helper.py"
+        collect_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "print(json.dumps({'status': 'keep', 'reason': 'target-generated-trace-data-present'}))\n",
+            encoding="utf-8",
+        )
+        collect_helper.chmod(0o700)
+        collect_task = {
+            "id": "trace-collect",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-trace-collect",
+            "next_action": "openclaw-speed-research drafter-trace-collect",
+        }
+        assert helper.is_supervisor_drafter_trace_collect_task(collect_task)
+        with patch.object(helper, "ensure_model_for_supervisor_task", return_value=(True, "")):
+            code, issue = helper.run_supervisor_drafter_trace_collect_task(
+                Namespace(research_helper_bin=str(collect_helper), model_start_timeout_seconds=1.0),
+                13,
+                "nightly",
+                collect_task,
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == ""
         bench_helper = Path(tmp) / "benchmark-helper.py"
         bench_helper.write_text(
             "#!/usr/bin/env python3\n"

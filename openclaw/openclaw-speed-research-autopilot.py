@@ -607,6 +607,15 @@ def is_supervisor_drafter_trace_prerequisite_task(task: dict[str, object] | None
     )
 
 
+def is_supervisor_drafter_trace_collect_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-trace-collect"
+        or "openclaw-speed-research drafter-trace-collect" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_dflash_compatibility_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -671,6 +680,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_drafter_fit_task,
             is_supervisor_drafter_trace_gate_task,
             is_supervisor_drafter_trace_prerequisite_task,
+            is_supervisor_drafter_trace_collect_task,
             is_supervisor_dflash_compatibility_task,
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
@@ -2464,6 +2474,50 @@ def run_supervisor_drafter_trace_prerequisite_task(
     return 0, "" if status == "keep" else reason
 
 
+def run_supervisor_drafter_trace_collect_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "drafter-trace-collect"]
+    ready, start_issue = ensure_model_for_supervisor_task(
+        log_file,
+        args.model_start_timeout_seconds,
+        task_id=str(task.get("id", "unknown")),
+        reason="supervisor drafter trace collect",
+    )
+    if not ready:
+        return 124 if "timeout" in start_issue else 75, start_issue
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter trace collect "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=900,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER TRACE COLLECT TIMEOUT\n")
+            return 124, "supervisor drafter trace collect timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
+    reason = str(parsed.get("reason") or f"supervisor drafter trace collect exit {result.returncode}")
+    complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_dflash_compatibility_task(
     args: argparse.Namespace,
     cycle: int,
@@ -3410,6 +3464,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_trace_gate_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_trace_prerequisite_task(selected_task):
             code, issue = run_supervisor_drafter_trace_prerequisite_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_trace_collect_task(selected_task):
+            code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
             code, issue = run_supervisor_dflash_compatibility_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):
