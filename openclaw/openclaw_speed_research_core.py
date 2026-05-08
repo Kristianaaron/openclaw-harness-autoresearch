@@ -576,7 +576,27 @@ def ensure_research_state(root: Path) -> None:
         exhausted.write_text("", encoding="utf-8")
     write_json_if_missing_or_stale(root / "benchmark-manifest.json", DEFAULT_BENCHMARK_MANIFEST, "version")
     write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
-    write_json_if_missing_or_stale(root / "research-profile.json", DEFAULT_RESEARCH_PROFILE, "version")
+    profile_path = root / "research-profile.json"
+    write_json_if_missing_or_stale(profile_path, DEFAULT_RESEARCH_PROFILE, "version")
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        profile = {}
+    if isinstance(profile, dict):
+        metrics = profile.setdefault("metrics", {})
+        if isinstance(metrics, dict):
+            changed_profile = False
+            default_metrics = DEFAULT_RESEARCH_PROFILE.get("metrics", {})
+            for key in ("primary", "secondary"):
+                values = metrics.setdefault(key, [])
+                defaults = default_metrics.get(key, []) if isinstance(default_metrics, dict) else []
+                if isinstance(values, list) and isinstance(defaults, list):
+                    for item in defaults:
+                        if item not in values:
+                            values.append(item)
+                            changed_profile = True
+            if changed_profile:
+                profile_path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     ensure_replay_buffer(root / "replay-buffer.jsonl")
     write_evaluator_policy(root)
     tasks_path = root / "tasks.jsonl"
@@ -1587,7 +1607,11 @@ def task_contract_report(root: Path) -> dict[str, Any]:
         if task.get("status", "ready") in {"ready", "rework"}
     ]
     issues = []
+    calibration_stage_counts: dict[str, int] = {}
     for task in tasks:
+        if task.get("supervisor_action") == "drafter-calibration-memory-stage":
+            stage = str(task.get("stage", ""))
+            calibration_stage_counts[stage] = calibration_stage_counts.get(stage, 0) + 1
         contract = task_contract_issues(root, task)
         if contract["blockers"] or contract["warnings"]:
             issues.append(
@@ -1595,6 +1619,15 @@ def task_contract_report(root: Path) -> dict[str, Any]:
                     "task_id": str(task.get("id", "")),
                     "blockers": contract["blockers"],
                     "warnings": contract["warnings"],
+                }
+            )
+    for stage, count in sorted(calibration_stage_counts.items()):
+        if stage and count > 1:
+            issues.append(
+                {
+                    "task_id": f"drafter-calibration-memory-stage:{stage}",
+                    "blockers": [f"duplicate ready calibration memory-stage tasks: {count}"],
+                    "warnings": [],
                 }
             )
     return {

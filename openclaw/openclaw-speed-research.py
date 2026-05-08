@@ -1361,16 +1361,124 @@ def parse_note_fields(notes: str) -> dict[str, str]:
     return fields
 
 
+def calibration_memory_stage_name(task: dict[str, Any]) -> str:
+    if str(task.get("supervisor_action", "")) != "drafter-calibration-memory-stage":
+        return ""
+    stage = str(task.get("stage", ""))
+    if stage:
+        return stage
+    task_id = str(task.get("id", ""))
+    prefix = "drafter-calibration-memory-stage-"
+    if task_id.startswith(prefix):
+        remainder = task_id[len(prefix) :]
+        for candidate in CALIBRATION_MEMORY_STAGES:
+            if remainder.startswith(candidate):
+                return candidate
+    return ""
+
+
+def active_calibration_memory_stage_tasks(root: Path) -> list[dict[str, Any]]:
+    return [
+        task
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"} and calibration_memory_stage_name(task)
+    ]
+
+
+def completed_calibration_memory_stages(root: Path, *, recent_rows: int = 600) -> set[str]:
+    completed: set[str] = set()
+    for row in result_rows(root)[-max(1, recent_rows) :]:
+        if row.get("status") != "keep":
+            continue
+        run_id = row.get("run_id", "")
+        notes = row.get("notes", "")
+        for stage in CALIBRATION_MEMORY_STAGES:
+            if run_id.startswith(f"drafter-calibration-memory-stage-{stage}-"):
+                completed.add(stage)
+            elif run_id.startswith("supervisor-drafter-calibration-memory-stage-"):
+                if parse_note_fields(notes).get("stage") == stage:
+                    completed.add(stage)
+    return completed
+
+
+def first_seedable_calibration_memory_stage(root: Path) -> str:
+    active = {calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)}
+    if active:
+        return ""
+    completed = completed_calibration_memory_stages(root)
+    for stage in CALIBRATION_MEMORY_STAGES:
+        if stage not in completed:
+            return stage
+    return ""
+
+
+def calibration_stage_duplicate_count(root: Path) -> int:
+    counts: dict[str, int] = {}
+    for task in active_calibration_memory_stage_tasks(root):
+        stage = calibration_memory_stage_name(task)
+        counts[stage] = counts.get(stage, 0) + 1
+    return sum(max(0, count - 1) for count in counts.values())
+
+
+def compact_duplicate_calibration_stage_tasks(root: Path) -> int:
+    tasks = read_jsonl(root / "tasks.jsonl")
+    keep_by_stage: dict[str, int] = {}
+    changed = False
+    compacted = 0
+    for index, task in enumerate(tasks):
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        stage = calibration_memory_stage_name(task)
+        if not stage:
+            continue
+        if stage not in keep_by_stage:
+            keep_by_stage[stage] = index
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        task["supervisor_summary"] = {
+            "reason": "duplicate calibration memory stage suppressed",
+            "stage": stage,
+            "kept_task_id": tasks[keep_by_stage[stage]].get("id", ""),
+        }
+        compacted += 1
+        changed = True
+    if changed:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": "calibration-stage-dedupe",
+                "finding": "suppressed duplicate ready calibration memory-stage tasks",
+                "evidence": {"compacted": compacted, "kept_stages": sorted(keep_by_stage)},
+                "next": "execute the oldest remaining stage and advance only after a keep artifact",
+            },
+        )
+    return compacted
+
+
 def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     path = root / "tasks.jsonl"
     existing = read_jsonl(path)
     existing_by_id = {str(task.get("id", "")): index for index, task in enumerate(existing)}
+    active_stage_keys = {
+        calibration_memory_stage_name(task)
+        for task in existing
+        if task.get("status", "ready") in {"ready", "rework"} and calibration_memory_stage_name(task)
+    }
+    completed_stages = completed_calibration_memory_stages(root)
     additions = 0
     changed = False
     for task in tasks:
         task_id = str(task.get("id", ""))
+        stage_key = calibration_memory_stage_name(task)
+        if stage_key and (stage_key in active_stage_keys or stage_key in completed_stages):
+            continue
         if task_id not in existing_by_id:
             existing.append(task)
+            if stage_key:
+                active_stage_keys.add(stage_key)
             additions += 1
             changed = True
             continue
@@ -2196,11 +2304,18 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     exhausted = exhausted_lanes(root)
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    active_calibration_stages = {
+        calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
+    }
+    completed_calibration_stages = completed_calibration_memory_stages(root)
     seedable: list[dict[str, Any]] = []
     for task in tasks:
         lane = str(task.get("lane", ""))
         task_id = str(task.get("id", ""))
         action = str(task.get("supervisor_action", ""))
+        stage = calibration_memory_stage_name(task)
+        if stage and (stage in active_calibration_stages or stage in completed_calibration_stages):
+            continue
         if lane in exhausted and lane != "exhaustion-report":
             continue
         if dflash_blocked and (
@@ -2478,6 +2593,7 @@ def research_quality_scorecard(
     contract_ok: bool,
     dflash_suppressed: bool,
     repeated_dflash_synthesis: int,
+    duplicate_stage_tasks: int,
     best_mean: float | None,
     target_tps: float,
     server_decode_values: list[float],
@@ -2520,6 +2636,8 @@ def research_quality_scorecard(
         evidence -= min(22.0, blocked_rows * 6.0)
     if server_decode_values:
         evidence += 4.0
+    if duplicate_stage_tasks:
+        evidence -= min(55.0, 18.0 + duplicate_stage_tasks * 2.0)
 
     novelty = 82.0
     if repeated_dflash_synthesis >= 2 and not dflash_suppressed:
@@ -2532,6 +2650,8 @@ def research_quality_scorecard(
         novelty += 10.0
     if exhaustion_candidate:
         novelty += 8.0
+    if duplicate_stage_tasks:
+        novelty -= min(45.0, 15.0 + duplicate_stage_tasks)
 
     causal = 70.0
     if has_causal_plateau:
@@ -2548,6 +2668,8 @@ def research_quality_scorecard(
         causal += 8.0
     if contaminated_rows and not any("runtime-overhead" in task_id for task_id in seeded_ids):
         causal -= 16.0
+    if duplicate_stage_tasks:
+        causal -= min(42.0, 14.0 + duplicate_stage_tasks)
 
     next_action = 55.0
     if has_next_action:
@@ -2558,6 +2680,8 @@ def research_quality_scorecard(
         next_action += 8.0
     if not contract_ok:
         next_action -= 24.0
+    if duplicate_stage_tasks:
+        next_action -= min(60.0, 28.0 + duplicate_stage_tasks * 2.0)
 
     convergence = 72.0
     if repeated_block2 and repeated_keep_current:
@@ -2570,6 +2694,8 @@ def research_quality_scorecard(
         convergence += 8.0
     if clean_runtime_maps >= 2 and not has_prerequisite_route:
         convergence -= 14.0
+    if duplicate_stage_tasks:
+        convergence -= min(65.0, 30.0 + duplicate_stage_tasks * 2.0)
 
     implementation = 72.0
     if contract_ok:
@@ -2580,6 +2706,8 @@ def research_quality_scorecard(
         implementation += 6.0
     if not has_next_action and best_mean is not None and best_mean < target_tps:
         implementation -= 18.0
+    if duplicate_stage_tasks:
+        implementation -= min(50.0, 18.0 + duplicate_stage_tasks)
 
     components = {
         "evidence": evidence,
@@ -2607,8 +2735,12 @@ def research_quality_scorecard(
             "ready_task_ids": ready_ids,
             "dflash_suppressed": dflash_suppressed,
             "repeated_dflash_synthesis": repeated_dflash_synthesis,
+            "duplicate_stage_tasks": duplicate_stage_tasks,
         },
         "interpretation": (
+            "queue_duplication_needs_repair"
+            if duplicate_stage_tasks
+            else
             "high_quality_exhaustion_or_prerequisite_route"
             if overall >= 85 and (exhaustion_candidate or has_prerequisite_route or dflash_suppressed)
             else "needs_more_evidence_or_clearer_next_action"
@@ -2622,6 +2754,7 @@ def quality_review(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
     ensure_lane_contracts(root)
+    compacted_stage_tasks = compact_duplicate_calibration_stage_tasks(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     blocked = [row for row in recent if row.get("status") == "blocked"]
@@ -2912,6 +3045,12 @@ def quality_review(args: argparse.Namespace) -> int:
             }
         )
     deterministic_ready = [task for task in active_tasks if is_deterministic_research_task(task)]
+    duplicate_stage_tasks = calibration_stage_duplicate_count(root) + compacted_stage_tasks
+    if duplicate_stage_tasks:
+        review_status = "blocked"
+        recommendations.append(
+            f"duplicate calibration memory-stage tasks detected={duplicate_stage_tasks}; compacted duplicates and blocked inflated quality."
+        )
     if not deterministic_ready:
         recommendations.append("no deterministic ready task remained after review; seeded one lane-contract fallback.")
         seeded_tasks.extend(
@@ -2951,11 +3090,24 @@ def quality_review(args: argparse.Namespace) -> int:
         contract_ok=bool(contract.get("ok")),
         dflash_suppressed=dflash_blocked_or_suppressed,
         repeated_dflash_synthesis=len(repeated_deliberate_dflash),
+        duplicate_stage_tasks=duplicate_stage_tasks,
         best_mean=best_mean,
         target_tps=float(args.target_tps),
         server_decode_values=server_decode_values,
     )
-    quality_score = max(legacy_quality_score, int(round(float(scorecard["overall"]))))
+    if verdict == "needs-repair":
+        scorecard = {
+            **scorecard,
+            "overall": min(float(scorecard["overall"]), 74.0),
+            "interpretation": "needs_repair_not_certified",
+            "inflation_guard": "needs-repair verdict caps scorecard until blockers are resolved",
+        }
+    if duplicate_stage_tasks:
+        quality_score = min(legacy_quality_score, int(round(float(scorecard["overall"]))))
+    else:
+        quality_score = max(legacy_quality_score, int(round(float(scorecard["overall"]))))
+    if verdict == "needs-repair":
+        quality_score = min(quality_score, 74)
     seeded_tasks = filter_seedable_tasks(root, seeded_tasks) if seeded_tasks else []
     seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
     timestamp = int(time.time())
@@ -2993,6 +3145,8 @@ def quality_review(args: argparse.Namespace) -> int:
         "variance": variance,
         "measurement_artifact": artifact_check,
         "task_contract": contract,
+        "duplicate_stage_tasks": duplicate_stage_tasks,
+        "compacted_stage_tasks": compacted_stage_tasks,
         "recommendations": recommendations,
         "seeded_tasks": seeded,
     }
@@ -3132,6 +3286,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     historical_bridge_zero = recent_empty_bridge_rows(root, recent, recent_rows=recent_rows)
     deliberate_ready = [task for task in ready if str(task.get("id", "")).startswith("deliberate-")]
     deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
+    duplicate_stage_tasks = calibration_stage_duplicate_count(root)
     bridge_ready = [task for task in deterministic_ready if is_implementation_bridge_task(task)]
     bridge_only_ready = bool(deterministic_ready) and len(bridge_ready) == len(deterministic_ready)
     patch_rows = [row for row in active_recent if row.get("run_id", "").startswith("patch-executor-")]
@@ -3173,10 +3328,11 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     except ValueError:
         latest_scorecard_overall = None
     latest_quality_interpretation = latest_quality_fields.get("scorecard_interpretation", "")
+    latest_quality_verdict = latest_quality_fields.get("verdict", "")
     quality_route_high = (
         (latest_scorecard_overall is not None and latest_scorecard_overall >= 85.0)
         or (latest_quality_score is not None and latest_quality_score >= 85.0)
-    ) and latest_quality_interpretation == "high_quality_exhaustion_or_prerequisite_route"
+    ) and latest_quality_interpretation == "high_quality_exhaustion_or_prerequisite_route" and latest_quality_verdict != "needs-repair"
     terminal_calibration_plateau = bool(calibration_memory_report_rows or historical_calibration_memory_report_rows)
     decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
     contract = task_contract_report(root)
@@ -3247,6 +3403,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         scores["implementation_handoff"] -= 1.0
         scores["research_quality"] -= 0.6
         gaps.append("bridge-only deterministic ready task after an empty implementation bridge")
+    if duplicate_stage_tasks:
+        scores["karpathy_core_loop"] -= 2.4
+        scores["research_quality"] -= 2.5
+        scores["implementation_handoff"] -= 1.7
+        scores["self_improvement"] -= 1.4
+        gaps.append(f"duplicate calibration memory-stage tasks remain ready={duplicate_stage_tasks}")
     if bridge_zero:
         scores["implementation_handoff"] -= min(1.4, len(bridge_zero) * 0.25)
         gaps.append(f"recent implementation bridge rows had no deterministic task={len(bridge_zero)}")
@@ -3277,6 +3439,10 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if quality_route_high:
         scores["research_quality"] += 0.2
         strengths.append("quality scorecard shows evidence-backed routing rather than research churn")
+    elif latest_quality_verdict == "needs-repair":
+        scores["research_quality"] -= 1.5
+        scores["karpathy_core_loop"] -= 0.7
+        gaps.append("latest quality review verdict is needs-repair")
     if not contract.get("ok"):
         scores["implementation_handoff"] -= 1.0
         gaps.append("ready task contract blockers exist")
@@ -3302,7 +3468,13 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 
     scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
     overall = round(sum(scores.values()) / len(scores), 2)
-    blocking_gap_terms = ("contract", "measurement artifact", "repeated clean runtime-overhead", "bridge-only")
+    blocking_gap_terms = (
+        "contract",
+        "measurement artifact",
+        "repeated clean runtime-overhead",
+        "bridge-only",
+        "duplicate calibration memory-stage",
+    )
     readiness = (
         "frontier-candidate"
         if overall >= 9.0 and not any(term in gap for term in blocking_gap_terms for gap in gaps)
@@ -3330,6 +3502,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_calibration_memory_reports": len(calibration_memory_report_rows),
         "recent_clean_runtime_overhead_maps": len(clean_runtime_maps),
         "recent_memory_blocks": len(memory_blocks),
+        "duplicate_stage_tasks": duplicate_stage_tasks,
         "historical_debt": {
             "window_rows": len(recent),
             "empty_synthesis_rows": len(historical_empty_synthesis),
@@ -3340,6 +3513,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "latest_quality_score": latest_quality_score,
         "latest_quality_scorecard_overall": latest_scorecard_overall,
         "latest_quality_interpretation": latest_quality_interpretation,
+        "latest_quality_verdict": latest_quality_verdict,
         "task_contract": contract,
         "measurement_artifact": artifact,
         "strengths": strengths,
@@ -3356,7 +3530,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 
 def frontier_repair_tasks(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Seed one deterministic repair lane when the frontier score is below target."""
-    timestamp = int(report.get("timestamp") or time.time())
+    timestamp = int(time.time() * 1000)
     root = workspace_root()
     ensure_lane_contracts(root)
     rows = result_rows(root)
@@ -3473,6 +3647,7 @@ def frontier_eval(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
     ensure_lane_contracts(root)
+    compact_duplicate_calibration_stage_tasks(root)
     report = score_frontier_system(root, recent_rows=args.recent_rows)
     seeded_tasks = 0
     needs_repair = report["overall"] < args.min_score or any(
@@ -4195,8 +4370,12 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
     }
     seeded_stage_task = 0
     if status == "keep":
+        stage = first_seedable_calibration_memory_stage(root)
+    else:
+        stage = ""
+    if stage:
         stage_command = calibration_stage_helper_command(
-            "metadata",
+            stage,
             plan=str(plan_path),
             trace_data=str(trace_path) if trace_path is not None else "",
             output_dir=str(output_dir),
@@ -4208,8 +4387,8 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
             [
                 drafter_calibration_memory_stage_task(
                     timestamp,
-                    stage="metadata",
-                    task_id=f"drafter-calibration-memory-stage-metadata-{timestamp}",
+                    stage=stage,
+                    task_id=f"drafter-calibration-memory-stage-{stage}-{timestamp}",
                     bounded_command=stage_command,
                 )
             ],
@@ -4329,7 +4508,15 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
         except OSError as error:
             failures.append(f"probe_exec_error:{type(error).__name__}")
     status = "keep" if not failures and returncode == 0 else "blocked"
-    next_stage = next_calibration_memory_stage(stage) if status == "keep" else ""
+    next_stage = ""
+    if status == "keep":
+        completed = completed_calibration_memory_stages(root) | {stage}
+        active = {calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)}
+        for candidate in CALIBRATION_MEMORY_STAGES:
+            if candidate in completed or candidate in active:
+                continue
+            next_stage = candidate
+            break
     seeded_next_stage = 0
     seeded_run_task = 0
     if status == "keep" and next_stage:

@@ -956,6 +956,28 @@ def main() -> int:
                 [helper.dflash_compatibility_task(123460, task_id="deliberate-dflash-compatibility-exhausted")],
             )
             assert exhausted_only == []
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    helper.drafter_calibration_memory_stage_task(
+                        123461,
+                        stage="metadata",
+                        task_id="drafter-calibration-memory-stage-metadata-a",
+                        bounded_command=["true"],
+                    ),
+                    helper.drafter_calibration_memory_stage_task(
+                        123462,
+                        stage="metadata",
+                        task_id="drafter-calibration-memory-stage-metadata-b",
+                        bounded_command=["true"],
+                    ),
+                ],
+            )
+            assert helper.calibration_stage_duplicate_count(root) == 1
+            assert helper.compact_duplicate_calibration_stage_tasks(root) == 1
+            assert helper.calibration_stage_duplicate_count(root) == 0
+            assert len(helper.active_calibration_memory_stage_tasks(root)) == 1
+            helper.write_jsonl(root / "tasks.jsonl", [])
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths
             handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))
@@ -981,13 +1003,15 @@ def main() -> int:
             assert eval_paths
             eval_report = json.loads(eval_paths[-1].read_text(encoding="utf-8"))
             assert eval_report["scores"]["karpathy_core_loop"] >= 8.0
-            assert eval_report["scores"]["research_quality"] >= 9.0
-            assert eval_report["latest_quality_scorecard_overall"] >= 90
-            assert eval_report["readiness"] == "frontier-candidate"
+            assert eval_report["scores"]["research_quality"] < 9.0
+            assert eval_report["latest_quality_scorecard_overall"] <= 74
+            assert eval_report["latest_quality_verdict"] == "needs-repair"
+            assert eval_report["readiness"] == "needs-targeted-work"
+            assert any("latest quality review verdict is needs-repair" in gap for gap in eval_report["gaps"])
             assert "deliberate-drafter-trace-gate-" in "\n".join(eval_report["deterministic_ready_tasks"])
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=9.0, allow_fail=True)) == 0
             repair_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
-            assert "frontier-repair-measurement-artifact-" not in repair_tasks
+            assert "frontier-repair-measurement-artifact-" in repair_tasks
             all_done_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in all_done_tasks:
                 task["status"] = "done"
