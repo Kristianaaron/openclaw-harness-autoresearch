@@ -502,10 +502,56 @@ def main() -> int:
                                 ),
                             )
                         assert helper.recent_lane_contract_decode_fallback_count(blocked_root) == 3
-                        exhausted_fallback = helper.lane_contract_fallback_tasks(
+                        overhead_fallback = helper.lane_contract_fallback_tasks(
                             blocked_root,
                             helper.result_rows(blocked_root),
                             123458,
+                            reason="unit repeated no ready task",
+                        )
+                        assert len(overhead_fallback) == 1
+                        assert overhead_fallback[0]["supervisor_action"] == "runtime-overhead-map"
+                        helper.upsert_tasks(blocked_root, overhead_fallback)
+                        fallback_tasks = helper.read_jsonl(blocked_root / "tasks.jsonl")
+                        for task in fallback_tasks:
+                            if task["id"] == overhead_fallback[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(blocked_root / "tasks.jsonl", fallback_tasks)
+                        helper.append_result(
+                            blocked_root,
+                            run_id="runtime-overhead-map-after-fallback-unit",
+                            status="keep",
+                            target="runtime-overhead-map",
+                            hypothesis="unit overhead map",
+                            commit="abc123",
+                            notes="contaminated=0 mean_server_tps=14.0 mean_clean_wall_tps=14.0 hit_count=12",
+                        )
+                        mtp_fallback = helper.lane_contract_fallback_tasks(
+                            blocked_root,
+                            helper.result_rows(blocked_root),
+                            123459,
+                            reason="unit repeated no ready task",
+                        )
+                        assert len(mtp_fallback) == 1
+                        assert mtp_fallback[0]["supervisor_action"] == "mtp-report"
+                        helper.upsert_tasks(blocked_root, mtp_fallback)
+                        fallback_tasks = helper.read_jsonl(blocked_root / "tasks.jsonl")
+                        for task in fallback_tasks:
+                            if task["id"] == mtp_fallback[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(blocked_root / "tasks.jsonl", fallback_tasks)
+                        helper.append_result(
+                            blocked_root,
+                            run_id="mtp-report-after-fallback-unit",
+                            status="keep",
+                            target="mtp-acceptance-report",
+                            hypothesis="unit mtp report",
+                            commit="abc123",
+                            notes="samples=2 mtp_samples=2 mean_server_tok_s=14.0 mean_accept=0.6",
+                        )
+                        exhausted_fallback = helper.lane_contract_fallback_tasks(
+                            blocked_root,
+                            helper.result_rows(blocked_root),
+                            123460,
                             reason="unit repeated no ready task",
                         )
                         assert exhausted_fallback == []

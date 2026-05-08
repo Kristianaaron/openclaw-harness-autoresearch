@@ -1394,6 +1394,10 @@ def active_task_has_prefix(root: Path, prefix: str) -> bool:
     )
 
 
+def any_task_has_prefix(root: Path, prefix: str) -> bool:
+    return any(str(task.get("id", "")).startswith(prefix) for task in read_jsonl(root / "tasks.jsonl"))
+
+
 def should_seed_action(root: Path, prefix: str, *, recent_rows: int = 80) -> bool:
     return not active_task_has_prefix(root, prefix) and not recent_result_has_prefix(root, prefix, recent_rows=recent_rows)
 
@@ -1802,14 +1806,63 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     if calibration_blocker and recent_lane_contract_decode_fallback_count(root, recent_rows=40) >= 3:
+        if not any_task_has_prefix(root, "lane-contract-runtime-overhead-map-after-fallback-"):
+            return filter_seedable_tasks(
+                root,
+                [
+                    {
+                        "id": f"lane-contract-runtime-overhead-map-after-fallback-{timestamp}",
+                        "status": "ready",
+                        "priority": 99,
+                        "lane": "runtime-overhead",
+                        "task_type": "supervisor",
+                        "supervisor_action": "runtime-overhead-map",
+                        "target": "openclaw/openclaw-jang-vlm-server.py",
+                        "hypothesis": (
+                            "Calibration is blocked and fallback decode measurements repeated; map the runtime/proxy "
+                            "overhead boundary once before pausing the lane."
+                        ),
+                        "metric": "server_wall_decode_gap",
+                        "guard_checks": ["no_model_turn_required", "no_live_profile_change", "no_opencode_changes"],
+                        "acceptance": "A runtime-overhead artifact identifies a patchable boundary or explicitly rules it out.",
+                        "rollback": "No runtime rollback needed; this is a read-only supervisor artifact.",
+                        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+                    }
+                ],
+            )
+        if not any_task_has_prefix(root, "lane-contract-mtp-report-after-fallback-"):
+            return filter_seedable_tasks(
+                root,
+                [
+                    {
+                        "id": f"lane-contract-mtp-report-after-fallback-{timestamp}",
+                        "status": "ready",
+                        "priority": 98,
+                        "lane": "exhaustion-report",
+                        "task_type": "supervisor",
+                        "supervisor_action": "mtp-report",
+                        "target": "openclaw-model-proxy.log",
+                        "hypothesis": (
+                            "Calibration is blocked and runtime mapping already ran; capture MTP acceptance evidence "
+                            "before marking the fallback path exhausted."
+                        ),
+                        "metric": "mean_accept",
+                        "guard_checks": ["no_model_turn_required", "no_opencode_changes", "one_narrow_tool"],
+                        "acceptance": "An MTP report artifact records server tok/s, sample count, and acceptance evidence when logs expose it.",
+                        "rollback": "No runtime rollback needed; this is a read-only supervisor report.",
+                        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 240",
+                        "lines": 240,
+                    }
+                ],
+            )
         append_jsonl(
             root / "findings.jsonl",
             {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "task_id": "lane-contract-fallback-exhausted",
-                "finding": "lane-contract fallback decode measurements repeated without opening a new lane",
+                "finding": "lane-contract fallback decode measurements repeated and bounded no-model escalations are already complete",
                 "reason": calibration_blocker,
-                "next": "pause autoresearch until calibration runtime prerequisites or a new non-calibration implementation task exists",
+                "next": "pause autoresearch until calibration runtime prerequisites, new trace data, or a new non-calibration implementation task exists",
             },
         )
         return []
@@ -3085,6 +3138,9 @@ def frontier_eval(args: argparse.Namespace) -> int:
             if not active_task_has_prefix(root, str(task.get("id", "")).rsplit("-", 1)[0] + "-")
         ]
         seeded_tasks = upsert_tasks(root, repairs) if repairs else 0
+        if seeded_tasks:
+            # Score the post-repair queue state, not the stale pre-repair snapshot.
+            report = score_frontier_system(root, recent_rows=args.recent_rows)
         report["seeded_repair_tasks"] = seeded_tasks
         if seeded_tasks:
             report["next"] = "run seeded frontier repair task, then rerun frontier-eval"
