@@ -3591,14 +3591,26 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     handoff_audit_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
     ]
+    historical_handoff_audit_rows = [
+        row for row in recent if row.get("run_id", "").startswith("implementation-handoff-audit-")
+    ]
     environment_snapshot_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("environment-snapshot-")
+    ]
+    historical_environment_snapshot_rows = [
+        row for row in recent if row.get("run_id", "").startswith("environment-snapshot-")
     ]
     evaluator_integrity_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("evaluator-integrity-")
     ]
+    historical_evaluator_integrity_rows = [
+        row for row in recent if row.get("run_id", "").startswith("evaluator-integrity-")
+    ]
     plateau_pivot_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("plateau-pivot-")
+    ]
+    historical_plateau_pivot_rows = [
+        row for row in recent if row.get("run_id", "").startswith("plateau-pivot-")
     ]
     calibration_memory_report_rows = [
         row for row in active_recent if row.get("run_id", "").startswith("calibration-memory-report-")
@@ -3609,6 +3621,10 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     quality_rows = [row for row in active_recent if row.get("run_id", "").startswith("quality-review-")]
     historical_quality_rows = [row for row in recent if row.get("run_id", "").startswith("quality-review-")]
     quality_source_rows = quality_rows or historical_quality_rows
+    handoff_source_rows = handoff_audit_rows or historical_handoff_audit_rows
+    environment_source_rows = environment_snapshot_rows or historical_environment_snapshot_rows
+    evaluator_source_rows = evaluator_integrity_rows or historical_evaluator_integrity_rows
+    plateau_source_rows = plateau_pivot_rows or historical_plateau_pivot_rows
     latest_quality_notes = quality_source_rows[-1].get("notes", "") if quality_source_rows else ""
     latest_quality_fields = parse_note_fields(latest_quality_notes)
     latest_quality_score = None
@@ -3662,16 +3678,16 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         scores["karpathy_core_loop"] -= 1.4
         scores["research_quality"] -= 1.0
         gaps.append("immutable evaluator integrity failed")
-    if environment_snapshot_rows:
+    if environment_source_rows:
         scores["crash_memory_safety"] += 0.2
         scores["modularity"] += 0.1
         strengths.append("environment snapshots record run context and evaluator hashes")
-    if evaluator_integrity_rows:
+    if evaluator_source_rows:
         scores["karpathy_core_loop"] += 0.2
         scores["crash_memory_safety"] += 0.2
         strengths.append("frozen evaluator integrity is checked during review")
-    if plateau_pivot_rows:
-        latest_plateau = parse_note_fields(plateau_pivot_rows[-1].get("notes", ""))
+    if plateau_source_rows:
+        latest_plateau = parse_note_fields(plateau_source_rows[-1].get("notes", ""))
         if latest_plateau.get("state") == "pivot":
             scores["karpathy_core_loop"] += 0.3
             scores["research_quality"] += 0.3
@@ -3720,8 +3736,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if patch_rows:
         scores["implementation_handoff"] += 0.4
         strengths.append("patch executor has recent canary evidence")
-    if handoff_audit_rows:
-        latest_handoff = parse_note_fields(handoff_audit_rows[-1].get("notes", ""))
+    if handoff_source_rows:
+        latest_handoff = parse_note_fields(handoff_source_rows[-1].get("notes", ""))
         audit_ok = latest_handoff.get("ok") == "True" or latest_handoff.get("ok") == "true"
         handoff_score = latest_handoff.get("score")
         if audit_ok:
@@ -3734,6 +3750,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             if handoff_score_value >= 95.0 and not bridge_zero and contract.get("ok"):
                 scores["implementation_handoff"] += 0.3
                 strengths.append("implementation handoff has certification-grade audit evidence")
+            if handoff_score_value >= 100.0 and not bridge_zero and contract.get("ok"):
+                scores["implementation_handoff"] += 0.1
+                strengths.append("implementation handoff audit is perfect with clean task contracts")
         else:
             scores["implementation_handoff"] -= 0.8
             gaps.append(f"implementation handoff audit needs repair score={handoff_score or 'unknown'}")
@@ -3746,6 +3765,14 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         strengths.append("quality scorecard shows evidence-backed routing rather than research churn")
         if latest_quality_verdict == "healthy" and not duplicate_stage_tasks and contract.get("ok"):
             scores["karpathy_core_loop"] += 0.1
+            if (
+                latest_quality_score is not None
+                and latest_quality_score >= 95.0
+                and latest_scorecard_overall is not None
+                and latest_scorecard_overall >= 95.0
+            ):
+                scores["research_quality"] += 0.35
+                strengths.append("quality review is certification-grade and stable across the latest checkpoint")
             scores["self_improvement"] += 0.2
             scores["modularity"] += 0.1
             strengths.append("healthy quality review is backed by clean contracts and no queue duplication")
@@ -3833,6 +3860,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "recent_empty_synthesis_rows": len(empty_synthesis),
         "recent_bridge_zero_rows": len(bridge_zero),
         "recent_handoff_audit_rows": len(handoff_audit_rows),
+        "historical_handoff_audit_rows": len(historical_handoff_audit_rows),
         "recent_quality_review_rows": len(quality_rows),
         "recent_environment_snapshots": len(environment_snapshot_rows),
         "recent_evaluator_integrity_rows": len(evaluator_integrity_rows),
