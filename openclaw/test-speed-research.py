@@ -488,6 +488,30 @@ def main() -> int:
                         assert len(contract_fallback) == 1
                         assert contract_fallback[0]["benchmark_mode"] == "decode-sample"
                         assert "calibration-memory-after-load" in contract_fallback[0]["hypothesis"]
+                        for index in range(3):
+                            helper.append_result(
+                                blocked_root,
+                                run_id=f"synthesis-fallback-{index}",
+                                status="keep",
+                                target="synthesis",
+                                hypothesis="unit repeated fallback",
+                                commit="abc123",
+                                notes=(
+                                    "ideas=5 seeded_tasks=1 kind=frontier deliberate_actions= "
+                                    f"contract_actions=lane-contract-decode-remeasure-calibration-block-{index}"
+                                ),
+                            )
+                        assert helper.recent_lane_contract_decode_fallback_count(blocked_root) == 3
+                        exhausted_fallback = helper.lane_contract_fallback_tasks(
+                            blocked_root,
+                            helper.result_rows(blocked_root),
+                            123458,
+                            reason="unit repeated no ready task",
+                        )
+                        assert exhausted_fallback == []
+                        assert "lane-contract-fallback-exhausted" in (
+                            blocked_root / "findings.jsonl"
+                        ).read_text(encoding="utf-8")
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}

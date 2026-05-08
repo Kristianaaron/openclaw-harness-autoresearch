@@ -1774,6 +1774,20 @@ def lane_contract_decode_task(timestamp: int, *, task_id: str, reason: str, prio
     }
 
 
+def recent_lane_contract_decode_fallback_count(root: Path, *, recent_rows: int = 40) -> int:
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    return sum(
+        1
+        for row in rows
+        if (
+            "contract_actions=lane-contract-decode-remeasure-" in row.get("notes", "")
+            or row.get("run_id", "").startswith("benchmark-")
+            and row.get("target") == "decode-sample"
+            and "lane-contract-decode-remeasure-" in row.get("notes", "")
+        )
+    )
+
+
 def lane_contract_fallback_tasks(
     root: Path,
     rows: list[dict[str, str]] | None,
@@ -1787,6 +1801,18 @@ def lane_contract_fallback_tasks(
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
+    if calibration_blocker and recent_lane_contract_decode_fallback_count(root, recent_rows=40) >= 3:
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": "lane-contract-fallback-exhausted",
+                "finding": "lane-contract fallback decode measurements repeated without opening a new lane",
+                "reason": calibration_blocker,
+                "next": "pause autoresearch until calibration runtime prerequisites or a new non-calibration implementation task exists",
+            },
+        )
+        return []
     if recent_drafter_fit_plan_ready(root, recent_rows=240) and not calibration_blocker:
         if existing_drafter_trace_paths():
             tasks.append(
