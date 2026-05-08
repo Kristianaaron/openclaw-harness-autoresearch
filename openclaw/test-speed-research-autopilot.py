@@ -1306,9 +1306,68 @@ def main() -> int:
                 "nightly",
                 calibration_run_task,
                 Path(tmp) / "autopilot.log",
-            )
+        )
         assert code == 0
         assert issue == ""
+        missing_module_helper = Path(tmp) / "calibration-run-missing-module.py"
+        missing_module_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print(\"ModuleNotFoundError: No module named 'mlx_vlm.speculative'\")\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        missing_module_helper.chmod(0o700)
+        missing_module_task = {
+            "id": "calibration-run-missing-module",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-run",
+            "bounded_command": [str(missing_module_helper)],
+            "next_action": str(missing_module_helper),
+        }
+        with patch.object(helper, "model_ready", return_value=False), patch.object(helper, "wait_for_memory", return_value=(True, "")):
+            code, issue = helper.run_supervisor_drafter_calibration_run_task(
+                Namespace(),
+                16,
+                "nightly",
+                missing_module_task,
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == "missing-runtime-module:mlx_vlm.speculative"
+        assert "drafter-calibration-runtime" in (helper.WORKSPACE / "exhausted-approaches.jsonl").read_text(
+            encoding="utf-8"
+        )
+        memory_gate_helper = Path(tmp) / "calibration-run-memory-gate.py"
+        memory_gate_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "print('calibration memory gate blocked: after-load: free=795MB<16384MB')\n"
+            "sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        memory_gate_helper.chmod(0o700)
+        memory_gate_task = {
+            "id": "calibration-run-memory-gate",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-run",
+            "bounded_command": [str(memory_gate_helper)],
+            "next_action": str(memory_gate_helper),
+        }
+        with patch.object(helper, "model_ready", return_value=False), patch.object(helper, "wait_for_memory", return_value=(True, "")):
+            code, issue = helper.run_supervisor_drafter_calibration_run_task(
+                Namespace(),
+                17,
+                "nightly",
+                memory_gate_task,
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == "calibration-memory-gate:after-load"
+        exhausted = (helper.WORKSPACE / "exhausted-approaches.jsonl").read_text(encoding="utf-8")
+        assert "drafter-calibration-memory" in exhausted
         bench_helper = Path(tmp) / "benchmark-helper.py"
         bench_helper.write_text(
             "#!/usr/bin/env python3\n"

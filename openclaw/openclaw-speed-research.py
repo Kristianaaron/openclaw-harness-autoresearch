@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -61,6 +62,7 @@ DEFAULT_JANQ_TARGET_PATH = (
     "snapshots/bb11360eacf55506f6e51eaacc6b0f65f9209b14"
 )
 DEFAULT_MTP_DRAFT_PATH = "/Users/kristian/.openclaw/models/gemma-4-31B-it-assistant-mlx-4bit"
+DEFAULT_RUNTIME_SITE = Path.home() / ".openclaw" / "runtime" / "rapid-mlx" / "site"
 DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
@@ -124,6 +126,63 @@ def workspace_root() -> Path:
 
 def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+
+
+def calibration_python() -> str:
+    explicit = os.environ.get("OPENCLAW_CALIBRATION_PYTHON") or os.environ.get("OPENCLAW_RAPID_PYTHON")
+    if explicit:
+        return explicit
+    for candidate in (
+        Path("/opt/homebrew/opt/rapid-mlx/libexec/bin/python"),
+        Path("/opt/homebrew/opt/rapid-mlx/libexec/bin/python3.12"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    for candidate in sorted(Path("/opt/homebrew/Cellar/rapid-mlx").glob("*/libexec/bin/python"), reverse=True):
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
+def calibration_python_env() -> dict[str, str]:
+    env = os.environ.copy()
+    runtime_site = Path(os.environ.get("OPENCLAW_JANG_TARGET", DEFAULT_RUNTIME_SITE)).expanduser()
+    pythonpath = str(runtime_site)
+    if env.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}{os.pathsep}{env['PYTHONPATH']}"
+    env["PYTHONPATH"] = pythonpath
+    return env
+
+
+def calibration_runtime_import_issue(python_bin: str) -> str:
+    code = (
+        "import importlib; "
+        "importlib.import_module('mlx'); "
+        "importlib.import_module('jang_tools.loader'); "
+        "importlib.import_module('mlx_vlm.speculative.drafters')"
+    )
+    try:
+        result = subprocess.run(
+            [python_bin, "-c", code],
+            env=calibration_python_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"calibration-runtime-check-failed:{type(error).__name__}"
+    if result.returncode == 0:
+        return ""
+    tail = result.stdout[-500:].replace("\n", " ").strip()
+    if "mlx_vlm.speculative" in tail:
+        return "missing-runtime-module:mlx_vlm.speculative.drafters"
+    if "jang_tools" in tail:
+        return "missing-runtime-module:jang_tools.loader"
+    if "No module named 'mlx'" in tail or 'No module named "mlx"' in tail:
+        return "missing-runtime-module:mlx"
+    return f"calibration-runtime-import-exit:{result.returncode}:{tail}"
 
 
 def git_available() -> bool:
@@ -1453,6 +1512,8 @@ def existing_drafter_trace_paths() -> list[Path]:
 
 
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
+    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows):
+        return False
     return bool(existing_drafter_trace_paths()) and should_seed_action(
         root,
         "drafter-calibration-canary-",
@@ -1461,11 +1522,26 @@ def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120
 
 
 def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -> bool:
+    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows):
+        return False
     return should_seed_action(
         root,
         "drafter-calibration-run-",
         recent_rows=recent_rows,
     )
+
+
+def recent_calibration_run_hard_blocker(root: Path, *, recent_rows: int = 160) -> str:
+    for row in reversed(result_rows(root)[-max(1, recent_rows) :]):
+        run_id = row.get("run_id", "")
+        if not run_id.startswith("supervisor-drafter-calibration-run-"):
+            continue
+        notes = row.get("notes", "").lower()
+        if "calibration memory gate blocked: after-load" in notes:
+            return "calibration-memory-after-load"
+        if "missing-runtime-module:mlx_vlm.speculative" in notes or "no module named 'mlx_vlm.speculative'" in notes:
+            return "calibration-runtime-missing-speculative"
+    return ""
 
 
 def recent_drafter_fit_plan_ready(root: Path, *, recent_rows: int = 160) -> bool:
@@ -1605,6 +1681,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     """Drop tasks from retired lanes before they enter the durable queue."""
     exhausted = exhausted_lanes(root)
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     seedable: list[dict[str, Any]] = []
     for task in tasks:
         lane = str(task.get("lane", ""))
@@ -1616,6 +1693,12 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             lane == "frontier-dflash"
             or action == "dflash-compatibility-gate"
             or "dflash-compatibility" in task_id
+        ):
+            continue
+        if calibration_blocker and (
+            action in {"drafter-calibration-canary", "drafter-calibration-run"}
+            or "drafter-calibration-canary" in task_id
+            or "drafter-calibration-run" in task_id
         ):
             continue
         seedable.append(task)
@@ -1658,14 +1741,36 @@ def recent_empty_bridge_rows(
 def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
     """Return one non-bridge task when handoff synthesis has already stalled."""
     tasks: list[dict[str, Any]] = []
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     if recent_drafter_fit_plan_ready(root, recent_rows=240):
-        if existing_drafter_trace_paths():
+        if existing_drafter_trace_paths() and not calibration_blocker:
             tasks.append(
                 drafter_calibration_canary_task(
                     timestamp,
                     task_id=f"handoff-audit-drafter-calibration-canary-{timestamp}",
                     priority=99,
                 )
+            )
+        elif calibration_blocker:
+            tasks.append(
+                {
+                    "id": f"handoff-audit-decode-remeasure-after-calibration-block-{timestamp}",
+                    "status": "ready",
+                    "priority": 99,
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "target": "decode-sample",
+                    "hypothesis": (
+                        "JANQ calibration is currently blocked by "
+                        f"{calibration_blocker}; continue overnight work with feasible decode measurement."
+                    ),
+                    "metric": "decode_tps",
+                    "benchmark_mode": "decode-sample",
+                    "guard_checks": ["memory_gate", "no_live_profile_change", "no_opencode_changes"],
+                    "acceptance": "A fresh decode benchmark records wall-clock and server tok/s without loading a second JANQ target.",
+                    "rollback": "No rollback needed; benchmark-only task.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+                }
             )
         elif recent_drafter_trace_missing(root, recent_rows=160):
             tasks.append(
@@ -3376,6 +3481,10 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         except subprocess.TimeoutExpired:
             test_result = {"ok": False, "returncode": 124, "tail": "focused test timeout"}
             failures.append("focused_test_timeout")
+    runtime_python = calibration_python()
+    runtime_issue = calibration_runtime_import_issue(runtime_python)
+    if runtime_issue:
+        failures.append(runtime_issue)
     calibrated_output = output_dir / f"calibrated-drafter-canary-{timestamp}"
     target_path = os.environ.get("OPENCLAW_JANQ_TARGET_PATH", str(plan.get("target_path") or DEFAULT_JANQ_TARGET_PATH))
     drafter_path = os.environ.get(
@@ -3383,7 +3492,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         os.environ.get("OPENCLAW_JANG_DRAFT_MODEL", DEFAULT_MTP_DRAFT_PATH),
     )
     bounded_command = [
-        "python3",
+        runtime_python,
         "/Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py",
         "--target-path",
         target_path,
@@ -3421,6 +3530,8 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "status": status,
         "decision": "ready-for-bounded-calibration" if status == "keep" else "blocked",
         "failures": failures,
+        "runtime_python": runtime_python,
+        "runtime_import_ok": not runtime_issue,
         "plan": str(plan_path),
         "trace_data": str(trace_path) if trace_path is not None else "",
         "trace_rows": len(trace_rows),

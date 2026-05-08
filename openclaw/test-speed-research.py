@@ -428,10 +428,41 @@ def main() -> int:
                         )
                         assert canary_report["decision"] == "ready-for-bounded-calibration"
                         assert canary_report["trace_rows"] == 4
+                        assert canary_report["runtime_import_ok"] is True
+                        assert canary_report["bounded_calibration_command"][0] == helper.calibration_python()
                         assert Path(canary_report["prompts_file"]).exists()
                         task_text = (root / "tasks.jsonl").read_text(encoding="utf-8")
                         assert "drafter-calibration-run-" in task_text
                         assert "openclaw-mtp-drafter-calibrate.py" in task_text
+                        fake_python = trace_home / "missing-speculative-python"
+                        fake_python.write_text(
+                            "#!/usr/bin/env python3\n"
+                            "import sys\n"
+                            "print(\"ModuleNotFoundError: No module named 'mlx_vlm.speculative'\")\n"
+                            "sys.exit(1)\n",
+                            encoding="utf-8",
+                        )
+                        fake_python.chmod(0o700)
+                        with patch.dict(os.environ, {"OPENCLAW_CALIBRATION_PYTHON": str(fake_python)}, clear=False):
+                            assert helper.calibration_python() == str(fake_python)
+                            assert (
+                                helper.calibration_runtime_import_issue(helper.calibration_python())
+                                == "missing-runtime-module:mlx_vlm.speculative.drafters"
+                            )
+                        blocked_root = Path(tmp) / "calibration-block-root"
+                        helper.ensure_research_state(blocked_root)
+                        helper.append_result(
+                            blocked_root,
+                            run_id="supervisor-drafter-calibration-run-unit",
+                            status="blocked",
+                            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                            hypothesis="unit calibration blocker",
+                            commit="abc123",
+                            notes="calibration memory gate blocked: after-load: free=795MB<16384MB",
+                        )
+                        assert helper.recent_calibration_run_hard_blocker(blocked_root) == "calibration-memory-after-load"
+                        assert not helper.should_seed_drafter_calibration_canary(blocked_root)
+                        assert not helper.should_seed_drafter_calibration_run(blocked_root)
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}

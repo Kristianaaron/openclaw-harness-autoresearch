@@ -10,13 +10,22 @@ normal MLX drafter directory that can be quantized and benchmarked separately.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import random
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+OPENCLAW_RUNTIME_SITE = Path(
+    os.environ.get("OPENCLAW_JANG_TARGET", Path.home() / ".openclaw" / "runtime" / "rapid-mlx" / "site")
+).expanduser()
+if OPENCLAW_RUNTIME_SITE.exists():
+    sys.path.insert(0, str(OPENCLAW_RUNTIME_SITE))
 
 import mlx.core as mx
 import mlx.nn as nn

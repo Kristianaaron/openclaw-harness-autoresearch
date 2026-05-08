@@ -180,6 +180,36 @@ def clean_tsv(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
 
 
+def calibration_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    runtime_site = Path(
+        os.environ.get("OPENCLAW_JANG_TARGET", OPENCLAW_HOME / "runtime" / "rapid-mlx" / "site")
+    ).expanduser()
+    pythonpath = str(runtime_site)
+    if env.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}{os.pathsep}{env['PYTHONPATH']}"
+    env["PYTHONPATH"] = pythonpath
+    return env
+
+
+def missing_speculative_runtime_issue(output: str) -> str:
+    lower = output.lower()
+    if "no module named 'mlx_vlm.speculative'" in lower or 'no module named "mlx_vlm.speculative"' in lower:
+        return "missing-runtime-module:mlx_vlm.speculative"
+    if "no module named 'mlx_vlm'" in lower or 'no module named "mlx_vlm"' in lower:
+        return "missing-runtime-module:mlx_vlm"
+    return ""
+
+
+def calibration_memory_gate_issue(output: str) -> str:
+    lower = output.lower()
+    if "calibration memory gate blocked: after-load" in lower:
+        return "calibration-memory-gate:after-load"
+    if "calibration memory gate blocked" in lower:
+        return "calibration-memory-gate"
+    return ""
+
+
 def is_memory_or_crash_issue(text: object) -> bool:
     lower = str(text).lower()
     return any(term in lower for term in MEMORY_OR_CRASH_TERMS)
@@ -2629,6 +2659,7 @@ def run_supervisor_drafter_calibration_run_task(
         try:
             result = subprocess.run(
                 command,
+                env=calibration_subprocess_env(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -2647,7 +2678,32 @@ def run_supervisor_drafter_calibration_run_task(
         file.write(result.stdout)
         file.flush()
     status = "keep" if result.returncode == 0 else "blocked"
-    reason = f"supervisor drafter calibration run exit {result.returncode}"
+    runtime_issue = missing_speculative_runtime_issue(result.stdout)
+    memory_gate_issue = calibration_memory_gate_issue(result.stdout)
+    reason = runtime_issue or memory_gate_issue or f"supervisor drafter calibration run exit {result.returncode}"
+    if runtime_issue:
+        mark_lane_exhausted(
+            WORKSPACE,
+            lane="drafter-calibration-runtime",
+            reason=runtime_issue,
+            evidence={
+                "task_id": task.get("id", "unknown"),
+                "command": command,
+                "output_tail": result.stdout[-1200:],
+            },
+        )
+    if memory_gate_issue:
+        mark_lane_exhausted(
+            WORKSPACE,
+            lane="drafter-calibration-memory",
+            reason=memory_gate_issue,
+            evidence={
+                "task_id": task.get("id", "unknown"),
+                "command": command,
+                "output_tail": result.stdout[-1200:],
+                "next": "suppress bounded calibration runs until the calibrator can avoid loading a second full JANQ target",
+            },
+        )
     append_result(
         WORKSPACE,
         run_id=f"supervisor-drafter-calibration-run-{cycle}",
@@ -2663,6 +2719,8 @@ def run_supervisor_drafter_calibration_run_task(
         summary={
             "reason": reason,
             "returncode": result.returncode,
+            "runtime_issue": runtime_issue,
+            "memory_gate_issue": memory_gate_issue,
             "output_tail": result.stdout[-1200:],
             "command": command,
         },
