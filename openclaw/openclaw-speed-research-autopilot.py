@@ -201,6 +201,17 @@ def missing_speculative_runtime_issue(output: str) -> str:
     return ""
 
 
+def calibration_quantized_gradient_issue(output: str) -> str:
+    lower = output.lower()
+    if "no gradient wrt the quantized weights" in lower:
+        return "calibration-quantized-gradient-unsupported"
+    if "quantizedmatmul::vjp" in lower and "no gradient" in lower:
+        return "calibration-quantized-gradient-unsupported"
+    if "uantized weights" in lower and ("returncode" in lower or "probe_exit:2" in lower):
+        return "calibration-quantized-gradient-unsupported"
+    return ""
+
+
 def calibration_memory_gate_issue(output: str) -> str:
     lower = output.lower()
     if "calibration memory gate blocked: after-load" in lower:
@@ -2766,11 +2777,15 @@ def run_supervisor_drafter_calibration_memory_stage_task(
     status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
     memory_gate_issue = calibration_memory_gate_issue(result.stdout)
     runtime_issue = missing_speculative_runtime_issue(result.stdout)
+    gradient_issue = calibration_quantized_gradient_issue(result.stdout)
     reason = (
-        runtime_issue
+        gradient_issue
+        or runtime_issue
         or memory_gate_issue
         or str(parsed.get("decision") or parsed.get("reason") or f"supervisor drafter calibration memory stage exit {result.returncode}")
     )
+    if gradient_issue:
+        status = "blocked"
     append_result(
         WORKSPACE,
         run_id=f"supervisor-drafter-calibration-memory-stage-{cycle}",
@@ -2779,7 +2794,7 @@ def run_supervisor_drafter_calibration_memory_stage_task(
         hypothesis=str(task.get("hypothesis", "run staged JANQ drafter calibration memory gate")),
         commit=current_commit(),
         notes=clean_tsv(
-            f"stage={task.get('stage', '')} reason={reason} output_tail={result.stdout[-500:]}"
+            f"stage={task.get('stage', '')} reason={reason} blocker={gradient_issue or ''} output_tail={result.stdout[-500:]}"
         ),
     )
     complete_supervisor_task(
@@ -2790,6 +2805,7 @@ def run_supervisor_drafter_calibration_memory_stage_task(
             "returncode": result.returncode,
             "runtime_issue": runtime_issue,
             "memory_gate_issue": memory_gate_issue,
+            "gradient_issue": gradient_issue,
             "parsed": parsed,
             "output_tail": result.stdout[-1200:],
             "command": command,
@@ -2865,7 +2881,8 @@ def run_supervisor_drafter_calibration_run_task(
     status = "keep" if result.returncode == 0 else "blocked"
     runtime_issue = missing_speculative_runtime_issue(result.stdout)
     memory_gate_issue = calibration_memory_gate_issue(result.stdout)
-    reason = runtime_issue or memory_gate_issue or f"supervisor drafter calibration run exit {result.returncode}"
+    gradient_issue = calibration_quantized_gradient_issue(result.stdout)
+    reason = gradient_issue or runtime_issue or memory_gate_issue or f"supervisor drafter calibration run exit {result.returncode}"
     if runtime_issue:
         mark_lane_exhausted(
             WORKSPACE,
@@ -2889,6 +2906,18 @@ def run_supervisor_drafter_calibration_run_task(
                 "next": "suppress bounded calibration runs until the calibrator can avoid loading a second full JANQ target",
             },
         )
+    if gradient_issue:
+        mark_lane_exhausted(
+            WORKSPACE,
+            lane="drafter-calibration-gradient",
+            reason=gradient_issue,
+            evidence={
+                "task_id": task.get("id", "unknown"),
+                "command": command,
+                "output_tail": result.stdout[-1200:],
+                "next": "suppress calibration until a trainable adapter path avoids gradients through quantized weights",
+            },
+        )
     append_result(
         WORKSPACE,
         run_id=f"supervisor-drafter-calibration-run-{cycle}",
@@ -2896,7 +2925,7 @@ def run_supervisor_drafter_calibration_run_task(
         target=str(task.get("target", "drafter-calibration-run")),
         hypothesis=str(task.get("hypothesis", "run bounded JANQ drafter calibration")),
         commit=current_commit(),
-        notes=clean_tsv(f"{reason} output_tail={result.stdout[-500:]}"),
+        notes=clean_tsv(f"{reason} blocker={gradient_issue or ''} output_tail={result.stdout[-500:]}"),
     )
     complete_supervisor_task(
         task,
@@ -2906,6 +2935,7 @@ def run_supervisor_drafter_calibration_run_task(
             "returncode": result.returncode,
             "runtime_issue": runtime_issue,
             "memory_gate_issue": memory_gate_issue,
+            "gradient_issue": gradient_issue,
             "output_tail": result.stdout[-1200:],
             "command": command,
         },

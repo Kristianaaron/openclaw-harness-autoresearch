@@ -63,6 +63,11 @@ def main() -> int:
                 [
                     {"status": "blocked", "target": "autoresearch-quality"},
                     {"status": "blocked", "target": "autoresearch-frontier-eval"},
+                    {
+                        "status": "blocked",
+                        "target": "janq-drafter-calibration-memory-stage",
+                        "notes": "[QuantizedMatmul::vjp] no gradient wrt the quantized weights.",
+                    },
                     {"status": "blocked", "target": "decode-sample"},
                 ]
             ) == [{"status": "blocked", "target": "decode-sample"}]
@@ -88,6 +93,10 @@ def main() -> int:
             lane_contracts = json.loads((root / "lane-contracts.json").read_text(encoding="utf-8"))
             assert "drafter-alignment" in lane_contracts["lanes"]
             assert "calibration-memory-after-load" in lane_contracts["lanes"]["drafter-alignment"]["hard_blockers"]
+            assert (
+                "calibration-quantized-gradient-unsupported"
+                in lane_contracts["lanes"]["drafter-alignment"]["hard_blockers"]
+            )
             replay_cases = (root / "replay-buffer.jsonl").read_text(encoding="utf-8")
             assert "decode-token-source-required" in replay_cases
             assert "profile-variant-paired-control" in replay_cases
@@ -561,6 +570,84 @@ def main() -> int:
                         assert len(contract_fallback) == 1
                         assert contract_fallback[0]["benchmark_mode"] == "decode-sample"
                         assert "calibration-memory-after-load" in contract_fallback[0]["hypothesis"]
+                        gradient_blocked_root = Path(tmp) / "calibration-gradient-block-root"
+                        helper.ensure_research_state(gradient_blocked_root)
+                        helper.append_result(
+                            gradient_blocked_root,
+                            run_id="supervisor-drafter-calibration-memory-stage-unit",
+                            status="blocked",
+                            target="janq-drafter-calibration-memory-stage",
+                            hypothesis="unit gradient blocker",
+                            commit="abc123",
+                            notes=(
+                                "stage=micro-step reason=calibration-quantized-gradient-unsupported "
+                                "output_tail=[QuantizedMatmul::vjp] no gradient wrt the quantized weights."
+                            ),
+                        )
+                        assert (
+                            helper.recent_calibration_run_hard_blocker(gradient_blocked_root)
+                            == "calibration-quantized-gradient-unsupported"
+                        )
+                        helper.append_result(
+                            gradient_blocked_root,
+                            run_id="supervisor-drafter-calibration-memory-stage-truncated-unit",
+                            status="blocked",
+                            target="janq-drafter-calibration-memory-stage",
+                            hypothesis="unit truncated gradient blocker",
+                            commit="abc123",
+                            notes='stage=micro-step reason=blocked output_tail=uantized weights.\\n", "returncode": 2',
+                        )
+                        assert (
+                            helper.recent_calibration_run_hard_blocker(gradient_blocked_root)
+                            == "calibration-quantized-gradient-unsupported"
+                        )
+                        assert not helper.should_seed_drafter_calibration_canary(gradient_blocked_root)
+                        assert not helper.should_seed_drafter_calibration_run(gradient_blocked_root)
+                        assert helper.actionable_blocked_rows(helper.result_rows(gradient_blocked_root)) == []
+                        assert helper.filter_seedable_tasks(
+                            gradient_blocked_root,
+                            [
+                                helper.drafter_calibration_canary_task(
+                                    123457,
+                                    task_id="drafter-calibration-canary-gradient-blocked",
+                                ),
+                                helper.drafter_calibration_memory_stage_task(
+                                    123457,
+                                    stage="micro-step",
+                                    task_id="drafter-calibration-memory-stage-micro-step-blocked",
+                                    bounded_command=["python3", "calibrate.py"],
+                                ),
+                            ],
+                        ) == []
+                        helper.upsert_tasks(
+                            gradient_blocked_root,
+                            [
+                                helper.drafter_calibration_memory_stage_task(
+                                    123458,
+                                    stage="micro-step",
+                                    task_id="drafter-calibration-memory-stage-micro-step-stale",
+                                    bounded_command=["python3", "calibrate.py"],
+                                )
+                            ],
+                        )
+                        assert helper.compact_terminal_calibration_tasks(gradient_blocked_root) == 1
+                        assert not helper.active_calibration_memory_stage_tasks(gradient_blocked_root)
+                        gradient_fallback = helper.lane_contract_fallback_tasks(
+                            gradient_blocked_root,
+                            helper.result_rows(gradient_blocked_root),
+                            123457,
+                            reason="unit gradient blocker",
+                        )
+                        assert len(gradient_fallback) == 1
+                        assert gradient_fallback[0]["supervisor_action"] == "calibration-memory-report"
+                        helper.upsert_tasks(gradient_blocked_root, gradient_fallback)
+                        quality_args = Namespace(
+                            recent_rows=120,
+                            min_sweeps=3,
+                            min_samples_per_block=3,
+                            target_tps=30.0,
+                        )
+                        assert helper.quality_review(quality_args) == 0
                         for index in range(3):
                             helper.append_result(
                                 blocked_root,

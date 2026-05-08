@@ -67,6 +67,11 @@ DEFAULT_MTP_CALIBRATOR_SCRIPT = (
     "/Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/openclaw-mtp-drafter-calibrate.py"
 )
 CALIBRATION_MEMORY_STAGES = ("metadata", "drafter-load", "target-load", "combined-load", "micro-step")
+CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
+CALIBRATION_CANARY_TERMINAL_BLOCKERS = {
+    "calibration-runtime-missing-speculative",
+    CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
+}
 DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
@@ -93,6 +98,7 @@ DEFAULT_LANE_CONTRACTS: dict[str, Any] = {
             "hard_blockers": [
                 "calibration-memory-after-load",
                 "calibration-runtime-missing-speculative",
+                CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
             ],
             "promotion_gate": "target-generated traces, calibration canary, acceptance lift, and paired decode benchmark",
         },
@@ -286,6 +292,21 @@ def ensure_lane_contracts(root: Path) -> dict[str, Any]:
         if lane not in lanes:
             lanes[lane] = contract
             changed = True
+            continue
+        existing_contract = lanes.get(lane)
+        if not isinstance(existing_contract, dict):
+            lanes[lane] = contract
+            changed = True
+            continue
+        for key, value in contract.items():
+            if key not in existing_contract:
+                existing_contract[key] = value
+                changed = True
+            elif key == "hard_blockers" and isinstance(existing_contract.get(key), list) and isinstance(value, list):
+                for blocker in value:
+                    if blocker not in existing_contract[key]:
+                        existing_contract[key].append(blocker)
+                        changed = True
     if changed:
         loaded.setdefault("version", DEFAULT_LANE_CONTRACTS["version"])
         write_if_changed(path, json.dumps(loaded, indent=2, sort_keys=True) + "\n")
@@ -1290,11 +1311,43 @@ def is_certification_blocked_row(row: dict[str, str]) -> bool:
     return row.get("status") == "blocked" and row.get("target") in CERTIFICATION_TARGETS
 
 
+def calibration_quantized_gradient_issue(text: object) -> str:
+    lower = str(text).lower()
+    if "no gradient wrt the quantized weights" in lower:
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+    if "quantizedmatmul::vjp" in lower and "no gradient" in lower:
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+    if "uantized weights" in lower and ("returncode" in lower or "probe_exit:2" in lower):
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+    return ""
+
+
+def is_known_terminal_calibration_blocked_row(row: dict[str, str]) -> bool:
+    if row.get("status") != "blocked":
+        return False
+    target = row.get("target", "")
+    run_id = row.get("run_id", "")
+    if "calibration" not in target and "calibration" not in run_id:
+        return False
+    notes = row.get("notes", "")
+    return (
+        CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in notes
+        or calibration_quantized_gradient_issue(notes) == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+        or (
+            row.get("run_id", "").startswith("drafter-calibration-memory-stage-micro-step-")
+            and "decision=blocked" in notes
+            and "failures=1" in notes
+        )
+    )
+
+
 def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return [
         row
         for row in rows
-        if row.get("status") == "blocked" and not is_certification_blocked_row(row)
+        if row.get("status") == "blocked"
+        and not is_certification_blocked_row(row)
+        and not is_known_terminal_calibration_blocked_row(row)
     ]
 
 
@@ -1514,6 +1567,48 @@ def compact_stale_calibration_canary_tasks(root: Path) -> int:
                 "finding": "completed stale calibration canary tasks after a downstream memory-stage was queued",
                 "evidence": {"compacted": compacted},
                 "next": "execute the queued calibration memory-stage",
+            },
+        )
+    return compacted
+
+
+def compact_terminal_calibration_tasks(root: Path) -> int:
+    """Complete queued calibration retries after a terminal calibration blocker is known."""
+    blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    if blocker not in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
+        return 0
+    tasks = read_jsonl(root / "tasks.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    compacted = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        task_id = str(task.get("id", ""))
+        action = str(task.get("supervisor_action", ""))
+        if not (
+            action in {"drafter-calibration-canary", "drafter-calibration-memory-stage", "drafter-calibration-run"}
+            or "drafter-calibration-canary" in task_id
+            or "drafter-calibration-memory-stage" in task_id
+            or "drafter-calibration-run" in task_id
+        ):
+            continue
+        task["status"] = "done"
+        task["completed_at"] = now
+        task["supervisor_summary"] = {
+            "reason": "terminal calibration blocker suppressed queued retry",
+            "blocker": blocker,
+        }
+        compacted += 1
+    if compacted:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": now,
+                "task_id": "terminal-calibration-compaction",
+                "finding": "completed queued calibration retries after a terminal calibration blocker was classified",
+                "evidence": {"compacted": compacted, "blocker": blocker},
+                "next": "route to a root-cause report or a changed trainable-adapter calibration method",
             },
         )
     return compacted
@@ -1935,7 +2030,7 @@ def existing_drafter_trace_paths() -> list[Path]:
 
 
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
-    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) == "calibration-runtime-missing-speculative":
+    if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
     return bool(existing_drafter_trace_paths()) and should_seed_action(
         root,
@@ -1955,11 +2050,20 @@ def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -
 
 
 def recent_calibration_run_hard_blocker(root: Path, *, recent_rows: int = 160) -> str:
+    calibration_prefixes = (
+        "supervisor-drafter-calibration-run-",
+        "supervisor-drafter-calibration-memory-stage-",
+        "drafter-calibration-run-",
+        "drafter-calibration-memory-stage-",
+    )
     for row in reversed(result_rows(root)[-max(1, recent_rows) :]):
         run_id = row.get("run_id", "")
-        if not run_id.startswith("supervisor-drafter-calibration-run-"):
+        if not run_id.startswith(calibration_prefixes):
             continue
         notes = row.get("notes", "").lower()
+        gradient_issue = calibration_quantized_gradient_issue(notes)
+        if gradient_issue:
+            return gradient_issue
         if "calibration memory gate blocked: after-load" in notes:
             return "calibration-memory-after-load"
         if "missing-runtime-module:mlx_vlm.speculative" in notes or "no module named 'mlx_vlm.speculative'" in notes:
@@ -2216,10 +2320,48 @@ def calibration_memory_report_task(timestamp: int, *, task_id: str, priority: in
         "hypothesis": "Calibration is blocked after loading the JANQ target and drafter, so produce one no-model root-cause report before more overnight cycles.",
         "metric": "calibration_memory_root_cause",
         "guard_checks": ["no_model_load", "one_narrow_tool", "no_live_profile_change", "no_opencode_changes"],
-        "acceptance": "A report records the after-load memory blocker, relevant calibration knobs, and the next implementation gate.",
+        "acceptance": "A report records the calibration blocker, relevant calibration knobs, and the next implementation gate.",
         "rollback": "No runtime rollback needed; this is a read-only supervisor report.",
         "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research calibration-memory-report",
     }
+
+
+def calibration_blocker_report_tasks(root: Path, timestamp: int, *, blocker: str) -> list[dict[str, Any]]:
+    for row in result_rows(root)[-240:]:
+        if row.get("run_id", "").startswith("calibration-memory-report-") and f"blocker={blocker}" in row.get("notes", ""):
+            return []
+    for task in read_jsonl(root / "tasks.jsonl"):
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if str(task.get("supervisor_action", "")) == "calibration-memory-report":
+            return []
+    if any_task_has_prefix(root, "calibration-memory-report-"):
+        tasks = read_jsonl(root / "tasks.jsonl")
+        if any(
+            task.get("status", "ready") in {"ready", "rework"}
+            and str(task.get("id", "")).startswith("calibration-memory-report-")
+            for task in tasks
+        ):
+            return []
+    if recent_result_has_prefix(root, "calibration-memory-report-", recent_rows=20):
+        return []
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "calibration-terminal-blocker",
+            "finding": "drafter calibration hit a terminal blocker; supervisor will report once instead of reseeding the same lane",
+            "blocker": blocker,
+            "next": "record root cause and wait for a changed calibration method or trainable adapter path",
+        },
+    )
+    return [
+        calibration_memory_report_task(
+            timestamp,
+            task_id=f"calibration-memory-report-{timestamp}",
+            priority=99,
+        )
+    ]
 
 
 def calibration_plateau_tasks(root: Path, plateau: dict[str, Any], timestamp: int, *, task_id: str) -> list[dict[str, Any]]:
@@ -2237,6 +2379,39 @@ def calibration_plateau_tasks(root: Path, plateau: dict[str, Any], timestamp: in
     ]
 
 
+def calibration_blocker_diagnosis(blocker: str) -> str:
+    if blocker == "calibration-memory-after-load":
+        return (
+            "bounded calibration is blocked after loading both the JANQ target and drafter; "
+            "the next useful work is a canary-only source change that reduces calibration load overlap "
+            "or lowers the calibration memory envelope before retrying training"
+        )
+    if blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        return (
+            "calibration reached the micro-step but MLX reported no gradient through quantized weights; "
+            "retrying the same JANQ/JANG quantized micro-step will repeat the failure"
+        )
+    if blocker == "calibration-runtime-missing-speculative":
+        return (
+            "calibration is blocked because the local runtime is missing the speculative decoding module; "
+            "retrying calibration is not useful until the runtime dependency changes"
+        )
+    return "no current calibration blocker was detected in recent calibration rows"
+
+
+def calibration_blocker_next_step(blocker: str) -> str:
+    if blocker == "calibration-memory-after-load":
+        return "implementation-gate: propose a canary-only calibration memory patch with tests, or wait for more free memory"
+    if blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        return (
+            "implementation-gate: design a canary-only adapter/calibration path that avoids differentiating "
+            "quantized target weights, or retire drafter calibration until that method exists"
+        )
+    if blocker == "calibration-runtime-missing-speculative":
+        return "implementation-gate: resolve runtime dependency or keep the lane suppressed"
+    return "continue normal drafter-alignment tasks"
+
+
 def lane_contract_fallback_tasks(
     root: Path,
     rows: list[dict[str, str]] | None,
@@ -2250,6 +2425,11 @@ def lane_contract_fallback_tasks(
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
+    if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        return filter_seedable_tasks(
+            root,
+            calibration_blocker_report_tasks(root, timestamp, blocker=calibration_blocker),
+        )
     if calibration_blocker and recent_lane_contract_decode_fallback_count(root, recent_rows=40) >= 3:
         plateau = recent_calibration_fallback_plateau(root, recent_rows=80)
         if plateau and plateau["no_model_escalations_done"]:
@@ -2404,9 +2584,14 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         ):
             continue
         calibration_blocked_action = action == "drafter-calibration-run" or "drafter-calibration-run" in task_id
-        if calibration_blocker == "calibration-runtime-missing-speculative":
+        if calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
             calibration_blocked_action = calibration_blocked_action or (
                 action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
+            )
+        if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+            calibration_blocked_action = calibration_blocked_action or (
+                action == "drafter-calibration-memory-stage"
+                or "drafter-calibration-memory-stage" in task_id
             )
         if calibration_blocker and calibration_blocked_action:
             continue
@@ -2696,6 +2881,7 @@ def research_quality_scorecard(
             "drafter-calibration-memory-stage",
             "drafter-trace-gate",
             "drafter-fit",
+            "calibration-memory-report",
             "runtime-overhead",
             "exhaustion-report",
         )
@@ -2836,6 +3022,7 @@ def quality_review(args: argparse.Namespace) -> int:
     ensure_lane_contracts(root)
     compacted_stage_tasks = compact_duplicate_calibration_stage_tasks(root)
     compacted_canary_tasks = compact_stale_calibration_canary_tasks(root)
+    compacted_terminal_tasks = compact_terminal_calibration_tasks(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
     raw_blocked = [row for row in recent if row.get("status") == "blocked"]
@@ -2910,6 +3097,8 @@ def quality_review(args: argparse.Namespace) -> int:
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     active_task_ids = [str(task.get("id", "")) for task in active_tasks]
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=max(160, int(args.recent_rows)))
+    has_terminal_calibration_route = calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS
     has_calibration_stage_route = any(
         str(task.get("supervisor_action", "")) == "drafter-calibration-memory-stage"
         or "drafter-calibration-memory-stage" in str(task.get("id", ""))
@@ -2919,7 +3108,7 @@ def quality_review(args: argparse.Namespace) -> int:
         not has_calibration_stage_route
         and any("drafter-calibration-canary" in task_id for task_id in active_task_ids)
     )
-    has_calibration_route = has_calibration_canary_route or has_calibration_stage_route
+    has_calibration_route = has_calibration_canary_route or has_calibration_stage_route or has_terminal_calibration_route
     repeated_canary_ready_no_stage = [
         row
         for row in recent[-60:]
@@ -3254,6 +3443,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "duplicate_stage_tasks": duplicate_stage_tasks,
         "compacted_stage_tasks": compacted_stage_tasks,
         "compacted_canary_tasks": compacted_canary_tasks,
+        "compacted_terminal_tasks": compacted_terminal_tasks,
         "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
         "recommendations": recommendations,
         "seeded_tasks": seeded,
@@ -4062,18 +4252,8 @@ def calibration_memory_report(args: argparse.Namespace) -> int:
         "plateau": plateau,
         "source_hits": hits[:80],
         "hit_count": len(hits),
-        "diagnosis": (
-            "bounded calibration is blocked after loading both the JANQ target and drafter; "
-            "the next useful work is a canary-only source change that reduces calibration load overlap "
-            "or lowers the calibration memory envelope before retrying training"
-            if blocker == "calibration-memory-after-load"
-            else "no current after-load memory blocker was detected in recent calibration rows"
-        ),
-        "next": (
-            "implementation-gate: propose a canary-only calibration memory patch with tests, or wait for more free memory"
-            if blocker
-            else "continue normal drafter-alignment tasks"
-        ),
+        "diagnosis": calibration_blocker_diagnosis(blocker),
+        "next": calibration_blocker_next_step(blocker),
     }
     path = root / "benchmarks" / f"calibration-memory-report-{report['timestamp']}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -4649,9 +4829,15 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
             returncode = result.returncode
             if result.returncode != 0:
                 failures.append(f"probe_exit:{result.returncode}")
+                gradient_issue = calibration_quantized_gradient_issue(result.stdout)
+                if gradient_issue:
+                    failures.append(gradient_issue)
         except subprocess.TimeoutExpired as error:
             stdout = (error.stdout or "") if isinstance(error.stdout, str) else ""
             failures.append("probe_timeout")
+            gradient_issue = calibration_quantized_gradient_issue(stdout)
+            if gradient_issue:
+                failures.append(gradient_issue)
             returncode = 124
         except OSError as error:
             failures.append(f"probe_exec_error:{type(error).__name__}")
@@ -4708,6 +4894,8 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
     decision = "blocked"
     if status == "keep":
         decision = "advance" if next_stage else "ready-for-bounded-calibration"
+    elif CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in failures:
+        decision = "terminal-blocker"
     report = {
         "ok": status == "keep",
         "kind": "drafter-calibration-memory-stage",
@@ -4750,7 +4938,8 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
         hypothesis="Staged calibration probes should isolate memory/runtime blockers before full JANQ drafter fitting.",
         commit=current_commit(repo_root()),
         notes=(
-            f"stage={stage} decision={decision} failures={len(failures)} "
+            f"stage={stage} decision={decision} failures={','.join(failures) or 'none'} "
+            f"blocker={CALIBRATION_QUANTIZED_GRADIENT_BLOCKER if CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in failures else ''} "
             f"seeded_next_stage={seeded_next_stage} seeded_run_task={seeded_run_task}"
         ),
     )
