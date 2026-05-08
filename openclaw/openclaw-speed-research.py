@@ -2588,6 +2588,7 @@ def quality_review(args: argparse.Namespace) -> int:
         server_decode_values=server_decode_values,
     )
     quality_score = max(legacy_quality_score, int(round(float(scorecard["overall"]))))
+    seeded_tasks = filter_seedable_tasks(root, seeded_tasks) if seeded_tasks else []
     seeded = upsert_tasks(root, seeded_tasks) if seeded_tasks else 0
     timestamp = int(time.time())
     artifact = {

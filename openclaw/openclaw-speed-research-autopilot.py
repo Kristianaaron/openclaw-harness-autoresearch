@@ -1989,9 +1989,22 @@ def run_supervisor_benchmark_task(
     parsed = parse_json_object(result.stdout)
     if result.returncode != 0:
         reason = str((parsed or {}).get("reason") or f"supervisor benchmark exit {result.returncode}")
+        complete_supervisor_task(
+            task,
+            status="blocked",
+            summary={"mode": mode, "reason": reason, "result": parsed or {}},
+            commit=current_commit(),
+        )
         return result.returncode, reason
     if parsed and parsed.get("ok") is False:
-        return 2, str(parsed.get("reason") or "supervisor benchmark blocked")
+        reason = str(parsed.get("reason") or "supervisor benchmark blocked")
+        complete_supervisor_task(
+            task,
+            status="blocked",
+            summary={"mode": mode, "reason": reason, "result": parsed},
+            commit=current_commit(),
+        )
+        return 2, reason
     if parsed:
         append_jsonl(
             EXPERIMENTS,
@@ -2003,6 +2016,12 @@ def run_supervisor_benchmark_task(
                 "fallback": fallback,
                 "result": parsed,
             },
+        )
+        complete_supervisor_task(
+            task,
+            status="keep",
+            summary={"mode": mode, "fallback": fallback, "result": parsed},
+            commit=current_commit(),
         )
     return 0, ""
 

@@ -854,6 +854,41 @@ def main() -> int:
         assert issue == ""
         assert fit_plan.exists()
         assert "supervisor-drafter-fit-9" in helper.RESULTS.read_text(encoding="utf-8")
+        benchmark_helper = Path(tmp) / "benchmark-helper.py"
+        benchmark_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok': True, 'mode': 'decode-sample', 'decode_tps': 14.5, 'completion_tokens': 96}))\n",
+            encoding="utf-8",
+        )
+        benchmark_helper.chmod(0o700)
+        benchmark_task = {
+            "id": "lane-contract-decode-remeasure-unit",
+            "status": "ready",
+            "lane": "runtime-overhead",
+            "task_type": "supervisor",
+            "benchmark_mode": "decode-sample",
+            "target": "decode-sample",
+            "hypothesis": "unit benchmark task should be completed by the supervisor",
+        }
+        helper.write_jsonl(helper.TASKS, [benchmark_task])
+        with patch.object(helper, "ensure_model_for_supervisor_task", return_value=(True, "")):
+            code, issue = helper.run_supervisor_benchmark_task(
+                Namespace(
+                    research_helper_bin=str(benchmark_helper),
+                    supervisor_benchmark_timeout_seconds=10,
+                    model_start_timeout_seconds=1.0,
+                ),
+                10,
+                "test-session",
+                helper.read_jsonl(helper.TASKS)[0],
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == ""
+        completed_benchmark_task = helper.read_jsonl(helper.TASKS)[0]
+        assert completed_benchmark_task["status"] == "done"
+        assert completed_benchmark_task["supervisor_summary"]["result"]["decode_tps"] == 14.5
         trace_helper = Path(tmp) / "trace-helper.py"
         trace_helper.write_text(
             "#!/usr/bin/env python3\n"
