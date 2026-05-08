@@ -625,6 +625,15 @@ def is_supervisor_drafter_calibration_canary_task(task: dict[str, object] | None
     )
 
 
+def is_supervisor_drafter_calibration_run_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-calibration-run"
+        or "openclaw-mtp-drafter-calibrate.py" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_dflash_compatibility_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -691,6 +700,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_drafter_trace_prerequisite_task,
             is_supervisor_drafter_trace_collect_task,
             is_supervisor_drafter_calibration_canary_task,
+            is_supervisor_drafter_calibration_run_task,
             is_supervisor_dflash_compatibility_task,
             is_supervisor_focused_test_task,
             is_supervisor_gepa_policy_canary_task,
@@ -2574,6 +2584,93 @@ def run_supervisor_drafter_calibration_canary_task(
     return 0, "" if status == "keep" else reason
 
 
+def run_supervisor_drafter_calibration_run_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    command = task.get("bounded_command")
+    if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+        reason = "drafter calibration run missing bounded_command"
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason}, commit=current_commit())
+        return 2, reason
+    if model_ready():
+        stop_openclaw_model_for_memory_recovery(
+            args,
+            reason=f"supervisor drafter calibration run requires exclusive JANQ target load: task={task.get('id', 'unknown')}",
+        )
+    ready, memory_issue = wait_for_memory(args)
+    if not ready:
+        complete_supervisor_task(
+            task,
+            status="blocked",
+            summary={"reason": memory_issue, "deferred": True},
+            commit=current_commit(),
+        )
+        append_result(
+            WORKSPACE,
+            run_id=f"supervisor-drafter-calibration-run-{cycle}",
+            status="blocked",
+            target=str(task.get("target", "drafter-calibration-run")),
+            hypothesis=str(task.get("hypothesis", "run bounded JANQ drafter calibration")),
+            commit=current_commit(),
+            notes=clean_tsv(memory_issue),
+        )
+        return 75, memory_issue
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter calibration run "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(command) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=1800,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER CALIBRATION RUN TIMEOUT\n")
+            complete_supervisor_task(
+                task,
+                status="blocked",
+                summary={"reason": "supervisor drafter calibration run timeout"},
+                commit=current_commit(),
+            )
+            return 124, "supervisor drafter calibration run timeout"
+        file.write(result.stdout)
+        file.flush()
+    status = "keep" if result.returncode == 0 else "blocked"
+    reason = f"supervisor drafter calibration run exit {result.returncode}"
+    append_result(
+        WORKSPACE,
+        run_id=f"supervisor-drafter-calibration-run-{cycle}",
+        status=status,
+        target=str(task.get("target", "drafter-calibration-run")),
+        hypothesis=str(task.get("hypothesis", "run bounded JANQ drafter calibration")),
+        commit=current_commit(),
+        notes=clean_tsv(f"{reason} output_tail={result.stdout[-500:]}"),
+    )
+    complete_supervisor_task(
+        task,
+        status=status,
+        summary={
+            "reason": reason,
+            "returncode": result.returncode,
+            "output_tail": result.stdout[-1200:],
+            "command": command,
+        },
+        commit=current_commit(),
+    )
+    return 0, "" if status == "keep" else reason
+
+
 def run_supervisor_dflash_compatibility_task(
     args: argparse.Namespace,
     cycle: int,
@@ -3524,6 +3621,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_canary_task(selected_task):
             code, issue = run_supervisor_drafter_calibration_canary_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_calibration_run_task(selected_task):
+            code, issue = run_supervisor_drafter_calibration_run_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
             code, issue = run_supervisor_dflash_compatibility_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):

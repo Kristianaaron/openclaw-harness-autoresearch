@@ -1413,6 +1413,33 @@ def drafter_calibration_canary_task(timestamp: int, *, task_id: str, priority: i
     }
 
 
+def drafter_calibration_run_task(
+    timestamp: int,
+    *,
+    task_id: str,
+    bounded_command: list[str],
+    priority: int = 97,
+) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-calibration-run",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-jang-vlm-server.py"],
+        "hypothesis": "A validated JANQ trace canary should advance into exactly one bounded calibration experiment.",
+        "metric": "acceptance_delta",
+        "guard_checks": ["stop_live_model_first", "memory_gate", "bounded_training", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "The calibration script writes a keep/blocked artifact and no live profile is changed unless later paired benchmarks pass.",
+        "rollback": "Discard the output directory and keep the current official q4 drafter if calibration blocks or does not beat paired benchmarks.",
+        "bounded_command": bounded_command,
+        "next_action": " ".join(bounded_command),
+        "created_at": timestamp,
+    }
+
+
 def drafter_trace_candidates() -> list[Path]:
     return [
         home() / "drafter-fit" / "target-generated-traces.jsonl",
@@ -1429,6 +1456,14 @@ def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120
     return bool(existing_drafter_trace_paths()) and should_seed_action(
         root,
         "drafter-calibration-canary-",
+        recent_rows=recent_rows,
+    )
+
+
+def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -> bool:
+    return should_seed_action(
+        root,
+        "drafter-calibration-run-",
         recent_rows=recent_rows,
     )
 
@@ -3396,6 +3431,19 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "memory_after_mb": memory_snapshot(),
         "timestamp": timestamp,
     }
+    seeded_run_task = 0
+    if status == "keep" and should_seed_drafter_calibration_run(root, recent_rows=120):
+        seeded_run_task = upsert_tasks(
+            root,
+            [
+                drafter_calibration_run_task(
+                    timestamp,
+                    task_id=f"drafter-calibration-run-{timestamp}",
+                    bounded_command=bounded_command,
+                )
+            ],
+        )
+    report["seeded_run_task"] = seeded_run_task
     artifact = root / "benchmarks" / f"drafter-calibration-canary-{timestamp}.json"
     artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -3417,7 +3465,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         commit=current_commit(repo_root()),
         notes=(
             f"decision={report['decision']} trace_rows={len(trace_rows)} "
-            f"test_ok={test_result.get('ok')} failures={len(failures)}"
+            f"test_ok={test_result.get('ok')} failures={len(failures)} seeded_run_task={seeded_run_task}"
         ),
     )
     print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))

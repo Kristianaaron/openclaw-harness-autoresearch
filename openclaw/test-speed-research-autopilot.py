@@ -1282,6 +1282,33 @@ def main() -> int:
         )
         assert code == 0
         assert issue == ""
+        calibration_run_helper = Path(tmp) / "calibration-run-helper.py"
+        calibration_run_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('bounded calibration complete')\n",
+            encoding="utf-8",
+        )
+        calibration_run_helper.chmod(0o700)
+        calibration_run_task = {
+            "id": "calibration-run",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-run",
+            "bounded_command": [str(calibration_run_helper)],
+            "next_action": str(calibration_run_helper),
+        }
+        assert helper.is_supervisor_drafter_calibration_run_task(calibration_run_task)
+        assert helper.task_runs_without_model(calibration_run_task)
+        with patch.object(helper, "model_ready", return_value=False), patch.object(helper, "wait_for_memory", return_value=(True, "")):
+            code, issue = helper.run_supervisor_drafter_calibration_run_task(
+                Namespace(),
+                15,
+                "nightly",
+                calibration_run_task,
+                Path(tmp) / "autopilot.log",
+            )
+        assert code == 0
+        assert issue == ""
         bench_helper = Path(tmp) / "benchmark-helper.py"
         bench_helper.write_text(
             "#!/usr/bin/env python3\n"

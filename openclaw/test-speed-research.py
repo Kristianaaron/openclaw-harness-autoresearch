@@ -429,6 +429,9 @@ def main() -> int:
                         assert canary_report["decision"] == "ready-for-bounded-calibration"
                         assert canary_report["trace_rows"] == 4
                         assert Path(canary_report["prompts_file"]).exists()
+                        task_text = (root / "tasks.jsonl").read_text(encoding="utf-8")
+                        assert "drafter-calibration-run-" in task_text
+                        assert "openclaw-mtp-drafter-calibrate.py" in task_text
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
