@@ -3277,6 +3277,8 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
         except subprocess.TimeoutExpired:
             return False, "supervisor synthesis timeout"
     if result.returncode != 0:
+        if result.returncode == 2:
+            return False, "supervisor synthesis terminal no-work"
         return False, f"supervisor synthesis exit {result.returncode}"
     return True, ""
 
@@ -3824,6 +3826,27 @@ def main() -> int:
             after = durable_snapshot()
             progress_reasons = durable_progress(before, after)
             deterministic_ready = deterministic_ready_tasks()
+            if not ok and issue == "supervisor synthesis terminal no-work":
+                review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
+                after_review = durable_snapshot()
+                review_progress = durable_progress(after, after_review)
+                deterministic_ready = deterministic_ready_tasks()
+                if deterministic_ready:
+                    progress_cycles += 1
+                    log(
+                        f"cycle={cycle} terminal_no_work_review ok={review_ok} "
+                        f"deterministic_ready={len(deterministic_ready)} "
+                        f"artifact={','.join(review_progress) if review_progress else 'none'}"
+                    )
+                    time.sleep(args.sleep_seconds)
+                    continue
+                pause_reason = (
+                    "synthesis reported terminal no-work and review found no deterministic ready task; "
+                    f"{review_issue or 'research lanes are exhausted or waiting on new prerequisites'}"
+                )
+                append_quality_pause(cycle, current_session, pause_reason)
+                log(f"cycle={cycle} terminal_no_work_pause reason={pause_reason}")
+                break
             if ok and not deterministic_ready:
                 review_ok, review_issue = run_supervisor_quality_review(args, cycle, current_session, log_file)
                 after_review = durable_snapshot()

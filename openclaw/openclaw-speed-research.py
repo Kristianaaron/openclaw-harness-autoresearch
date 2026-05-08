@@ -1304,6 +1304,7 @@ def result_rows(root: Path) -> list[dict[str, str]]:
 CERTIFICATION_TARGETS = {
     "autoresearch-quality",
     "autoresearch-frontier-eval",
+    "autoresearch-frontier-certification",
 }
 
 
@@ -1379,6 +1380,16 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
     if latest_clean_handoff_index < 0:
         return blocked
 
+    latest_progress_index = latest_clean_handoff_index
+    for index, row in enumerate(rows):
+        if row.get("status") != "keep":
+            continue
+        if row.get("target") in CERTIFICATION_TARGETS:
+            continue
+        if row.get("target") in {"synthesis", "autopilot"}:
+            continue
+        latest_progress_index = max(latest_progress_index, index)
+
     unresolved: list[dict[str, str]] = []
     for index, row in enumerate(rows):
         if row not in blocked:
@@ -1386,6 +1397,17 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
         if index < latest_clean_handoff_index and (
             row.get("target") == "autoresearch-implementation-handoff"
             or row.get("run_id", "").startswith("supervisor-implementation-bridge-")
+        ):
+            continue
+        if index < latest_progress_index and (
+            (
+                row.get("target") == "synthesis"
+                and "seeded_tasks=0" in row.get("notes", "")
+            )
+            or (
+                row.get("target") == "autopilot"
+                and "supervisor synthesis" in row.get("notes", "")
+            )
         ):
             continue
         unresolved.append(row)
@@ -3135,6 +3157,7 @@ def quality_review(args: argparse.Namespace) -> int:
     repeated_keep_current = len(sweep_fields) >= int(args.min_sweeps) and all(
         fields.get("decision") == "keep-current" for fields in sweep_fields[-int(args.min_sweeps) :]
     )
+    durable_sweep_coverage = len(sweep_rows) >= int(args.min_sweeps) and repeated_block2 and repeated_keep_current
     tasks = read_jsonl(root / "tasks.jsonl")
     active_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     active_task_ids = [str(task.get("id", "")) for task in active_tasks]
@@ -3179,7 +3202,7 @@ def quality_review(args: argparse.Namespace) -> int:
     recommendations: list[str] = []
     gates: dict[str, Any] = {
         "no_blocked_rows": not blocked,
-        "required_block_coverage": not missing_required_blocks or has_calibration_route,
+        "required_block_coverage": not missing_required_blocks or has_calibration_route or durable_sweep_coverage,
         "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
         "has_frontier_next_lane": bool(frontier_ready),
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
@@ -3214,7 +3237,7 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append(
             "calibration canary has repeatedly confirmed readiness without advancing; run the queued memory-stage before any new canary."
         )
-    if missing_required_blocks and not has_calibration_route:
+    if missing_required_blocks and not has_calibration_route and not durable_sweep_coverage:
         quality_score -= 20
         recommendations.append(
             "coverage gap: rerun a bounded sweep before trusting conclusions; missing blocks="
@@ -3398,7 +3421,7 @@ def quality_review(args: argparse.Namespace) -> int:
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
     verdict = "healthy"
-    coverage_gap = bool(missing_required_blocks and not has_calibration_route)
+    coverage_gap = bool(missing_required_blocks and not has_calibration_route and not durable_sweep_coverage)
     if exhaustion_candidate:
         verdict = "exhaustion-candidate"
     elif coverage_gap or blocked:
