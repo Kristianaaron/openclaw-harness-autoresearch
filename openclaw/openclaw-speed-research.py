@@ -1780,7 +1780,7 @@ def lane_contract_decode_task(timestamp: int, *, task_id: str, reason: str, prio
 
 def recent_lane_contract_decode_fallback_count(root: Path, *, recent_rows: int = 40) -> int:
     rows = result_rows(root)[-max(1, recent_rows) :]
-    return sum(
+    row_count = sum(
         1
         for row in rows
         if (
@@ -1789,6 +1789,78 @@ def recent_lane_contract_decode_fallback_count(root: Path, *, recent_rows: int =
             and row.get("target") == "decode-sample"
             and "lane-contract-decode-remeasure-" in row.get("notes", "")
         )
+    )
+    task_count = sum(
+        1
+        for task in read_jsonl(root / "tasks.jsonl")
+        if str(task.get("id", "")).startswith(
+            (
+                "lane-contract-decode-remeasure-",
+                "handoff-audit-decode-remeasure-after-calibration-block-",
+            )
+        )
+    )
+    return row_count + task_count
+
+
+def recent_calibration_fallback_plateau(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 80,
+    min_clean_decode_rows: int = 4,
+    max_clean_decode_tps: float = 18.0,
+) -> dict[str, Any] | None:
+    """Detect when calibration is blocked and fallback decode remeasurements are no longer useful."""
+    recent = (rows if rows is not None else result_rows(root))[-max(1, recent_rows) :]
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    if not calibration_blocker:
+        return None
+    fallback_count = recent_lane_contract_decode_fallback_count(root, recent_rows=recent_rows)
+    if fallback_count < 3:
+        return None
+    clean_decode_values: list[float] = []
+    for row in recent:
+        if row.get("status") != "keep" or row.get("target") != "decode-sample":
+            continue
+        signal = decode_measurement_signal(row)
+        if signal["contaminated"]:
+            continue
+        value = signal.get("server_decode_tps") or signal.get("wall_decode_tps")
+        if value is not None:
+            clean_decode_values.append(float(value))
+    if len(clean_decode_values) < min_clean_decode_rows:
+        return None
+    best_clean = max(clean_decode_values)
+    if best_clean >= max_clean_decode_tps:
+        return None
+    no_model_escalations_done = any_task_has_prefix(
+        root, "lane-contract-runtime-overhead-map-after-fallback-"
+    ) and any_task_has_prefix(root, "lane-contract-mtp-report-after-fallback-")
+    return {
+        "calibration_blocker": calibration_blocker,
+        "fallback_count": fallback_count,
+        "clean_decode_rows": len(clean_decode_values),
+        "best_clean_decode_tps": round(best_clean, 3),
+        "mean_clean_decode_tps": mean_value(clean_decode_values),
+        "no_model_escalations_done": no_model_escalations_done,
+        "max_clean_decode_tps": max_clean_decode_tps,
+    }
+
+
+def record_calibration_fallback_plateau(root: Path, plateau: dict[str, Any], *, task_id: str) -> None:
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": task_id,
+            "finding": "calibration fallback plateau reached; supervisor stopped reseeding decode remeasurements",
+            "evidence": plateau,
+            "next": (
+                "wait for new JANQ trace/calibration prerequisites or a specific implementation candidate; "
+                "do not rerun generic decode fallback benchmarks"
+            ),
+        },
     )
 
 
@@ -1806,6 +1878,10 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     if calibration_blocker and recent_lane_contract_decode_fallback_count(root, recent_rows=40) >= 3:
+        plateau = recent_calibration_fallback_plateau(root, recent_rows=80)
+        if plateau and plateau["no_model_escalations_done"]:
+            record_calibration_fallback_plateau(root, plateau, task_id="lane-contract-fallback-plateau")
+            return []
         if not any_task_has_prefix(root, "lane-contract-runtime-overhead-map-after-fallback-"):
             return filter_seedable_tasks(
                 root,
@@ -1984,6 +2060,10 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
                 )
             )
         elif calibration_blocker:
+            plateau = recent_calibration_fallback_plateau(root, rows, recent_rows=100)
+            if plateau:
+                record_calibration_fallback_plateau(root, plateau, task_id="handoff-audit-calibration-plateau")
+                return []
             tasks.append(
                 {
                     "id": f"handoff-audit-decode-remeasure-after-calibration-block-{timestamp}",

@@ -558,6 +558,40 @@ def main() -> int:
                         assert "lane-contract-fallback-exhausted" in (
                             blocked_root / "findings.jsonl"
                         ).read_text(encoding="utf-8")
+                        for index in range(4):
+                            helper.append_result(
+                                blocked_root,
+                                run_id=f"benchmark-plateau-{index}",
+                                status="keep",
+                                target="decode-sample",
+                                hypothesis="unit clean plateau decode",
+                                commit="abc123",
+                                decode_tps=14.0 + index / 10,
+                                wall_s=6.8,
+                                notes="server_tok_s=14.5 server_elapsed_s=6.6 measurement_quality=clean",
+                            )
+                        helper.append_result(
+                            blocked_root,
+                            run_id="supervisor-drafter-fit-unit",
+                            status="keep",
+                            target="/tmp/fit-plan.json",
+                            hypothesis="unit plan ready",
+                            commit="abc123",
+                            notes="decision=ready-for-target-generated-trace-data",
+                        )
+                        plateau = helper.recent_calibration_fallback_plateau(blocked_root)
+                        assert plateau
+                        assert plateau["best_clean_decode_tps"] == 14.5
+                        assert plateau["no_model_escalations_done"] is True
+                        handoff_after_plateau = helper.concrete_handoff_prerequisite_tasks(
+                            blocked_root,
+                            helper.result_rows(blocked_root),
+                            123461,
+                        )
+                        assert handoff_after_plateau == []
+                        assert "handoff-audit-calibration-plateau" in (
+                            blocked_root / "findings.jsonl"
+                        ).read_text(encoding="utf-8")
             benchmark_json = sorted((root / "benchmarks").glob("benchmark-*-decode-sample.json"))[-1]
             benchmark_data = json.loads(benchmark_json.read_text(encoding="utf-8"))
             assert benchmark_data["draft_block_size"] in {1, 2, 3}
