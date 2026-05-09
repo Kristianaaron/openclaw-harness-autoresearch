@@ -3303,6 +3303,8 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
         )
 
     for prefix, task in candidates:
+        if any_task_has_prefix(root, prefix):
+            continue
         if should_seed_action(root, prefix, recent_rows=240):
             return filter_seedable_tasks(root, [task])
     return []

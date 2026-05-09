@@ -644,6 +644,20 @@ def main() -> int:
                         assert "no_model_load" in gradient_expansion[0]["guard_checks"]
                         assert "JANQ calibration is blocked" in gradient_expansion[0]["hypothesis"]
                         assert not helper.task_contract_issues(gradient_blocked_root, gradient_expansion[0])["blockers"]
+                        helper.upsert_tasks(gradient_blocked_root, gradient_expansion)
+                        consumed_gradient_tasks = helper.read_jsonl(gradient_blocked_root / "tasks.jsonl")
+                        for task in consumed_gradient_tasks:
+                            if task["id"] == gradient_expansion[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(gradient_blocked_root / "tasks.jsonl", consumed_gradient_tasks)
+                        assert (
+                            helper.frontier_expansion_tasks(
+                                gradient_blocked_root,
+                                helper.result_rows(gradient_blocked_root),
+                                123458,
+                            )
+                            == []
+                        )
                         helper.upsert_tasks(
                             gradient_blocked_root,
                             [
