@@ -477,10 +477,40 @@ def main() -> int:
             ],
         )
         external_status = helper.external_change_required_status(external_args)
+        assert external_status["should_stop"] is False
+        assert external_status["reason"] == "ready deterministic/prerequisite task exists"
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "terminal-runtime-overhead",
+                    "status": "done",
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
+                }
+            ],
+        )
+        external_status = helper.external_change_required_status(external_args)
         assert external_status["should_stop"] is True
         helper.append_external_change_required(44, "nightly", external_status)
         assert "external-change-required-44" in helper.RESULTS.read_text(encoding="utf-8")
         assert "autoresearch-external-change-required" in helper.FINDINGS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "frontier-repair-exhaustion-mtp-report",
+                    "status": "ready",
+                    "lane": "exhaustion-report",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                }
+            ],
+        )
+        mtp_status = helper.external_change_required_status(external_args)
+        assert mtp_status["should_stop"] is False
+        assert mtp_status["reason"] == "ready deterministic/prerequisite task exists"
         helper.write_jsonl(
             helper.TASKS,
             [

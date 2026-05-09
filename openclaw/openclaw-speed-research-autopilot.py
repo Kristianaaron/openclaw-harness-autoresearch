@@ -597,6 +597,14 @@ def external_change_required_status(args: argparse.Namespace) -> dict[str, objec
             "ready_tasks": [str(task.get("id", "")) for task in ready_impl[:8]],
         }
 
+    deterministic_ready = [task for task in ready if task_runs_without_model(task)]
+    if deterministic_ready:
+        return {
+            "should_stop": False,
+            "reason": "ready deterministic/prerequisite task exists",
+            "ready_tasks": [str(task.get("id", "")) for task in deterministic_ready[:8]],
+        }
+
     meaningful_ready = [
         task
         for task in ready
