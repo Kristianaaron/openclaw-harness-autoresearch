@@ -1151,6 +1151,9 @@ def self_improve(args: argparse.Namespace) -> int:
             recent_rows=args.recent_rows,
             max_variants_per_skill=args.max_variants_per_skill,
             min_score=args.min_score,
+            shadow_min_score=args.shadow_min_score,
+            stage_min_wins=args.stage_min_wins,
+            stage_max_effective_authority=args.stage_max_effective_authority,
         )
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
@@ -7312,6 +7315,13 @@ def main() -> int:
     self_improve_parser.add_argument("--recent-rows", type=int, default=160)
     self_improve_parser.add_argument("--max-variants-per-skill", type=int, default=2)
     self_improve_parser.add_argument("--min-score", type=int, default=90)
+    self_improve_parser.add_argument("--shadow-min-score", type=int, default=90)
+    self_improve_parser.add_argument("--stage-min-wins", type=int, default=2)
+    self_improve_parser.add_argument(
+        "--stage-max-effective-authority",
+        choices=("none", "canary", "shadow", "advisory"),
+        default="advisory",
+    )
     self_improve_parser.set_defaults(func=self_improve)
 
     prompt = sub.add_parser("prompt")

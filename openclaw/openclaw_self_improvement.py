@@ -28,9 +28,15 @@ PROPOSALS = "evolution-proposals.jsonl"
 EVAL_CASES = "evolution-eval-cases.jsonl"
 VARIANTS = "evolution-variants.jsonl"
 DECISIONS = "evolution-decisions.jsonl"
+SHADOW_REVIEWS = "evolution-shadow-reviews.jsonl"
+PROMOTIONS = "evolution-promotions.jsonl"
+ROLLBACKS = "evolution-rollbacks.jsonl"
 SKILLS_DIR = "skills"
 SNAPSHOTS_DIR = "snapshots"
 CANARIES_DIR = "evolution-canaries"
+
+AUTHORITY_STAGES = ("canary", "shadow", "advisory", "task_seed", "supervisor_route")
+DEFAULT_MAX_EFFECTIVE_AUTHORITY = "advisory"
 
 EVOLUTION_TARGETS = {
     "decode-speed-research",
@@ -186,7 +192,17 @@ def ensure_self_improvement_state(root: Path) -> None:
     base = self_root(root)
     (base / SKILLS_DIR).mkdir(parents=True, exist_ok=True)
     (base / SNAPSHOTS_DIR).mkdir(parents=True, exist_ok=True)
-    for name in (LESSONS, TRAJECTORIES, PROPOSALS, EVAL_CASES, VARIANTS, DECISIONS):
+    for name in (
+        LESSONS,
+        TRAJECTORIES,
+        PROPOSALS,
+        EVAL_CASES,
+        VARIANTS,
+        DECISIONS,
+        SHADOW_REVIEWS,
+        PROMOTIONS,
+        ROLLBACKS,
+    ):
         if not (base / name).exists():
             (base / name).write_text("", encoding="utf-8")
     usage_path = base / USAGE
@@ -772,6 +788,288 @@ def score_skill_variant(root: Path, variant: dict[str, Any], cases: list[dict[st
     }
 
 
+def latest_decision_by_variant(root: Path) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(self_root(root) / DECISIONS):
+        variant_id = str(row.get("variant_id", ""))
+        if variant_id:
+            latest[variant_id] = row
+    return latest
+
+
+def variant_metadata_by_id(root: Path) -> dict[str, dict[str, Any]]:
+    return {str(row.get("id", "")): row for row in read_jsonl(self_root(root) / VARIANTS) if row.get("id")}
+
+
+def eval_cases_by_id(root: Path) -> dict[str, dict[str, Any]]:
+    return {str(row.get("id", "")): row for row in read_jsonl(self_root(root) / EVAL_CASES) if row.get("id")}
+
+
+def latest_shadow_reviews_by_variant(root: Path) -> dict[str, list[dict[str, Any]]]:
+    reviews: dict[str, list[dict[str, Any]]] = {}
+    for row in read_jsonl(self_root(root) / SHADOW_REVIEWS):
+        variant_id = str(row.get("variant_id", ""))
+        if variant_id:
+            reviews.setdefault(variant_id, []).append(row)
+    return reviews
+
+
+def canary_skill_body(canary_path: str, target_skill: str) -> str:
+    if not canary_path:
+        return ""
+    path = Path(canary_path) / "skills" / target_skill / "SKILL.md"
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def shadow_case_coverage_score(body: str, cases: list[dict[str, Any]], *, is_canary: bool) -> dict[str, Any]:
+    text = body.lower()
+    score = 55.0
+    matched = 0
+    missing: list[str] = []
+    required_terms = {
+        "decode-speed-research": ("decode", "paired", "acceptance", "promotion"),
+        "implementation-gate": ("source", "canary", "rollback", "approval"),
+        "reviewer-quality": ("duplicate", "evidence", "route", "actionable"),
+        "self-improvement-curator": ("trajectory", "evidence", "authority", "mutation"),
+    }
+    for case in cases:
+        target = str(case.get("target_skill", "self-improvement-curator"))
+        terms = required_terms.get(target, required_terms["self-improvement-curator"])
+        case_hits = sum(1 for term in terms if term in text)
+        if case_hits >= max(2, len(terms) - 1):
+            matched += 1
+        else:
+            missing.append(str(case.get("id", "")))
+        score += min(8.0, case_hits * 1.4) * float(case.get("weight") or 1.0)
+    if "no opencode changes" in text:
+        score += 4.0
+    if "no live model/backend mutation" in text:
+        score += 4.0
+    if "rollback" in text:
+        score += 4.0
+    if "promotion gates" in text:
+        score += 4.0
+    if is_canary and "canary candidate" in text:
+        score += 4.0
+    return {
+        "score": round(max(0.0, min(100.0, score)), 2),
+        "matched_cases": matched,
+        "missing_case_ids": missing[:8],
+    }
+
+
+def shadow_review_variants(root: Path, *, min_score: int = 90) -> dict[str, Any]:
+    """Replay held canaries against current cases without giving them authority."""
+    ensure_self_improvement_state(root)
+    case_map = eval_cases_by_id(root)
+    variants = variant_metadata_by_id(root)
+    latest_decisions = latest_decision_by_variant(root)
+    existing = read_jsonl(self_root(root) / SHADOW_REVIEWS)
+    seen = {str(row.get("id", "")) for row in existing}
+    generated = 0
+    wins = 0
+    losses = 0
+    timestamp = now()
+    for variant_id, decision in sorted(latest_decisions.items()):
+        if decision.get("decision") != "hold_for_review":
+            continue
+        metadata = variants.get(variant_id, {})
+        target_skill = str(decision.get("target_skill") or metadata.get("target_skill") or "")
+        if target_skill not in EVOLUTION_TARGETS:
+            continue
+        canary_body = canary_skill_body(str(decision.get("canary_path", "")), target_skill)
+        stable_body = skill_body(root, target_skill)
+        case_ids = [str(item) for item in metadata.get("case_ids", [])]
+        cases = [case_map[case_id] for case_id in case_ids if case_id in case_map]
+        if not canary_body or not stable_body or not cases:
+            status = "loss"
+            canary_score = 0.0
+            stable_score = 100.0 if stable_body else 0.0
+            missing = case_ids[:8]
+        else:
+            canary = shadow_case_coverage_score(canary_body, cases, is_canary=True)
+            stable = shadow_case_coverage_score(stable_body, cases, is_canary=False)
+            canary_score = float(canary["score"])
+            stable_score = float(stable["score"])
+            missing = list(canary["missing_case_ids"])
+            status = "win" if canary_score >= float(min_score) and canary_score >= stable_score else "loss"
+        review_id = lesson_id(
+            "shadow-review",
+            timestamp,
+            len(existing),
+            variant_id,
+            decision.get("id", ""),
+            canary_score,
+            stable_score,
+            status,
+        )
+        if review_id in seen:
+            continue
+        existing.append(
+            {
+                "id": review_id,
+                "created_at": timestamp,
+                "variant_id": variant_id,
+                "target_skill": target_skill,
+                "status": status,
+                "shadow_score": canary_score,
+                "stable_score": stable_score,
+                "delta": round(canary_score - stable_score, 2),
+                "min_score": int(min_score),
+                "missing_case_ids": missing,
+                "stage_before": "canary",
+                "stage_after": "shadow" if status == "win" else "canary",
+                "effective_authority": "none",
+                "active_skill_mutated": False,
+            }
+        )
+        seen.add(review_id)
+        generated += 1
+        if status == "win":
+            wins += 1
+        else:
+            losses += 1
+    write_jsonl(self_root(root) / SHADOW_REVIEWS, existing)
+    return {"generated": generated, "wins": wins, "losses": losses, "total": len(existing)}
+
+
+def authority_stage_for_wins(wins: int) -> str:
+    if wins >= 4:
+        return "supervisor_route"
+    if wins >= 3:
+        return "task_seed"
+    if wins >= 2:
+        return "advisory"
+    if wins >= 1:
+        return "shadow"
+    return "canary"
+
+
+def capped_authority(stage: str, max_effective_authority: str) -> str:
+    if stage not in AUTHORITY_STAGES:
+        return "none"
+    if max_effective_authority not in AUTHORITY_STAGES:
+        return "none"
+    stage_index = AUTHORITY_STAGES.index(stage)
+    max_index = AUTHORITY_STAGES.index(max_effective_authority)
+    if stage_index > max_index:
+        return max_effective_authority
+    return stage
+
+
+def stage_evolution_authority(
+    root: Path,
+    *,
+    min_wins: int = 2,
+    min_score: int = 90,
+    max_effective_authority: str = DEFAULT_MAX_EFFECTIVE_AUTHORITY,
+) -> dict[str, Any]:
+    """Create non-mutating promotion records from repeated shadow wins."""
+    ensure_self_improvement_state(root)
+    reviews = latest_shadow_reviews_by_variant(root)
+    variants = variant_metadata_by_id(root)
+    promotions = read_jsonl(self_root(root) / PROMOTIONS)
+    seen = {str(row.get("id", "")) for row in promotions}
+    generated = 0
+    advisory = 0
+    timestamp = now()
+    for variant_id, variant_reviews in sorted(reviews.items()):
+        wins = [row for row in variant_reviews if row.get("status") == "win" and float(row.get("shadow_score") or 0) >= min_score]
+        if len(wins) < int(min_wins):
+            continue
+        target_skill = str(variants.get(variant_id, {}).get("target_skill") or wins[-1].get("target_skill") or "")
+        proposed_stage = authority_stage_for_wins(len(wins))
+        effective = capped_authority(proposed_stage, max_effective_authority)
+        if effective in {"task_seed", "supervisor_route"}:
+            effective = "advisory"
+        promotion_id = lesson_id("promotion", variant_id, len(wins), proposed_stage, effective)
+        if promotion_id in seen:
+            continue
+        promotions.append(
+            {
+                "id": promotion_id,
+                "created_at": timestamp,
+                "variant_id": variant_id,
+                "target_skill": target_skill,
+                "wins": len(wins),
+                "min_wins": int(min_wins),
+                "min_score": int(min_score),
+                "proposed_stage": proposed_stage,
+                "effective_authority": effective,
+                "promotion_mode": "manual-review-only",
+                "approval_required": effective != "none",
+                "active_skill_mutated": False,
+                "rollback": "Disable this promotion record; active skills and runtime were not changed.",
+            }
+        )
+        seen.add(promotion_id)
+        generated += 1
+        if effective == "advisory":
+            advisory += 1
+    write_jsonl(self_root(root) / PROMOTIONS, promotions)
+    return {"generated": generated, "advisory": advisory, "total": len(promotions)}
+
+
+def recent_unhealthy_signals(root: Path, *, recent_rows: int = 160) -> list[str]:
+    reasons: list[str] = []
+    for row in parse_results(root / "results.tsv", limit=recent_rows):
+        target = str(row.get("target", ""))
+        status = str(row.get("status", ""))
+        notes = str(row.get("notes", "")).lower()
+        if target == "autoresearch-quality" and status == "blocked":
+            reasons.append("quality-review-blocked")
+        if "memory" in notes and ("blocked" in notes or "crash" in notes or "pressure" in notes):
+            reasons.append("memory-safety-signal")
+        if "python" in notes and "crash" in notes:
+            reasons.append("python-crash-signal")
+        if "metal" in notes and ("crash" in notes or "error" in notes):
+            reasons.append("metal-safety-signal")
+    return sorted(set(reasons))
+
+
+def rollback_unhealthy_promotions(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    """Disable staged authority when current run health is not clean."""
+    ensure_self_improvement_state(root)
+    reasons = recent_unhealthy_signals(root, recent_rows=recent_rows)
+    if not reasons:
+        return {"generated": 0, "reasons": [], "total": len(read_jsonl(self_root(root) / ROLLBACKS))}
+    promotions = read_jsonl(self_root(root) / PROMOTIONS)
+    active = [row for row in promotions if row.get("effective_authority") not in {"", "none"}]
+    rollbacks = read_jsonl(self_root(root) / ROLLBACKS)
+    seen = {str(row.get("id", "")) for row in rollbacks}
+    generated = 0
+    timestamp = now()
+    for promotion in active:
+        rollback_id = lesson_id("rollback", promotion.get("id", ""), ",".join(reasons))
+        if rollback_id in seen:
+            continue
+        rollbacks.append(
+            {
+                "id": rollback_id,
+                "created_at": timestamp,
+                "promotion_id": promotion.get("id", ""),
+                "variant_id": promotion.get("variant_id", ""),
+                "target_skill": promotion.get("target_skill", ""),
+                "reason": ",".join(reasons),
+                "previous_effective_authority": promotion.get("effective_authority", ""),
+                "new_effective_authority": "none",
+                "active_skill_mutated": False,
+            }
+        )
+        seen.add(rollback_id)
+        generated += 1
+    write_jsonl(self_root(root) / ROLLBACKS, rollbacks)
+    return {"generated": generated, "reasons": reasons, "total": len(rollbacks)}
+
+
+def rolled_back_promotion_ids(root: Path) -> set[str]:
+    return {
+        str(row.get("promotion_id", ""))
+        for row in read_jsonl(self_root(root) / ROLLBACKS)
+        if row.get("promotion_id")
+    }
+
+
 def write_variant_canary(root: Path, variant: dict[str, Any], score: dict[str, Any]) -> str:
     base = self_root(root) / CANARIES_DIR / str(variant["id"])
     target = base / "skills" / str(variant["target_skill"]) / "SKILL.md"
@@ -799,8 +1097,11 @@ def run_evolution(
     recent_rows: int = 160,
     max_variants_per_skill: int = 2,
     min_score: int = 90,
+    shadow_min_score: int = 90,
+    stage_min_wins: int = 2,
+    stage_max_effective_authority: str = DEFAULT_MAX_EFFECTIVE_AUTHORITY,
 ) -> dict[str, Any]:
-    """Run canary-only skill evolution and hold winners for review."""
+    """Run canary-only skill evolution, shadow review, and staged advisory records."""
     ensure_self_improvement_state(root)
     snapshot = snapshot_self_improvement(root, reason="pre-evolution-run")
     rows = parse_results(root / "results.tsv", limit=recent_rows)
@@ -851,6 +1152,14 @@ def run_evolution(
 
     write_jsonl(self_root(root) / VARIANTS, existing_variants)
     write_jsonl(self_root(root) / DECISIONS, existing_decisions)
+    shadow_reviews = shadow_review_variants(root, min_score=shadow_min_score)
+    staged_authority = stage_evolution_authority(
+        root,
+        min_wins=stage_min_wins,
+        min_score=shadow_min_score,
+        max_effective_authority=stage_max_effective_authority,
+    )
+    rollbacks = rollback_unhealthy_promotions(root, recent_rows=recent_rows)
     bump_skill_usage(root, ["self-improvement-curator"], reason="evolve")
     report = {
         "ok": True,
@@ -862,9 +1171,12 @@ def run_evolution(
             "held_for_review": held_for_review,
             "rejected": rejected,
         },
+        "shadow_reviews": shadow_reviews,
+        "staged_authority": staged_authority,
+        "rollbacks": rollbacks,
         "promotion": "manual-review-only",
         "active_skill_mutated": False,
-        "next": "review held canary variants, then promote through patch/canary gate only if desired",
+        "next": "review advisory/shadow wins, then promote through patch/canary gate only if desired",
     }
     state_path = self_root(root) / CURATOR_STATE
     state = read_json(state_path, {})
@@ -908,6 +1220,9 @@ def snapshot_self_improvement(root: Path, reason: str = "curate") -> Path | None
         base / EVAL_CASES,
         base / VARIANTS,
         base / DECISIONS,
+        base / SHADOW_REVIEWS,
+        base / PROMOTIONS,
+        base / ROLLBACKS,
         base / SKILLS_DIR,
     ]
     dest.mkdir(parents=True, exist_ok=False)
@@ -1030,10 +1345,19 @@ def status(root: Path) -> dict[str, Any]:
     eval_cases = read_jsonl(base / EVAL_CASES)
     variants = read_jsonl(base / VARIANTS)
     decisions = read_jsonl(base / DECISIONS)
+    shadow_reviews = read_jsonl(base / SHADOW_REVIEWS)
+    promotions = read_jsonl(base / PROMOTIONS)
+    rollbacks = read_jsonl(base / ROLLBACKS)
     usage = read_json(base / USAGE, {})
     state = read_json(base / CURATOR_STATE, {})
     skills = sorted(path.parent.name for path in (base / SKILLS_DIR).glob("*/SKILL.md"))
     held_variants = [row for row in decisions if row.get("decision") == "hold_for_review"]
+    rolled_back = rolled_back_promotion_ids(root)
+    advisory_promotions = [
+        row
+        for row in promotions
+        if row.get("effective_authority") == "advisory" and str(row.get("id", "")) not in rolled_back
+    ]
     return {
         "ok": True,
         "path": str(base),
@@ -1044,6 +1368,11 @@ def status(root: Path) -> dict[str, Any]:
         "variants": len(variants),
         "decisions": len(decisions),
         "held_variants": len(held_variants),
+        "shadow_reviews": len(shadow_reviews),
+        "promotions": len(promotions),
+        "advisory_promotions": len(advisory_promotions),
+        "rolled_back_promotions": len(rolled_back),
+        "rollbacks": len(rollbacks),
         "usage": usage,
         "skills": skills,
         "run_count": int(state.get("run_count") or 0),

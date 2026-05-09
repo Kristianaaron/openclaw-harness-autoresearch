@@ -63,6 +63,9 @@ def main() -> int:
         assert (root / "self-improvement" / "evolution-eval-cases.jsonl").exists()
         assert (root / "self-improvement" / "evolution-variants.jsonl").exists()
         assert (root / "self-improvement" / "evolution-decisions.jsonl").exists()
+        assert (root / "self-improvement" / "evolution-shadow-reviews.jsonl").exists()
+        assert (root / "self-improvement" / "evolution-promotions.jsonl").exists()
+        assert (root / "self-improvement" / "evolution-rollbacks.jsonl").exists()
         assert (root / "self-improvement" / "usage.json").exists()
         assert (root / "self-improvement" / "curator-state.json").exists()
 
@@ -128,7 +131,14 @@ def main() -> int:
         active_skill_before = (
             root / "self-improvement" / "skills" / "reviewer-quality" / "SKILL.md"
         ).read_text(encoding="utf-8")
-        evolution = sim.run_evolution(root, recent_rows=20, max_variants_per_skill=2, min_score=90)
+        evolution = sim.run_evolution(
+            root,
+            recent_rows=20,
+            max_variants_per_skill=2,
+            min_score=90,
+            shadow_min_score=90,
+            stage_min_wins=1,
+        )
         assert evolution["ok"] is True
         assert evolution["promotion"] == "manual-review-only"
         assert evolution["active_skill_mutated"] is False
@@ -136,6 +146,11 @@ def main() -> int:
         assert evolution["variants"]["generated"] >= 4
         assert evolution["decisions"]["held_for_review"] >= 1
         assert evolution["decisions"]["rejected"] == 0
+        assert evolution["shadow_reviews"]["generated"] >= 1
+        assert evolution["shadow_reviews"]["wins"] >= 1
+        assert evolution["staged_authority"]["generated"] >= 1
+        assert evolution["rollbacks"]["generated"] >= 1
+        assert "quality-review-blocked" in evolution["rollbacks"]["reasons"]
         active_skill_after = (
             root / "self-improvement" / "skills" / "reviewer-quality" / "SKILL.md"
         ).read_text(encoding="utf-8")
@@ -156,6 +171,31 @@ def main() -> int:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             assert payload["active_skill_mutated"] is False
             assert payload["promotion"] == "manual-review-only"
+        shadow_reviews = sim.read_jsonl(root / "self-improvement" / "evolution-shadow-reviews.jsonl")
+        assert all(item["active_skill_mutated"] is False for item in shadow_reviews)
+        assert all(item["effective_authority"] == "none" for item in shadow_reviews)
+        promotions = sim.read_jsonl(root / "self-improvement" / "evolution-promotions.jsonl")
+        assert all(item["active_skill_mutated"] is False for item in promotions)
+        assert {item["effective_authority"] for item in promotions} <= {"advisory", "shadow", "canary", "none"}
+        rollbacks = sim.read_jsonl(root / "self-improvement" / "evolution-rollbacks.jsonl")
+        assert rollbacks
+        assert all(item["active_skill_mutated"] is False for item in rollbacks)
+        second_evolution = sim.run_evolution(
+            root,
+            recent_rows=20,
+            max_variants_per_skill=2,
+            min_score=90,
+            shadow_min_score=90,
+            stage_min_wins=2,
+        )
+        assert second_evolution["shadow_reviews"]["generated"] >= 1
+        assert second_evolution["staged_authority"]["advisory"] >= 1
+        assert second_evolution["active_skill_mutated"] is False
+        status_after_evolution = sim.status(root)
+        assert status_after_evolution["shadow_reviews"] >= len(shadow_reviews)
+        assert status_after_evolution["promotions"] >= len(promotions)
+        assert status_after_evolution["rollbacks"] >= len(rollbacks)
+        assert status_after_evolution["rolled_back_promotions"] >= 1
 
         bad_variant = {
             "id": "bad",
@@ -184,6 +224,9 @@ def main() -> int:
                         "recent_rows": 20,
                         "max_variants_per_skill": 1,
                         "min_score": 90,
+                        "shadow_min_score": 90,
+                        "stage_min_wins": 1,
+                        "stage_max_effective_authority": "advisory",
                     },
                 )()
             ) == 0
