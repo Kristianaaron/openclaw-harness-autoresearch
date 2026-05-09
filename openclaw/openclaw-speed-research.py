@@ -126,6 +126,12 @@ DEFAULT_LANE_CONTRACTS: dict[str, Any] = {
             "fallback": "deterministic-bridge",
             "promotion_gate": "allowed paths, py_compile/tests, no opencode or secret files, rollback recorded",
         },
+        "frontier-expansion": {
+            "purpose": "Generate the next bounded candidate path after active speed lanes exhaust.",
+            "memory_class": "no_model_load",
+            "fallback": "implementation-gate",
+            "promotion_gate": "one canary-only candidate with acceptance, rollback, and no live profile mutation",
+        },
     },
 }
 DEFAULT_TRACE_PROMPTS = (
@@ -1516,7 +1522,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
     deterministic_ids = [str(task.get("id", "")) for task in deterministic]
     ready_lanes = sorted({str(task.get("lane", "")) for task in ready if str(task.get("lane", ""))})
     exhausted = set(exhausted_lanes(root))
-    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash", "frontier-expansion"}
     breakthrough_lanes = sorted(lane for lane in ready_lanes if lane in frontier_lanes and lane not in exhausted)
     decode_values = [
         float(signal["wall_decode_tps"])
@@ -1554,6 +1560,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
                 "review-drafter-calibration-canary",
                 "review-janq-drafter-fit",
                 "runtime-overhead",
+                "frontier-expansion",
                 "calibration-memory-report",
                 "exhaustion",
             )
@@ -3138,6 +3145,169 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     return filter_seedable_tasks(root, tasks)
 
 
+def frontier_expansion_task(
+    timestamp: int,
+    *,
+    slug: str,
+    priority: int,
+    target: str,
+    hypothesis: str,
+    acceptance: str,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Create one no-model candidate path when existing frontier lanes are exhausted."""
+    return {
+        "id": f"frontier-expansion-{slug}-{timestamp}",
+        "status": "ready",
+        "priority": priority,
+        "lane": "frontier-expansion",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
+        "target": target,
+        "source_files": [
+            "openclaw/openclaw-speed-research.py",
+            "openclaw/openclaw-speed-research-autopilot.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": hypothesis,
+        "metric": "frontier_candidate_gate",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": acceptance,
+        "rollback": "Discard this candidate path unless its canary remains green and a later paired benchmark beats the current TUI decode baseline.",
+        "evidence": evidence,
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+    }
+
+
+def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
+    """Route exhausted lanes into one new bounded candidate path instead of terminal churn."""
+    ensure_lane_contracts(root)
+    recent = rows[-160:]
+    exhausted = set(exhausted_lanes(root))
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    dflash_blocked = (
+        "frontier-dflash" in exhausted
+        or dflash_lane_is_blocked(root, recent_rows=240)
+        or suppress_hard_blocked_dflash_lane(root, recent_rows=240)
+    )
+    clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=80)
+    decode_mean = latest_decode_mean(root, recent_rows=120)
+    sweep_rows = completed_drafter_sweep_rows(root, recent_rows=160, min_sweeps=3)
+    sweep_fields = [parse_note_fields(row.get("notes", "")) for row in sweep_rows[-3:]]
+    block_sweep_settled = (
+        len(sweep_fields) >= 2
+        and all(fields.get("decision") == "keep-current" for fields in sweep_fields)
+        and all(fields.get("winner_block") in {"", "2"} for fields in sweep_fields)
+    )
+    evidence = {
+        "exhausted_lanes": sorted(exhausted),
+        "calibration_blocker": calibration_blocker,
+        "dflash_blocked": dflash_blocked,
+        "clean_runtime_maps": len(clean_runtime_maps),
+        "decode_mean_tps": decode_mean,
+        "block_sweep_settled": block_sweep_settled,
+    }
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        candidates.append(
+            (
+                "frontier-expansion-janq-adapter-path-",
+                frontier_expansion_task(
+                    timestamp,
+                    slug="janq-adapter-path",
+                    priority=99,
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis=(
+                        "JANQ calibration is blocked because the quantized target does not expose gradients; "
+                        "the next candidate is a trainable adapter or logit-distillation path that uses "
+                        "target-generated traces without differentiating through JANQ weights."
+                    ),
+                    acceptance=(
+                        "A canary-only source path exists for adapter/logit-distillation calibration, with "
+                        "no target-model mutation, no live profile mutation, and a later decode TPS promotion gate."
+                    ),
+                    evidence=evidence,
+                ),
+            )
+        )
+    if dflash_blocked:
+        candidates.append(
+            (
+                "frontier-expansion-dflash-candidate-search-",
+                frontier_expansion_task(
+                    timestamp,
+                    slug="dflash-candidate-search",
+                    priority=97,
+                    target="openclaw/openclaw-drafter-fit.py",
+                    hypothesis=(
+                        "DFlash is blocked for the current drafter candidate; the next path is a candidate-search "
+                        "gate that only reopens DFlash when a same-tokenizer JANQ-compatible draft candidate changes."
+                    ),
+                    acceptance=(
+                        "The candidate-search gate records why the current DFlash candidate is retired, what "
+                        "candidate evidence would reopen it, and preserves the existing MTP path until paired tests win."
+                    ),
+                    evidence=evidence,
+                ),
+            )
+        )
+    if "mtp-decode" in exhausted or block_sweep_settled:
+        candidates.append(
+            (
+                "frontier-expansion-mtp-verify-cache-",
+                frontier_expansion_task(
+                    timestamp,
+                    slug="mtp-verify-cache",
+                    priority=95,
+                    target="openclaw/openclaw-jang-vlm-server.py",
+                    hypothesis=(
+                        "Block-size tuning has settled below target; inspect MTP verify/cache/rollback instrumentation "
+                        "next so speed work can target accepted-token yield rather than repeat block sweeps."
+                    ),
+                    acceptance=(
+                        "A no-model canary confirms the MTP verification/cache/rollback path has explicit metrics "
+                        "or a scoped source patch candidate with rollback before any live benchmark promotion."
+                    ),
+                    evidence=evidence,
+                ),
+            )
+        )
+    if len(clean_runtime_maps) >= 2:
+        candidates.append(
+            (
+                "frontier-expansion-runtime-source-bridge-",
+                frontier_expansion_task(
+                    timestamp,
+                    slug="runtime-source-bridge",
+                    priority=93,
+                    target="openclaw/openclaw-model-proxy.py",
+                    hypothesis=(
+                        "Repeated clean runtime maps mean measurement alone is exhausted; create one source-bridge "
+                        "candidate for the smallest proxy/server overhead patch that canary tests can verify."
+                    ),
+                    acceptance=(
+                        "The bridge names exactly one patchable runtime boundary, its canary test, and a rollback "
+                        "path; otherwise it retires runtime-overhead until new evidence appears."
+                    ),
+                    evidence=evidence,
+                ),
+            )
+        )
+
+    for prefix, task in candidates:
+        if should_seed_action(root, prefix, recent_rows=240):
+            return filter_seedable_tasks(root, [task])
+    return []
+
+
 def research_quality_scorecard(
     *,
     blocked_rows: int,
@@ -3185,6 +3355,7 @@ def research_quality_scorecard(
             "drafter-fit",
             "calibration-memory-report",
             "runtime-overhead",
+            "frontier-expansion",
             "exhaustion-report",
         )
     )
@@ -3436,7 +3607,7 @@ def quality_review(args: argparse.Namespace) -> int:
         for task in active_tasks
         if str(task.get("lane", "")) not in exhausted
     }
-    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+    frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash", "frontier-expansion"}
     frontier_ready = sorted(active_lanes & frontier_lanes)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=int(args.recent_rows))
     plateau_below_target = (
@@ -4004,7 +4175,12 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     frontier_lanes = {
         str(task.get("lane", ""))
         for task in ready
-        if str(task.get("lane", "")) in {"runtime-overhead", "drafter-alignment", "frontier-dflash"}
+        if str(task.get("lane", "")) in {
+            "runtime-overhead",
+            "drafter-alignment",
+            "frontier-dflash",
+            "frontier-expansion",
+        }
     }
 
     scores: dict[str, float] = {
@@ -5907,9 +6083,13 @@ def synthesize(args: argparse.Namespace) -> int:
     )
     deliberate_tasks: list[dict[str, Any]] = []
     contract_tasks: list[dict[str, Any]] = []
+    expansion_tasks: list[dict[str, Any]] = []
     if seeded == 0:
         deliberate_tasks = filter_seedable_tasks(root, synthesis_deliberate_action_tasks(root, rows, int(time.time())))
         seeded = upsert_tasks(root, deliberate_tasks) if deliberate_tasks else 0
+    if seeded == 0:
+        expansion_tasks = frontier_expansion_tasks(root, rows, int(time.time()))
+        seeded = upsert_tasks(root, expansion_tasks) if expansion_tasks else 0
     if seeded == 0:
         contract_tasks = lane_contract_fallback_tasks(
             root,
@@ -5965,6 +6145,7 @@ def synthesize(args: argparse.Namespace) -> int:
             ],
             "deliberate_actions": [task["id"] for task in deliberate_tasks],
             "contract_actions": [task["id"] for task in contract_tasks],
+            "frontier_expansion_actions": [task["id"] for task in expansion_tasks],
             "gepa_action": gepa_action,
             "gepa_report": gepa_report,
             "seeded_tasks": seeded,
@@ -5982,6 +6163,7 @@ def synthesize(args: argparse.Namespace) -> int:
             f"ideas={len(ideas)} seeded_tasks={seeded} kind={args.kind} "
             f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)} "
             f"contract_actions={','.join(task['id'] for task in contract_tasks)} "
+            f"frontier_expansion_actions={','.join(task['id'] for task in expansion_tasks)} "
             f"gepa_action={gepa_action} terminal_no_work={terminal_no_work}"
         ),
     )
@@ -5993,6 +6175,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 "seeded_tasks": seeded,
                 "deliberate_actions": [task["id"] for task in deliberate_tasks],
                 "contract_actions": [task["id"] for task in contract_tasks],
+                "frontier_expansion_actions": [task["id"] for task in expansion_tasks],
                 "gepa_action": gepa_action,
                 "status": status,
                 "terminal_no_work": terminal_no_work,
@@ -6021,6 +6204,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     seeded_bridge = False
     seeded_prerequisite = False
     seeded_fallback = False
+    seeded_expansion = False
     terminal_handoff_exhausted = False
     bridge_zero = recent_empty_bridge_rows(root, rows, recent_rows=120)
     bridge_only_ready = bool(deterministic_ready) and all(is_implementation_bridge_task(task) for task in deterministic_ready)
@@ -6028,6 +6212,10 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         if bridge_zero:
             prerequisite_tasks = concrete_handoff_prerequisite_tasks(root, rows, timestamp)
             seeded_prerequisite = bool(upsert_tasks(root, prerequisite_tasks))
+            if not seeded_prerequisite:
+                expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
+                seeded_expansion = bool(upsert_tasks(root, expansion_tasks))
+                seeded_prerequisite = seeded_expansion
             if not seeded_prerequisite:
                 fallback_tasks = lane_contract_fallback_tasks(
                     root,
@@ -6126,6 +6314,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "seeded_bridge": seeded_bridge,
         "seeded_prerequisite": seeded_prerequisite,
         "seeded_fallback": seeded_fallback,
+        "seeded_expansion": seeded_expansion,
         "terminal_handoff_exhausted": terminal_handoff_exhausted,
         "recent_empty_bridges": len(bridge_zero),
         "implementation_candidates": [str(task.get("id", "")) for task in candidates],
@@ -6164,7 +6353,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
             f"ok={ok} score={score} candidates={len(candidates)} scoped={len(scoped_candidates)} "
             f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} "
             f"seeded_prerequisite={seeded_prerequisite} empty_bridges={len(bridge_zero)} "
-            f"seeded_fallback={seeded_fallback} terminal_handoff_exhausted={terminal_handoff_exhausted} "
+            f"seeded_fallback={seeded_fallback} seeded_expansion={seeded_expansion} "
+            f"terminal_handoff_exhausted={terminal_handoff_exhausted} "
             f"blockers={len(contract_blockers)}"
         ),
     )

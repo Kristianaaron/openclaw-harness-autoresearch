@@ -96,12 +96,15 @@ def main() -> int:
             assert profile["name"] == "openclaw-speed"
             assert "decode_tps" in profile["metrics"]["primary"]
             assert "policy-optimization" in profile["scope"]["allowed_lanes"]
+            assert "frontier-expansion" in profile["scope"]["allowed_lanes"]
+            assert "frontier_candidate_gate" in profile["metrics"]["secondary"]
             assert "autoresearch_quality_delta" in profile["metrics"]["secondary"]
             policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
             assert "benchmark-manifest.json" in policy["immutable_paths"]
             assert "replay-buffer.jsonl" in policy["immutable_paths"]
             lane_contracts = json.loads((root / "lane-contracts.json").read_text(encoding="utf-8"))
             assert "drafter-alignment" in lane_contracts["lanes"]
+            assert "frontier-expansion" in lane_contracts["lanes"]
             assert "calibration-memory-after-load" in lane_contracts["lanes"]["drafter-alignment"]["hard_blockers"]
             assert (
                 "calibration-quantized-gradient-unsupported"
@@ -629,6 +632,18 @@ def main() -> int:
                                 ),
                             ],
                         ) == []
+                        gradient_expansion = helper.frontier_expansion_tasks(
+                            gradient_blocked_root,
+                            helper.result_rows(gradient_blocked_root),
+                            123457,
+                        )
+                        assert len(gradient_expansion) == 1
+                        assert gradient_expansion[0]["lane"] == "frontier-expansion"
+                        assert gradient_expansion[0]["supervisor_action"] == "focused-test"
+                        assert gradient_expansion[0]["metric"] == "frontier_candidate_gate"
+                        assert "no_model_load" in gradient_expansion[0]["guard_checks"]
+                        assert "JANQ calibration is blocked" in gradient_expansion[0]["hypothesis"]
+                        assert not helper.task_contract_issues(gradient_blocked_root, gradient_expansion[0])["blockers"]
                         helper.upsert_tasks(
                             gradient_blocked_root,
                             [
@@ -728,6 +743,46 @@ def main() -> int:
                         assert "lane-contract-fallback-exhausted" in (
                             blocked_root / "findings.jsonl"
                         ).read_text(encoding="utf-8")
+                        dflash_blocked_root = Path(tmp) / "dflash-block-root"
+                        helper.ensure_research_state(dflash_blocked_root)
+                        dflash_artifact = dflash_blocked_root / "experiments" / "dflash-compatibility-gate-123.json"
+                        dflash_artifact.write_text(
+                            json.dumps({"blockers": ["draft_model_type_mismatch=gemma4!=gemma4-janq"]}),
+                            encoding="utf-8",
+                        )
+                        helper.append_result(
+                            dflash_blocked_root,
+                            run_id="dflash-compatibility-gate-123",
+                            status="blocked",
+                            target="frontier-dflash",
+                            hypothesis="unit dflash blocker",
+                            commit="abc123",
+                            notes="decision=blocked draft_model_type_mismatch=gemma4!=gemma4-janq",
+                        )
+                        dflash_expansion = helper.frontier_expansion_tasks(
+                            dflash_blocked_root,
+                            helper.result_rows(dflash_blocked_root),
+                            123458,
+                        )
+                        assert len(dflash_expansion) == 1
+                        assert dflash_expansion[0]["id"].startswith("frontier-expansion-dflash-candidate-search-")
+                        assert "same-tokenizer JANQ-compatible" in dflash_expansion[0]["hypothesis"]
+                        mtp_exhausted_root = Path(tmp) / "mtp-exhausted-root"
+                        helper.ensure_research_state(mtp_exhausted_root)
+                        helper.mark_lane_exhausted(
+                            mtp_exhausted_root,
+                            lane="mtp-decode",
+                            reason="unit block-size settled below target",
+                            evidence={"winner_block": 2},
+                        )
+                        mtp_expansion = helper.frontier_expansion_tasks(
+                            mtp_exhausted_root,
+                            helper.result_rows(mtp_exhausted_root),
+                            123459,
+                        )
+                        assert len(mtp_expansion) == 1
+                        assert mtp_expansion[0]["id"].startswith("frontier-expansion-mtp-verify-cache-")
+                        assert "MTP verify/cache/rollback" in mtp_expansion[0]["hypothesis"]
                         for index in range(4):
                             helper.append_result(
                                 blocked_root,
@@ -1292,16 +1347,17 @@ def main() -> int:
                 ).read_text(encoding="utf-8")
             )
             assert terminal_handoff["ok"] is True
-            assert terminal_handoff["terminal_handoff_exhausted"] is True
-            assert terminal_handoff["seeded_prerequisite"] is False
-            assert terminal_handoff["ready_deterministic_tasks"] == []
+            assert terminal_handoff["terminal_handoff_exhausted"] is False
+            assert terminal_handoff["seeded_prerequisite"] is True
+            assert terminal_handoff["seeded_expansion"] is True
+            assert terminal_handoff["ready_deterministic_tasks"][0].startswith("frontier-expansion-")
             handoff_rows = [
                 row
                 for row in helper.result_rows(root)
                 if row.get("run_id", "").startswith("implementation-handoff-audit-")
             ]
             assert handoff_rows[-1]["status"] == "keep"
-            assert "terminal_handoff_exhausted=True" in handoff_rows[-1]["notes"]
+            assert "seeded_expansion=True" in handoff_rows[-1]["notes"]
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")

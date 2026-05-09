@@ -66,6 +66,21 @@ The loop is designed to continue overnight until `--max-hours` is reached or the
 user presses `Ctrl+C`. Clean external blockers are converted into an autonomous
 refocus tranche by default instead of stopping and waiting for manual prompting.
 
+### Frontier Expansion
+
+When the active speed lanes exhaust, the supervisor now opens one new bounded
+candidate path instead of repeating the same synthesis or stopping:
+
+- JANQ quantized-gradient calibration blockers route to an adapter or
+  logit-distillation candidate path.
+- DFlash/JANQ blocker loops route to a candidate-search gate that only reopens
+  DFlash when the drafter candidate changes.
+- Settled MTP block-size sweeps route to verify/cache/rollback instrumentation.
+- Repeated clean runtime maps route to one scoped source-bridge candidate.
+
+Every frontier-expansion task is no-model-load, canary-only, scoped to OpenClaw,
+and carries explicit acceptance and rollback gates before any later promotion.
+
 ### Deterministic Lane Contracts
 
 Each research lane declares the work it is allowed to do:
