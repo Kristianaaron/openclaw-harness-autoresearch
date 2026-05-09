@@ -378,9 +378,14 @@ case "${1:-}" in
     "$speed_research" add-source "$@"
     return $?
     ;;
+  speed-research-self-improve|research-speed-self-improve)
+    shift
+    "$speed_research" self-improve "$@"
+    return $?
+    ;;
   speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
     case "${2:-}" in
-      setup|prompt|benchmark|record|synthesize|compact)
+      setup|prompt|benchmark|record|synthesize|compact|self-improve)
         local speed_research_subcommand="${2:-}"
         shift 2
         if [[ "$speed_research_subcommand" == "benchmark" ]] && ! _openclaw_has_arg_prefix "--help" "$@" && ! _openclaw_has_arg_prefix "-h" "$@"; then

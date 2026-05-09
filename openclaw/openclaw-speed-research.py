@@ -53,7 +53,6 @@ from openclaw_speed_research_core import (
     write_gepa_policy_canary,
     write_jsonl,
 )
-
 DEFAULT_REPO_URL = "https://github.com/karpathy/autoresearch.git"
 DEFAULT_MODEL_URL = "http://127.0.0.1:8091/v1"
 DEFAULT_PROXY_LOG = "/Users/kristian/.openclaw/logs/openclaw-model-proxy.log"
@@ -1062,10 +1061,31 @@ Hard constraints:
 """
 
 
+def load_self_improvement_module():
+    try:
+        import openclaw_self_improvement
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenClaw self-improvement support is not installed. Copy "
+            "openclaw_self_improvement.py next to openclaw-speed-research, "
+            "or run from the setup repository."
+        ) from exc
+    return openclaw_self_improvement
+
+
+def ensure_optional_self_improvement_state(root: Path) -> None:
+    try:
+        self_improvement = load_self_improvement_module()
+    except RuntimeError:
+        return
+    self_improvement.ensure_self_improvement_state(root)
+
+
 def setup_workspace(args: argparse.Namespace) -> int:
     root = workspace_root()
     root.mkdir(parents=True, exist_ok=True)
     ensure_research_state(root)
+    ensure_optional_self_improvement_state(root)
     ensure_lane_contracts(root)
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
@@ -1106,6 +1126,35 @@ def setup_workspace(args: argparse.Namespace) -> int:
     print(root)
     print(clone_status)
     return 0
+
+
+def self_improve(args: argparse.Namespace) -> int:
+    self_improvement = load_self_improvement_module()
+    root = workspace_root()
+    ensure_research_state(root)
+    self_improvement.ensure_self_improvement_state(root)
+    if args.action == "status":
+        print(json.dumps(self_improvement.status(root), indent=2, sort_keys=True))
+        return 0
+    if args.action == "derive-lessons":
+        lessons = self_improvement.derive_lessons(root, recent_rows=args.recent_rows)
+        recorded = self_improvement.record_lessons(root, lessons)
+        print(json.dumps({"ok": True, "derived": len(lessons), **recorded}, indent=2, sort_keys=True))
+        return 0
+    if args.action == "curate":
+        summary = self_improvement.curate(root, recent_rows=args.recent_rows)
+        print(json.dumps({"ok": True, **summary}, indent=2, sort_keys=True))
+        return 0
+    if args.action == "evolve":
+        report = self_improvement.run_evolution(
+            root,
+            recent_rows=args.recent_rows,
+            max_variants_per_skill=args.max_variants_per_skill,
+            min_score=args.min_score,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    raise ValueError(f"unknown self-improve action: {args.action}")
 
 
 def add_source(args: argparse.Namespace) -> int:
@@ -7253,6 +7302,17 @@ def main() -> int:
     setup = sub.add_parser("setup")
     setup.add_argument("--repo-url", default=DEFAULT_REPO_URL)
     setup.set_defaults(func=setup_workspace)
+
+    self_improve_parser = sub.add_parser("self-improve")
+    self_improve_parser.add_argument(
+        "--action",
+        choices=("status", "derive-lessons", "curate", "evolve"),
+        default="status",
+    )
+    self_improve_parser.add_argument("--recent-rows", type=int, default=160)
+    self_improve_parser.add_argument("--max-variants-per-skill", type=int, default=2)
+    self_improve_parser.add_argument("--min-score", type=int, default=90)
+    self_improve_parser.set_defaults(func=self_improve)
 
     prompt = sub.add_parser("prompt")
     prompt.set_defaults(func=lambda _args: print(prompt_text(workspace_root())) or 0)

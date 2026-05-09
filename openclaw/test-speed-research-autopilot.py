@@ -426,6 +426,77 @@ def main() -> int:
         helper.append_quality_pause(43, "nightly", "unit-test exhausted synthesis")
         assert "quality-pause-43" in helper.RESULTS.read_text(encoding="utf-8")
         assert "autopilot-quality-pause" in helper.FINDINGS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.WORKSPACE / "exhausted-approaches.jsonl",
+            [
+                {"lane": "frontier-dflash", "reason": "unit-test"},
+                {"lane": "mtp-decode", "reason": "unit-test"},
+                {"lane": "drafter-calibration-memory", "reason": "unit-test"},
+            ],
+        )
+        (helper.BENCHMARKS / "quality-review-external.json").write_text(
+            json.dumps(
+                {
+                    "quality_score": 97,
+                    "scorecard": {"overall": 96.8},
+                    "canonical_state": {
+                        "state": "blocked_until_external_change",
+                        "clean": True,
+                        "decode_mean_tps": 15.0,
+                        "noise": {"terminal_synthesis_rows": 3, "routed_terminal_synthesis_rows": 1},
+                        "next": "add a new drafter candidate",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "frontier-system-eval-external.json").write_text(
+            json.dumps({"overall": 9.3, "task_contract": {"ok": True}}),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "implementation-handoff-audit-external.json").write_text(
+            json.dumps({"score": 82}),
+            encoding="utf-8",
+        )
+        external_args = Namespace(
+            stop_on_external_blocker=True,
+            external_blocker_min_quality=90,
+            external_blocker_min_exhausted_core_lanes=2,
+            external_blocker_min_terminal_cycles=3,
+        )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "terminal-runtime-overhead",
+                    "status": "ready",
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "supervisor_action": "runtime-overhead-map",
+                }
+            ],
+        )
+        external_status = helper.external_change_required_status(external_args)
+        assert external_status["should_stop"] is True
+        helper.append_external_change_required(44, "nightly", external_status)
+        assert "external-change-required-44" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "autoresearch-external-change-required" in helper.FINDINGS.read_text(encoding="utf-8")
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "meaningful-trace-prereq",
+                    "status": "ready",
+                    "lane": "drafter-trace",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-trace-gate",
+                }
+            ],
+        )
+        assert helper.external_change_required_status(external_args)["should_stop"] is False
+        for artifact in helper.BENCHMARKS.glob("*.json"):
+            artifact.unlink()
+        helper.write_jsonl(helper.WORKSPACE / "exhausted-approaches.jsonl", [])
         extend_args = Namespace(auto_extend_cycles=True, sleep_seconds=0, rotate_session_after_stalls=3)
         extend, reason, summary = helper.should_extend_cycle_budget(
             extend_args,
@@ -466,6 +537,7 @@ def main() -> int:
         )
         assert not extend
         assert "disabled" in reason
+        helper.write_jsonl(helper.TASKS, [])
         helper.ensure_task_queue()
         selected = helper.select_next_task(helper.WORKSPACE)
         assert selected["id"] == "decode-mtp-baseline"
@@ -1232,6 +1304,59 @@ def main() -> int:
         review_fail_text = review_fail_log.read_text(encoding="utf-8")
         assert "implementation-handoff-audit --min-score 90" in review_fail_text
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_fail_text
+        self_improve_marker = Path(tmp) / "self-improve-marker.txt"
+        self_improve_helper = Path(tmp) / "self-improve-helper.py"
+        self_improve_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(self_improve_marker)!r}).write_text(' '.join(sys.argv[1:]), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        self_improve_helper.chmod(0o700)
+        self_improve_args = Namespace(
+            research_helper_bin=str(self_improve_helper),
+            self_improvement=True,
+            self_evolution=False,
+            self_improvement_recent_rows=160,
+            self_improvement_timeout_seconds=5,
+            self_evolution_max_variants_per_skill=2,
+            self_evolution_min_score=90,
+        )
+        ok, issue = helper.run_supervisor_self_improvement(
+            self_improve_args,
+            8,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+            reason="unit",
+        )
+        assert ok
+        assert issue == ""
+        assert self_improve_marker.read_text(encoding="utf-8") == "self-improve --action curate --recent-rows 160"
+        self_improve_marker.unlink()
+        evolution_args = Namespace(**{**vars(self_improve_args), "self_evolution": True})
+        ok, issue = helper.run_supervisor_self_improvement(
+            evolution_args,
+            9,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+            reason="unit-evolve",
+        )
+        assert ok
+        assert issue == ""
+        assert (
+            self_improve_marker.read_text(encoding="utf-8")
+            == "self-improve --action evolve --recent-rows 160 --max-variants-per-skill 2 --min-score 90"
+        )
+        disabled_args = Namespace(**{**vars(self_improve_args), "self_improvement": False})
+        ok, issue = helper.run_supervisor_self_improvement(
+            disabled_args,
+            10,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+            reason="disabled",
+        )
+        assert ok
+        assert issue == "disabled"
         helper.write_jsonl(
             helper.TASKS,
             [

@@ -515,6 +515,169 @@ def append_quality_pause(cycle: int, session: str, reason: str) -> None:
     )
 
 
+TERMINAL_EXTERNAL_ACTIONS = {
+    "calibration-memory-report",
+    "implementation-bridge",
+    "mtp-report",
+    "runtime-overhead-map",
+}
+TERMINAL_EXTERNAL_LANES = {"exhaustion-report", "implementation-gate", "runtime-overhead"}
+CORE_SPEED_LANES = {"drafter-calibration-memory", "frontier-dflash", "mtp-decode"}
+
+
+def task_is_terminal_external(task: dict[str, object], *, recent_empty_bridge_count: int) -> bool:
+    action = str(task.get("supervisor_action", "")).strip()
+    lane = str(task.get("lane", "")).strip()
+    task_id = str(task.get("id", "")).strip()
+    if lane in CORE_SPEED_LANES:
+        return False
+    if action == "implementation-bridge":
+        return recent_empty_bridge_count > 0 or task_id.startswith("handoff-audit-deterministic-bridge-")
+    if action in TERMINAL_EXTERNAL_ACTIONS:
+        return True
+    return lane in TERMINAL_EXTERNAL_LANES
+
+
+def recent_terminal_external_count(limit: int = 160) -> int:
+    count = 0
+    for task in read_jsonl(TASKS)[-limit:]:
+        if task.get("status") not in {"done", "blocked"}:
+            continue
+        if task_is_terminal_external(task, recent_empty_bridge_count=1):
+            count += 1
+    return count
+
+
+def external_change_required_status(args: argparse.Namespace) -> dict[str, object]:
+    if not getattr(args, "stop_on_external_blocker", True):
+        return {"should_stop": False, "reason": "disabled"}
+
+    quality = latest_json_artifact("quality-review-*.json")
+    frontier = latest_json_artifact("frontier-system-eval-*.json")
+    handoff = latest_json_artifact("implementation-handoff-audit-*.json")
+    canonical = quality.get("canonical_state") if isinstance(quality.get("canonical_state"), dict) else {}
+    if not canonical:
+        canonical = frontier.get("canonical_state") if isinstance(frontier.get("canonical_state"), dict) else {}
+
+    canonical_state = str(canonical.get("state", "")).strip()
+    external_states = {"blocked_until_external_change", "prerequisite_needed", "plateau_detected"}
+    if canonical_state not in external_states:
+        return {"should_stop": False, "reason": f"canonical_state={canonical_state or 'unknown'}"}
+    if canonical.get("clean") is False:
+        return {"should_stop": False, "reason": "canonical_state_not_clean"}
+
+    quality_scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    quality_values = [
+        value
+        for value in (quality.get("quality_score"), quality_scorecard.get("overall"))
+        if isinstance(value, int | float)
+    ]
+    quality_score = float(max(quality_values)) if quality_values else 0.0
+    min_quality = float(getattr(args, "external_blocker_min_quality", 90.0))
+    if quality_score < min_quality:
+        return {"should_stop": False, "reason": f"quality_score={quality_score}<min {min_quality}"}
+
+    exhausted = active_exhausted_lanes()
+    exhausted_core = sorted(exhausted & CORE_SPEED_LANES)
+    min_exhausted = int(getattr(args, "external_blocker_min_exhausted_core_lanes", 2))
+    if len(exhausted_core) < min_exhausted:
+        return {
+            "should_stop": False,
+            "reason": f"exhausted_core_lanes={len(exhausted_core)}<min {min_exhausted}",
+            "exhausted_lanes": sorted(exhausted),
+        }
+
+    recent_empty_bridges = len(recent_empty_implementation_bridges(limit=120))
+    ready = ready_tasks()
+    ready_impl = [task for task in ready if str(task.get("task_type", "research")) == "implementation"]
+    if ready_impl:
+        return {
+            "should_stop": False,
+            "reason": "ready implementation task exists",
+            "ready_tasks": [str(task.get("id", "")) for task in ready_impl[:8]],
+        }
+
+    meaningful_ready = [
+        task
+        for task in ready
+        if not task_is_terminal_external(task, recent_empty_bridge_count=recent_empty_bridges)
+        and str(task.get("lane", "")) not in exhausted
+    ]
+    if meaningful_ready:
+        return {
+            "should_stop": False,
+            "reason": "meaningful ready task exists",
+            "ready_tasks": [str(task.get("id", "")) for task in meaningful_ready[:8]],
+        }
+
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    terminal_noise = int(noise.get("terminal_synthesis_rows") or 0) + int(noise.get("routed_terminal_synthesis_rows") or 0)
+    terminal_count = terminal_noise + recent_terminal_external_count()
+    min_terminal = int(getattr(args, "external_blocker_min_terminal_cycles", 3))
+    if ready and terminal_count < min_terminal:
+        return {
+            "should_stop": False,
+            "reason": f"terminal_evidence={terminal_count}<min {min_terminal}",
+            "ready_tasks": [str(task.get("id", "")) for task in ready[:8]],
+        }
+
+    return {
+        "should_stop": True,
+        "reason": "external change required before more useful autonomous speed research",
+        "canonical_state": canonical_state,
+        "decode_mean_tps": canonical.get("decode_mean_tps"),
+        "quality_score": quality_score,
+        "handoff_score": handoff.get("score"),
+        "ready_tasks": [str(task.get("id", "")) for task in ready[:8]],
+        "exhausted_lanes": sorted(exhausted),
+        "terminal_evidence": terminal_count,
+        "next": canonical.get("next") or "add a new drafter candidate, trace source, or approved implementation direction",
+    }
+
+
+def append_external_change_required(cycle: int, session: str, status: dict[str, object]) -> None:
+    reason = str(status.get("reason") or "external change required")
+    next_step = str(status.get("next") or "add a new candidate/prerequisite before restarting")
+    evidence = {
+        "canonical_state": status.get("canonical_state"),
+        "decode_mean_tps": status.get("decode_mean_tps"),
+        "quality_score": status.get("quality_score"),
+        "handoff_score": status.get("handoff_score"),
+        "exhausted_lanes": status.get("exhausted_lanes"),
+        "ready_tasks": status.get("ready_tasks"),
+        "terminal_evidence": status.get("terminal_evidence"),
+    }
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "autoresearch-external-change-required",
+            "finding": "autoresearch stopped cleanly because active speed lanes are exhausted",
+            "reason": reason,
+            "session": session,
+            "evidence": evidence,
+            "next": next_step,
+        },
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"external-change-required-{cycle}",
+        status="blocked",
+        target="autoresearch-external-change-required",
+        hypothesis="autoresearch should stop at a clean external blocker instead of repeating terminal synthesis",
+        commit=current_commit(),
+        notes=f"session={session} reason={clean_tsv(reason)} next={clean_tsv(next_step)} evidence={clean_tsv(json.dumps(evidence, sort_keys=True))}",
+    )
+
+
+def maybe_stop_for_external_change(args: argparse.Namespace, cycle: int, session: str) -> tuple[bool, dict[str, object]]:
+    status = external_change_required_status(args)
+    if status.get("should_stop"):
+        append_external_change_required(cycle, session, status)
+        return True, status
+    return False, status
+
+
 def benchmark_mode_for_task(task: dict[str, object] | None) -> str:
     if not task or task.get("task_type") == "implementation":
         return ""
@@ -3553,6 +3716,55 @@ def run_supervisor_environment_snapshot(args: argparse.Namespace, log_file: Path
         subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
 
 
+def run_supervisor_self_improvement(args: argparse.Namespace, cycle: int, session: str, log_file: Path, reason: str) -> tuple[bool, str]:
+    if not args.self_improvement:
+        return True, "disabled"
+    commands = [
+        [
+            args.research_helper_bin,
+            "self-improve",
+            "--action",
+            "curate",
+            "--recent-rows",
+            str(args.self_improvement_recent_rows),
+        ]
+    ]
+    if getattr(args, "self_evolution", False):
+        commands.append(
+            [
+                args.research_helper_bin,
+                "self-improve",
+                "--action",
+                "evolve",
+                "--recent-rows",
+                str(args.self_improvement_recent_rows),
+                "--max-variants-per-skill",
+                str(args.self_evolution_max_variants_per_skill),
+                "--min-score",
+                str(args.self_evolution_min_score),
+            ]
+        )
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\n===== cycle {cycle} session {session} supervisor self-improvement: {reason} =====\n")
+        for cmd in commands:
+            file.write("$ " + " ".join(cmd) + "\n")
+            file.flush()
+            try:
+                result = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=file,
+                    stderr=subprocess.STDOUT,
+                    timeout=args.self_improvement_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"self-improvement {cmd[3]} timeout"
+            if result.returncode != 0:
+                return False, f"self-improvement {cmd[3]} exit {result.returncode}"
+    return True, ""
+
+
 def run_supervisor_reflection(args: argparse.Namespace, cycle: int, session: str, log_file: Path, reason: str) -> tuple[bool, str]:
     replay_result = replay_checks(WORKSPACE)
     ready_impl = ready_implementation_tasks()
@@ -3605,6 +3817,44 @@ def main() -> int:
     parser.add_argument("--quality-review-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_INTERVAL", "6")))
     parser.add_argument("--quality-review-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TIMEOUT", "45")))
     parser.add_argument("--review-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_RECENT_ROWS", "120")))
+    parser.add_argument(
+        "--self-improvement",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_IMPROVEMENT", "1") != "0",
+        help="curate autoresearch lessons at deterministic supervisor checkpoints",
+    )
+    parser.add_argument(
+        "--self-improvement-interval",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_IMPROVEMENT_INTERVAL", "0")),
+        help="progress-cycle interval for self-improvement curation; 0 follows the quality-review interval",
+    )
+    parser.add_argument(
+        "--self-improvement-recent-rows",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_IMPROVEMENT_ROWS", "160")),
+    )
+    parser.add_argument(
+        "--self-improvement-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_IMPROVEMENT_TIMEOUT", "30")),
+    )
+    parser.add_argument(
+        "--self-evolution",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_EVOLUTION", "0") == "1",
+        help="run canary-only skill evolution after self-improvement curation; disabled by default",
+    )
+    parser.add_argument(
+        "--self-evolution-max-variants-per-skill",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_EVOLUTION_VARIANTS", "2")),
+    )
+    parser.add_argument(
+        "--self-evolution-min-score",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_EVOLUTION_MIN_SCORE", "90")),
+    )
     parser.add_argument("--review-min-sweeps", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SWEEPS", "3")))
     parser.add_argument("--review-min-samples-per-block", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_MIN_SAMPLES_PER_BLOCK", "3")))
     parser.add_argument("--review-target-tps", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TARGET_TPS", "30")))
@@ -3677,6 +3927,30 @@ def main() -> int:
         help="when the cycle tranche ends, keep going until max-hours if useful work remains or progress is healthy",
     )
     parser.add_argument(
+        "--stop-on-external-blocker",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_STOP_ON_EXTERNAL_BLOCKER", "1") != "0",
+        help="stop cleanly once evidence says active speed lanes require external change instead of more terminal synthesis",
+    )
+    parser.add_argument(
+        "--external-blocker-min-quality",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_BLOCKER_MIN_QUALITY", "90")),
+        help="minimum quality score before an external blocker can stop the autonomous loop",
+    )
+    parser.add_argument(
+        "--external-blocker-min-exhausted-core-lanes",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_BLOCKER_MIN_EXHAUSTED_LANES", "2")),
+        help="core speed lanes that must be exhausted before external-blocker stop can fire",
+    )
+    parser.add_argument(
+        "--external-blocker-min-terminal-cycles",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_BLOCKER_MIN_TERMINAL_CYCLES", "3")),
+        help="terminal synthesis/report evidence required before stopping while terminal tasks remain queued",
+    )
+    parser.add_argument(
         "--cycle-extension-size",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_CYCLE_EXTENSION_SIZE", "0")),
@@ -3744,6 +4018,15 @@ def main() -> int:
     )
     run_supervisor_compaction(args, log_file)
     run_supervisor_environment_snapshot(args, log_file, "autopilot-start")
+    self_improve_ok, self_improve_issue = run_supervisor_self_improvement(
+        args,
+        0,
+        args.session,
+        log_file,
+        reason="autopilot-start",
+    )
+    if not self_improve_ok:
+        log(f"startup self_improvement warning: {self_improve_issue}")
     replay_start = replay_checks(WORKSPACE)
     if not replay_start["ok"]:
         append_supervisor_result(0, args.session, "blocked", f"startup replay failed: {replay_start}")
@@ -3800,6 +4083,14 @@ def main() -> int:
         stale_causal_blocked = block_stale_model_bound_causal_tasks()
         if stale_causal_blocked:
             log(f"supervisor quarantined stale model-bound causal tasks count={stale_causal_blocked}")
+        external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+        if external_stop:
+            log(
+                f"cycle={cycle} external_change_required_stop reason={external_status.get('reason')} "
+                f"exhausted={','.join(str(item) for item in external_status.get('exhausted_lanes', [])) or 'none'} "
+                f"ready={','.join(str(item) for item in external_status.get('ready_tasks', [])) or 'none'}"
+            )
+            break
         memory_ok, memory_issue = wait_for_memory(args)
         if not memory_ok:
             stalled_cycles += 1
@@ -3834,6 +4125,13 @@ def main() -> int:
                 after_review = durable_snapshot()
                 review_progress = durable_progress(after, after_review)
                 deterministic_ready = deterministic_ready_tasks()
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                if external_stop:
+                    log(
+                        f"cycle={cycle} terminal_no_work_external_stop reason={external_status.get('reason')} "
+                        f"artifact={','.join(review_progress) if review_progress else 'none'}"
+                    )
+                    break
                 if deterministic_ready:
                     progress_cycles += 1
                     log(
@@ -3858,6 +4156,13 @@ def main() -> int:
                 if stale_causal_blocked:
                     review_progress.append("stale causal tasks quarantined")
                 deterministic_ready = deterministic_ready_tasks()
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                if external_stop:
+                    log(
+                        f"cycle={cycle} synthesis_empty_external_stop reason={external_status.get('reason')} "
+                        f"artifact={','.join(review_progress) if review_progress else 'none'}"
+                    )
+                    break
                 if deterministic_ready:
                     progress_cycles += 1
                     log(
@@ -3913,6 +4218,10 @@ def main() -> int:
                 if stale_causal_blocked:
                     log(f"cycle={cycle} deferred_task_review quarantined stale causal tasks count={stale_causal_blocked}")
                 deterministic_ready = deterministic_ready_tasks()
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                if external_stop:
+                    log(f"cycle={cycle} deferred_task_external_stop reason={external_status.get('reason')}")
+                    break
                 if deterministic_ready:
                     append_supervisor_result(cycle, current_session, "blocked", issue)
                     log(
@@ -4091,6 +4400,26 @@ def main() -> int:
                 log_file,
             )
             log(f"cycle={cycle} quality_review ok={review_ok} issue={review_issue or 'none'}")
+            external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+            if external_stop:
+                log(f"cycle={cycle} quality_review_external_stop reason={external_status.get('reason')}")
+                break
+        self_improvement_interval = args.self_improvement_interval or args.quality_review_interval
+        if (
+            progressed
+            and args.self_improvement
+            and self_improvement_interval > 0
+            and progress_cycles > 0
+            and progress_cycles % self_improvement_interval == 0
+        ):
+            self_improve_ok, self_improve_issue = run_supervisor_self_improvement(
+                args,
+                cycle,
+                current_session,
+                log_file,
+                reason=f"progress_cycles={progress_cycles}",
+            )
+            log(f"cycle={cycle} self_improvement ok={self_improve_ok} issue={self_improve_issue or 'none'}")
         if code not in {0, 124} and not progressed:
             log(f"cycle action returned nonzero exit={code}; continuing after a short pause")
         elif code == 2 and progressed:
