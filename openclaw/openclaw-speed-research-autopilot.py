@@ -782,6 +782,45 @@ def append_external_change_required(cycle: int, session: str, status: dict[str, 
     )
 
 
+def append_external_refocus(cycle: int, session: str, status: dict[str, object], seeded_tasks: int) -> None:
+    reason = str(status.get("reason") or "external change required")
+    next_step = str(status.get("next") or "continue with the next deterministic decode/MTP tranche")
+    evidence = {
+        "canonical_state": status.get("canonical_state"),
+        "decode_mean_tps": status.get("decode_mean_tps"),
+        "quality_score": status.get("quality_score"),
+        "handoff_score": status.get("handoff_score"),
+        "exhausted_lanes": status.get("exhausted_lanes"),
+        "ready_tasks": status.get("ready_tasks"),
+        "terminal_evidence": status.get("terminal_evidence"),
+        "seeded_tasks": seeded_tasks,
+    }
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "autoresearch-external-refocus",
+            "finding": "autoresearch converted a clean external blocker into the next autonomous decode/MTP tranche",
+            "reason": reason,
+            "session": session,
+            "evidence": evidence,
+            "next": next_step,
+        },
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"external-refocus-{cycle}",
+        status="keep",
+        target="autoresearch-external-refocus",
+        hypothesis="overnight autoresearch should refocus clean blockers instead of waiting for manual continuation",
+        commit=current_commit(),
+        notes=(
+            f"session={session} seeded_tasks={seeded_tasks} reason={clean_tsv(reason)} "
+            f"next={clean_tsv(next_step)} evidence={clean_tsv(json.dumps(evidence, sort_keys=True))}"
+        ),
+    )
+
+
 def refill_before_external_stop(
     args: argparse.Namespace,
     cycle: int,
@@ -830,6 +869,17 @@ def maybe_stop_for_external_change(
                     f"reason={status.get('reason', 'ready work created')}"
                 )
                 return False, status
+        action = str(getattr(args, "external_blocker_action", "refocus") or "refocus").strip().lower()
+        if action != "stop":
+            seeded = enqueue_recurring_decode_tasks(cycle, f"external blocker refocus: {status.get('reason', '')}")
+            append_external_refocus(cycle, session, status, seeded)
+            refocused = {
+                **status,
+                "should_stop": False,
+                "reason": f"external blocker refocused into deterministic work: {status.get('reason', '')}",
+                "seeded_tasks": seeded,
+            }
+            return False, refocused
         append_external_change_required(cycle, session, status)
         return True, status
     return False, status
@@ -3664,6 +3714,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     commands.append([args.research_helper_bin, "evaluator-integrity"])
     commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "frontier-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
+    commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
     commands.append(
         [
@@ -4130,6 +4181,12 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_REFILL_BEFORE_STOP", "1") != "0",
         help="run deterministic quality/synthesis refill before allowing an external-change stop",
+    )
+    parser.add_argument(
+        "--external-blocker-action",
+        choices=["refocus", "stop"],
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_BLOCKER_ACTION", "refocus"),
+        help="what to do when clean evidence says current lanes are externally blocked; default refocus keeps overnight loops alive",
     )
     parser.add_argument(
         "--cycle-extension-size",

@@ -1321,6 +1321,7 @@ def main() -> int:
         assert "plateau-pivot --recent-rows 120 --min-sweeps 3 --target-tps 30.0" in review_log
         assert "evaluator-integrity" in review_log
         assert "implementation-handoff-audit --min-score 90" in review_log
+        assert review_log.count("implementation-handoff-audit --min-score 90") == 2
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
@@ -1348,6 +1349,49 @@ def main() -> int:
         assert not should_stop
         assert refill_status["ready_tasks"] == ["refilled-task"]
         assert review_mock.call_count == 1
+        refocus_args = Namespace(**{**vars(review_args), "external_blocker_refill_before_stop": True})
+        with patch.object(
+            helper,
+            "external_change_required_status",
+            side_effect=[
+                {"should_stop": True, "ready_tasks": [], "reason": "external change required"},
+                {"should_stop": True, "ready_tasks": [], "reason": "external change required"},
+                {"should_stop": True, "ready_tasks": [], "reason": "external change required"},
+            ],
+        ):
+            with patch.object(helper, "run_supervisor_quality_review", return_value=(True, "")):
+                with patch.object(helper, "run_supervisor_synthesis", return_value=(True, "")):
+                    should_stop, refocus_status = helper.maybe_stop_for_external_change(
+                        refocus_args,
+                        14,
+                        "nightly",
+                        Path(tmp) / "autopilot.log",
+                    )
+        assert not should_stop
+        assert refocus_status["seeded_tasks"] == 3
+        assert "autoresearch-external-refocus" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "decode-repeatability-cycle-014" in helper.TASKS.read_text(encoding="utf-8")
+        stop_args = Namespace(
+            **{
+                **vars(review_args),
+                "external_blocker_refill_before_stop": False,
+                "external_blocker_action": "stop",
+            }
+        )
+        with patch.object(
+            helper,
+            "external_change_required_status",
+            return_value={"should_stop": True, "ready_tasks": [], "reason": "external change required"},
+        ):
+            should_stop, stop_status = helper.maybe_stop_for_external_change(
+                stop_args,
+                15,
+                "nightly",
+                Path(tmp) / "autopilot.log",
+            )
+        assert should_stop
+        assert stop_status["reason"] == "external change required"
+        assert "autoresearch-external-change-required" in helper.RESULTS.read_text(encoding="utf-8")
         review_fail_helper = Path(tmp) / "review-fail-helper.py"
         review_fail_log = Path(tmp) / "review-fail-marker.txt"
         review_fail_helper.write_text(
