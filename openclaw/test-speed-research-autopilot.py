@@ -1760,6 +1760,83 @@ def main() -> int:
         assert issue == ""
         assert "benchmark-test" in helper.RESULTS.read_text(encoding="utf-8")
         assert "supervisor-benchmark" in helper.EXPERIMENTS.read_text(encoding="utf-8")
+        refocus_workspace = Path(tmp) / "actual-external-refocus"
+        configure_workspace(helper, refocus_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        helper.write_jsonl(helper.TASKS, [])
+        helper.write_jsonl(
+            helper.WORKSPACE / "exhausted-approaches.jsonl",
+            [
+                {"lane": "drafter-calibration-memory", "reason": "unit exhausted"},
+                {"lane": "frontier-dflash", "reason": "unit exhausted"},
+            ],
+        )
+        canonical = {
+            "state": "prerequisite_needed",
+            "clean": True,
+            "next": "run deterministic prerequisite",
+            "decode_mean_tps": 13.4,
+            "noise": {"terminal_synthesis_rows": 3, "routed_terminal_synthesis_rows": 0},
+        }
+        (helper.BENCHMARKS / "quality-review-999.json").write_text(
+            json.dumps(
+                {
+                    "quality_score": 100,
+                    "scorecard": {"overall": 99.7},
+                    "canonical_state": canonical,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "frontier-system-eval-999.json").write_text(
+            json.dumps({"overall": 9.7, "canonical_state": canonical}),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "implementation-handoff-audit-999.json").write_text(
+            json.dumps({"ok": True, "score": 100}),
+            encoding="utf-8",
+        )
+        noop_helper = Path(tmp) / "noop-research-helper.py"
+        noop_helper.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
+        noop_helper.chmod(0o700)
+        actual_refocus_args = Namespace(
+            research_helper_bin=str(noop_helper),
+            review_recent_rows=120,
+            review_min_sweeps=3,
+            review_min_samples_per_block=3,
+            review_target_tps=30.0,
+            hypothesis_rank_limit=12,
+            gepa_min_blocked=3,
+            gepa_min_rework=2,
+            gepa_min_trajectory=2,
+            gepa_min_low_quality=2,
+            quality_review_timeout_seconds=5,
+            synthesis_timeout_seconds=5,
+            stop_on_external_blocker=True,
+            external_blocker_refill_before_stop=True,
+            external_blocker_action="refocus",
+            external_blocker_min_quality=90.0,
+            external_blocker_min_exhausted_core_lanes=2,
+            external_blocker_min_terminal_cycles=3,
+        )
+        actual_status = helper.external_change_required_status(actual_refocus_args)
+        assert actual_status["should_stop"]
+        should_stop, refocused = helper.maybe_stop_for_external_change(
+            actual_refocus_args,
+            21,
+            "actual-refocus",
+            helper.WORKSPACE / "autopilot.log",
+        )
+        assert not should_stop
+        assert refocused["seeded_tasks"] == 3
+        actual_tasks = helper.TASKS.read_text(encoding="utf-8")
+        assert "decode-repeatability-cycle-021" in actual_tasks
+        assert "mtp-acceptance-review-cycle-021" in actual_tasks
+        assert "implementation-bridge-cycle-021" in actual_tasks
+        assert "autoresearch-external-refocus" in helper.RESULTS.read_text(encoding="utf-8")
+        assert "autoresearch-external-change-required" not in helper.RESULTS.read_text(encoding="utf-8")
     return 0
 
 
