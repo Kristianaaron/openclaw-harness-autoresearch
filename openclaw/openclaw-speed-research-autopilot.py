@@ -782,9 +782,54 @@ def append_external_change_required(cycle: int, session: str, status: dict[str, 
     )
 
 
-def maybe_stop_for_external_change(args: argparse.Namespace, cycle: int, session: str) -> tuple[bool, dict[str, object]]:
+def refill_before_external_stop(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    log_file: Path,
+    status: dict[str, object],
+) -> tuple[dict[str, object], list[str]]:
+    """Give deterministic reviewers one chance to create useful work before stopping."""
+    attempts: list[str] = []
+    if not getattr(args, "external_blocker_refill_before_stop", True):
+        return status, attempts
+    if status.get("ready_tasks"):
+        return status, attempts
+
+    review_ok, review_issue = run_supervisor_quality_review(args, cycle, session, log_file)
+    attempts.append(f"quality_review={review_ok}:{review_issue or 'ok'}")
+    refreshed = external_change_required_status(args)
+    if not refreshed.get("should_stop"):
+        return refreshed, attempts
+
+    synth_ok, synth_issue = run_supervisor_synthesis(args, cycle, session, log_file)
+    attempts.append(f"synthesis={synth_ok}:{synth_issue or 'ok'}")
+    review_ok, review_issue = run_supervisor_quality_review(args, cycle, session, log_file)
+    attempts.append(f"post_synthesis_quality_review={review_ok}:{review_issue or 'ok'}")
+    refreshed = external_change_required_status(args)
+    if refreshed.get("should_stop"):
+        refreshed = {**refreshed, "refill_attempts": attempts}
+    return refreshed, attempts
+
+
+def maybe_stop_for_external_change(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    log_file: Path | None = None,
+) -> tuple[bool, dict[str, object]]:
     status = external_change_required_status(args)
     if status.get("should_stop"):
+        if log_file is not None:
+            status, attempts = refill_before_external_stop(args, cycle, session, log_file, status)
+            if attempts:
+                log(f"cycle={cycle} external_stop_refill attempts={'; '.join(attempts)}")
+            if not status.get("should_stop"):
+                log(
+                    f"cycle={cycle} external_stop_refill_resolved "
+                    f"reason={status.get('reason', 'ready work created')}"
+                )
+                return False, status
         append_external_change_required(cycle, session, status)
         return True, status
     return False, status
@@ -4081,6 +4126,12 @@ def main() -> int:
         help="terminal synthesis/report evidence required before stopping while terminal tasks remain queued",
     )
     parser.add_argument(
+        "--external-blocker-refill-before-stop",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_EXTERNAL_REFILL_BEFORE_STOP", "1") != "0",
+        help="run deterministic quality/synthesis refill before allowing an external-change stop",
+    )
+    parser.add_argument(
         "--cycle-extension-size",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_CYCLE_EXTENSION_SIZE", "0")),
@@ -4229,7 +4280,7 @@ def main() -> int:
         stale_causal_blocked = block_stale_model_bound_causal_tasks()
         if stale_causal_blocked:
             log(f"supervisor quarantined stale model-bound causal tasks count={stale_causal_blocked}")
-        external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+        external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
         if external_stop:
             log(
                 f"cycle={cycle} external_change_required_stop reason={external_status.get('reason')} "
@@ -4272,7 +4323,7 @@ def main() -> int:
                 after_review = durable_snapshot()
                 review_progress = durable_progress(after, after_review)
                 deterministic_ready = deterministic_ready_tasks()
-                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
                 if external_stop:
                     log(
                         f"cycle={cycle} terminal_no_work_external_stop reason={external_status.get('reason')} "
@@ -4303,7 +4354,7 @@ def main() -> int:
                 if stale_causal_blocked:
                     review_progress.append("stale causal tasks quarantined")
                 deterministic_ready = deterministic_ready_tasks()
-                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
                 if external_stop:
                     log(
                         f"cycle={cycle} synthesis_empty_external_stop reason={external_status.get('reason')} "
@@ -4366,7 +4417,7 @@ def main() -> int:
                 if stale_causal_blocked:
                     log(f"cycle={cycle} deferred_task_review quarantined stale causal tasks count={stale_causal_blocked}")
                 deterministic_ready = deterministic_ready_tasks()
-                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+                external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
                 if external_stop:
                     log(f"cycle={cycle} deferred_task_external_stop reason={external_status.get('reason')}")
                     break
@@ -4548,7 +4599,7 @@ def main() -> int:
                 log_file,
             )
             log(f"cycle={cycle} quality_review ok={review_ok} issue={review_issue or 'none'}")
-            external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session)
+            external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
             if external_stop:
                 log(f"cycle={cycle} quality_review_external_stop reason={external_status.get('reason')}")
                 break

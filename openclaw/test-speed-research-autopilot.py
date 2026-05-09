@@ -1324,6 +1324,30 @@ def main() -> int:
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
+        refill_args = Namespace(**{**vars(review_args), "external_blocker_refill_before_stop": True})
+        with patch.object(
+            helper,
+            "external_change_required_status",
+            side_effect=[
+                {"should_stop": True, "ready_tasks": [], "reason": "external change required"},
+                {
+                    "should_stop": False,
+                    "ready_tasks": ["refilled-task"],
+                    "reason": "ready deterministic/prerequisite task exists",
+                },
+            ],
+        ):
+            with patch.object(helper, "run_supervisor_quality_review", return_value=(True, "")) as review_mock:
+                with patch.object(helper, "run_supervisor_synthesis", side_effect=AssertionError("synthesis not needed")):
+                    should_stop, refill_status = helper.maybe_stop_for_external_change(
+                        refill_args,
+                        13,
+                        "nightly",
+                        Path(tmp) / "autopilot.log",
+                    )
+        assert not should_stop
+        assert refill_status["ready_tasks"] == ["refilled-task"]
+        assert review_mock.call_count == 1
         review_fail_helper = Path(tmp) / "review-fail-helper.py"
         review_fail_log = Path(tmp) / "review-fail-marker.txt"
         review_fail_helper.write_text(
