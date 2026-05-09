@@ -298,10 +298,86 @@ def configure_workspace(helper, workspace: Path) -> None:
     helper.AUTOPILOT_LOCK = helper.WORKSPACE / "autopilot.lock"
 
 
+def check_terminal_bridge_no_work_is_neutral(helper) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_workspace(helper, Path(tmp))
+        helper.ensure_task_queue()
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "handoff-audit-deterministic-bridge-unit",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "implementation-bridge",
+                    "target": "implementation-bridge",
+                }
+            ],
+        )
+        task = helper.read_jsonl(helper.TASKS)[0]
+        with patch.object(
+            helper,
+            "run_supervisor_synthesis",
+            return_value=(False, "supervisor synthesis terminal no-work"),
+        ):
+            code, issue = helper.run_supervisor_implementation_bridge(
+                Namespace(),
+                7,
+                "unit",
+                task,
+                helper.WORKSPACE / "autopilot.log",
+            )
+        assert (code, issue) == (0, "")
+        rows = helper.all_result_rows(helper.WORKSPACE)
+        bridge_rows = [row for row in rows if row.get("run_id") == "supervisor-implementation-bridge-7"]
+        assert bridge_rows and bridge_rows[-1]["status"] == "keep"
+        assert "terminal_no_work=True" in bridge_rows[-1]["notes"]
+        tasks = helper.read_jsonl(helper.TASKS)
+        assert tasks[0]["status"] == "done"
+        assert tasks[0]["supervisor_summary"]["terminal_no_work"] is True
+
+
+def check_quality_review_repairs_before_scoring(helper) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_workspace(helper, Path(tmp))
+        helper.ensure_task_queue()
+        commands: list[list[str]] = []
+
+        class Result:
+            returncode = 0
+
+        def capture_command(cmd, **_kwargs):
+            commands.append(list(cmd))
+            return Result()
+
+        args = Namespace(
+            research_helper_bin="/Users/kristian/.openclaw/bin/openclaw-speed-research",
+            review_recent_rows=120,
+            review_min_sweeps=3,
+            review_min_samples_per_block=3,
+            review_target_tps=30.0,
+            hypothesis_rank_limit=12,
+            gepa_min_blocked=3,
+            gepa_min_rework=2,
+            gepa_min_trajectory=2,
+            gepa_min_low_quality=2,
+            quality_review_timeout_seconds=5,
+        )
+        with patch.object(helper.subprocess, "run", side_effect=capture_command):
+            ok, issue = helper.run_supervisor_quality_review(args, 9, "unit", helper.WORKSPACE / "review.log")
+        assert ok is True
+        assert issue == ""
+        names = [cmd[1] for cmd in commands]
+        assert names.index("implementation-handoff-audit") < names.index("quality-review")
+        assert names.index("quality-review") < names.index("frontier-eval")
+
+
 def main() -> int:
     helper = load_helper()
     check_prompt_and_routing_guards(helper)
     check_memory_and_failure_guards(helper)
+    check_terminal_bridge_no_work_is_neutral(helper)
+    check_quality_review_repairs_before_scoring(helper)
     with tempfile.TemporaryDirectory() as tmp:
         configure_workspace(helper, Path(tmp))
         helper.ensure_task_queue()
@@ -1321,7 +1397,7 @@ def main() -> int:
         assert "plateau-pivot --recent-rows 120 --min-sweeps 3 --target-tps 30.0" in review_log
         assert "evaluator-integrity" in review_log
         assert "implementation-handoff-audit --min-score 90" in review_log
-        assert review_log.count("implementation-handoff-audit --min-score 90") == 2
+        assert review_log.count("implementation-handoff-audit --min-score 90") == 3
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log

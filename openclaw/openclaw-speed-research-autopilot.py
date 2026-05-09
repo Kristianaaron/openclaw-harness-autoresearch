@@ -2665,17 +2665,23 @@ def run_supervisor_implementation_bridge(
         for task_id, issue in contract_issues.items()
         if issue.get("blockers")
     }
+    terminal_no_work = issue == "supervisor synthesis terminal no-work" and not deterministic
     summary = {
         "synthesis_ok": ok,
         "issue": issue,
+        "terminal_no_work": terminal_no_work,
         "seeded_deterministic_tasks": seeded,
         "ready_deterministic_tasks": deterministic[:12],
         "contract_blockers": blocked_contracts,
         "stale_lane_blocked": stale_lane_blocked,
         "stale_causal_blocked": stale_causal_blocked,
-        "next": "select_next_ready_supervisor_task",
+        "next": (
+            "run implementation-handoff-audit to route one concrete prerequisite"
+            if terminal_no_work
+            else "select_next_ready_supervisor_task"
+        ),
     }
-    status = "keep" if ok and deterministic else "blocked"
+    status = "keep" if (ok and deterministic) or terminal_no_work else "blocked"
     append_result(
         WORKSPACE,
         run_id=f"supervisor-implementation-bridge-{cycle}",
@@ -2685,7 +2691,7 @@ def run_supervisor_implementation_bridge(
         commit=current_commit(),
         notes=(
             f"seeded={len(seeded)} ready_deterministic={len(deterministic)} "
-            f"issue={clean_tsv(issue)}"
+            f"terminal_no_work={terminal_no_work} issue={clean_tsv(issue)}"
         ),
     )
     complete_supervisor_task(task, status=status, summary=summary, commit=current_commit())
@@ -3674,6 +3680,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     first_issue = ""
     commands = [
         [args.research_helper_bin, "environment-snapshot", "--label", f"review-cycle-{cycle}", "--allow-fail"],
+        [args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"],
         [
             args.research_helper_bin,
             "quality-review",
