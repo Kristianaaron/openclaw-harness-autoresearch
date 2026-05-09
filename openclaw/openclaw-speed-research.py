@@ -6020,11 +6020,24 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     timestamp = int(time.time())
     seeded_bridge = False
     seeded_prerequisite = False
+    seeded_fallback = False
+    terminal_handoff_exhausted = False
     bridge_zero = recent_empty_bridge_rows(root, rows, recent_rows=120)
     bridge_only_ready = bool(deterministic_ready) and all(is_implementation_bridge_task(task) for task in deterministic_ready)
     if not deterministic_ready or (bridge_only_ready and bridge_zero):
         if bridge_zero:
-            seeded_prerequisite = bool(upsert_tasks(root, concrete_handoff_prerequisite_tasks(root, rows, timestamp)))
+            prerequisite_tasks = concrete_handoff_prerequisite_tasks(root, rows, timestamp)
+            seeded_prerequisite = bool(upsert_tasks(root, prerequisite_tasks))
+            if not seeded_prerequisite:
+                fallback_tasks = lane_contract_fallback_tasks(
+                    root,
+                    rows,
+                    timestamp,
+                    reason="Implementation handoff found an empty bridge and no concrete handoff prerequisite",
+                )
+                seeded_fallback = bool(upsert_tasks(root, fallback_tasks))
+                seeded_prerequisite = seeded_fallback
+            terminal_handoff_exhausted = not seeded_prerequisite
         else:
             seeded_bridge = bool(
                 upsert_tasks(
@@ -6090,7 +6103,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     )
     secret_fixture_classification = classify_patch(secret_fixture, source_files=["openclaw/sample.py"])
     gates = {
-        "deterministic_ready_task": bool(deterministic_ready),
+        "deterministic_ready_task": bool(deterministic_ready) or terminal_handoff_exhausted,
         "implementation_candidates_present": len(candidates) >= 3,
         "scoped_candidates_have_guards": len(scoped_candidates) >= 3,
         "ready_contracts_clean": not contract_blockers,
@@ -6112,13 +6125,21 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "ready_deterministic_tasks": [str(task.get("id", "")) for task in deterministic_ready[:12]],
         "seeded_bridge": seeded_bridge,
         "seeded_prerequisite": seeded_prerequisite,
+        "seeded_fallback": seeded_fallback,
+        "terminal_handoff_exhausted": terminal_handoff_exhausted,
         "recent_empty_bridges": len(bridge_zero),
         "implementation_candidates": [str(task.get("id", "")) for task in candidates],
         "scoped_candidates": [str(task.get("id", "")) for task in scoped_candidates],
         "contract_blockers": contract_blockers,
         "patch_template_contract": patch_template_contract,
         "secret_fixture_classification": secret_fixture_classification,
-        "next": "continue_autopilot_loop" if ok else "run implementation bridge or repair task contracts before research",
+        "next": (
+            "continue_autopilot_loop"
+            if ok and not terminal_handoff_exhausted
+            else "external_refocus_or_wait_for_new_candidate"
+            if terminal_handoff_exhausted
+            else "run implementation bridge or repair task contracts before research"
+        ),
     }
     path = root / "benchmarks" / f"implementation-handoff-audit-{timestamp}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -6143,6 +6164,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
             f"ok={ok} score={score} candidates={len(candidates)} scoped={len(scoped_candidates)} "
             f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} "
             f"seeded_prerequisite={seeded_prerequisite} empty_bridges={len(bridge_zero)} "
+            f"seeded_fallback={seeded_fallback} terminal_handoff_exhausted={terminal_handoff_exhausted} "
             f"blockers={len(contract_blockers)}"
         ),
     )

@@ -1269,6 +1269,39 @@ def main() -> int:
             assert "handoff-audit-drafter-calibration-canary-" in "\n".join(
                 handoff_after_empty["ready_deterministic_tasks"]
             )
+            handoff_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            for task in handoff_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", handoff_tasks)
+            helper.append_result(
+                root,
+                run_id="supervisor-implementation-bridge-terminal",
+                status="keep",
+                target="implementation-bridge",
+                hypothesis="unit terminal bridge",
+                commit="abc123",
+                notes="seeded=0 ready_deterministic=0 terminal_no_work=True issue=supervisor synthesis terminal no-work",
+            )
+            with patch.object(helper, "concrete_handoff_prerequisite_tasks", return_value=[]):
+                with patch.object(helper, "lane_contract_fallback_tasks", return_value=[]):
+                    assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            terminal_handoff = json.loads(
+                max(
+                    (root / "benchmarks").glob("implementation-handoff-audit-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert terminal_handoff["ok"] is True
+            assert terminal_handoff["terminal_handoff_exhausted"] is True
+            assert terminal_handoff["seeded_prerequisite"] is False
+            assert terminal_handoff["ready_deterministic_tasks"] == []
+            handoff_rows = [
+                row
+                for row in helper.result_rows(root)
+                if row.get("run_id", "").startswith("implementation-handoff-audit-")
+            ]
+            assert handoff_rows[-1]["status"] == "keep"
+            assert "terminal_handoff_exhausted=True" in handoff_rows[-1]["notes"]
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
