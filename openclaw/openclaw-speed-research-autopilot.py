@@ -114,6 +114,15 @@ MEMORY_OR_CRASH_TERMS = (
     "sigsegv",
     "crash",
 )
+INTERRUPT_CONTEXT: dict[str, object] = {
+    "args": None,
+    "child_process": None,
+    "current_session": "",
+    "cycle": 0,
+    "interrupted": False,
+    "lock": None,
+    "selected_task": None,
+}
 
 
 def log(message: str) -> None:
@@ -178,6 +187,51 @@ def file_mtime(path: Path) -> float:
 
 def clean_tsv(value: object) -> str:
     return str(value).replace("\t", " ").replace("\n", " ").strip()
+
+
+def handle_autopilot_interrupt(signum: int, _frame: object) -> None:
+    INTERRUPT_CONTEXT["interrupted"] = True
+    process = INTERRUPT_CONTEXT.get("child_process")
+    if isinstance(process, subprocess.Popen) and process.poll() is None:
+        stop_process_tree(process, terminate_grace_seconds=2)
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
+def install_interrupt_handlers() -> None:
+    signal.signal(signal.SIGINT, handle_autopilot_interrupt)
+    signal.signal(signal.SIGTERM, handle_autopilot_interrupt)
+
+
+def finalize_autopilot_interrupt(reason: str = "user interrupt") -> None:
+    if INTERRUPT_CONTEXT.get("interrupt_finalized"):
+        return
+    INTERRUPT_CONTEXT["interrupt_finalized"] = True
+    process = INTERRUPT_CONTEXT.get("child_process")
+    if isinstance(process, subprocess.Popen) and process.poll() is None:
+        stop_process_tree(process, terminate_grace_seconds=2)
+    cycle = int(INTERRUPT_CONTEXT.get("cycle") or 0)
+    session = str(INTERRUPT_CONTEXT.get("current_session") or INTERRUPT_CONTEXT.get("session") or "unknown")
+    selected_task = INTERRUPT_CONTEXT.get("selected_task")
+    append_interrupt_checkpoint(
+        cycle,
+        session,
+        reason,
+        selected_task=selected_task if isinstance(selected_task, dict) else None,
+    )
+    args = INTERRUPT_CONTEXT.get("args")
+    if args is not None and getattr(args, "stop_model_on_interrupt", True) and model_ready():
+        previous_cooldown = getattr(args, "memory_cooldown_after_stop_seconds", 0)
+        try:
+            setattr(args, "memory_cooldown_after_stop_seconds", 0)
+            stop_openclaw_model_for_memory_recovery(args, reason=f"autoresearch interrupted: {reason}")
+        finally:
+            setattr(args, "memory_cooldown_after_stop_seconds", previous_cooldown)
+    lock = INTERRUPT_CONTEXT.get("lock")
+    if lock is not None:
+        try:
+            lock.close()
+        except Exception:
+            pass
 
 
 def calibration_subprocess_env() -> dict[str, str]:
@@ -512,6 +566,56 @@ def append_quality_pause(cycle: int, session: str, reason: str) -> None:
         hypothesis="exhausted synthesis should pause instead of researching for the sake of research",
         commit=current_commit(),
         notes=f"session={session} reason={clean_tsv(reason)}",
+    )
+
+
+def append_interrupt_checkpoint(
+    cycle: int,
+    session: str,
+    reason: str,
+    *,
+    selected_task: dict[str, object] | None = None,
+) -> None:
+    """Record a user stop as a clean resume checkpoint, not research failure."""
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    task_id = str((selected_task or {}).get("id", "none"))
+    summary = ready_work_summary()
+    checkpoint = {
+        "timestamp": timestamp,
+        "cycle": cycle,
+        "session": session,
+        "reason": clean_tsv(reason),
+        "active_task": task_id,
+        "ready_tasks": summary.get("ready_tasks", 0),
+        "deterministic_ready_tasks": summary.get("deterministic_ready_tasks", 0),
+        "lanes": summary.get("lanes", []),
+        "commit": current_commit(),
+        "next": "resume with openclaw speed-research; do not treat this checkpoint as a blocker",
+    }
+    (WORKSPACE / "autopilot-interrupt.json").write_text(
+        json.dumps(checkpoint, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            **checkpoint,
+            "task_id": "autopilot-user-interrupt",
+            "finding": "autoresearch was stopped by the user and checkpointed cleanly for the next run",
+        },
+    )
+    append_result(
+        WORKSPACE,
+        run_id=f"user-interrupt-{int(time.time())}",
+        status="keep",
+        target="autoresearch-user-interrupt",
+        hypothesis="Ctrl+C should leave a neutral resume checkpoint instead of poisoning the next run",
+        commit=current_commit(),
+        notes=(
+            f"session={session} cycle={cycle} active_task={clean_tsv(task_id)} "
+            f"ready={checkpoint['ready_tasks']} deterministic={checkpoint['deterministic_ready_tasks']} "
+            f"reason={clean_tsv(reason)}"
+        ),
     )
 
 
@@ -1870,6 +1974,7 @@ def run_turn(
     starting_tool_results = session_tool_result_count(session)
     last_session_mtime = session_mtime(session)
     first_new_tool_at = 0.0
+    process: subprocess.Popen[str] | None = None
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         file.write("$ " + " ".join(cmd[:5] + ["<prompt>", *cmd[6:]]) + "\n")
@@ -1884,6 +1989,7 @@ def run_turn(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            INTERRUPT_CONTEXT["child_process"] = process
             deadline = started + args.turn_timeout_seconds + args.turn_timeout_grace_seconds
             next_heartbeat = started + 30
             next_tool_check = started + 1
@@ -1980,8 +2086,18 @@ def run_turn(
                         break
                     next_tool_check = now + 1
                 time.sleep(1)
-        finally:
+        except KeyboardInterrupt:
+            file.write(f"\nUSER INTERRUPT after {time.monotonic() - started:.1f}s; stopping child process tree\n")
             file.flush()
+            if process is not None:
+                stop_process_tree(process, terminate_grace_seconds=2)
+            raise
+        finally:
+            if process is not None and INTERRUPT_CONTEXT.get("child_process") is process:
+                INTERRUPT_CONTEXT["child_process"] = None
+            file.flush()
+        if process is None:
+            return 124, "agent process failed before launch"
         returncode = process.returncode if process.returncode is not None else 0
         if capped_by_tool_results and returncode != 0:
             returncode = 0
@@ -3923,6 +4039,12 @@ def main() -> int:
         help="stop OpenClaw's model process after memory, Metal, or fatal process failures before continuing",
     )
     parser.add_argument(
+        "--stop-model-on-interrupt",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_STOP_MODEL_ON_INTERRUPT", "1") != "0",
+        help="stop the OpenClaw-owned model and write a neutral resume checkpoint when Ctrl+C/SIGTERM stops research",
+    )
+    parser.add_argument(
         "--rotate-session-after-stalls",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_ROTATE_AFTER_STALLS", "3")),
@@ -4000,6 +4122,16 @@ def main() -> int:
         help="minimum quality-review scorecard required before starting autonomous cycles",
     )
     args = parser.parse_args()
+    INTERRUPT_CONTEXT.update(
+        {
+            "args": args,
+            "session": args.session,
+            "current_session": args.session,
+            "cycle": 0,
+            "selected_task": None,
+        }
+    )
+    install_interrupt_handlers()
     if args.cycles <= 0:
         args.cycles = 1_000_000
 
@@ -4009,6 +4141,7 @@ def main() -> int:
     if autopilot_lock is None:
         log(f"autopilot refused duplicate workspace run lock={AUTOPILOT_LOCK}")
         return 2
+    INTERRUPT_CONTEXT["lock"] = autopilot_lock
     log_file = LOG_DIR / f"autopilot-{args.session}-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + args.max_hours * 3600
     stalled_cycles = 0
@@ -4047,6 +4180,9 @@ def main() -> int:
             return 2
     cycle = 0
     while True:
+        INTERRUPT_CONTEXT["cycle"] = cycle
+        INTERRUPT_CONTEXT["current_session"] = current_session
+        INTERRUPT_CONTEXT["selected_task"] = None
         if cycle >= cycle_limit:
             extend, reason, summary = should_extend_cycle_budget(
                 args,
@@ -4070,6 +4206,8 @@ def main() -> int:
         cycle += 1
         if not args.reuse_session:
             current_session = f"{args.session}-cycle-{cycle:03d}"
+        INTERRUPT_CONTEXT["cycle"] = cycle
+        INTERRUPT_CONTEXT["current_session"] = current_session
         if time.monotonic() >= deadline:
             log("autopilot max-hours reached")
             break
@@ -4123,6 +4261,7 @@ def main() -> int:
             continue
         before = durable_snapshot()
         selected_task = select_next_runnable_task(args)
+        INTERRUPT_CONTEXT["selected_task"] = selected_task
         if selected_task is None:
             ok, issue = run_supervisor_synthesis(args, cycle, current_session, log_file)
             after = durable_snapshot()
@@ -4205,6 +4344,7 @@ def main() -> int:
             time.sleep(args.sleep_seconds)
             continue
         selected_task = claim_task_evidence_window(WORKSPACE, selected_task, int(before["results_lines"]))
+        INTERRUPT_CONTEXT["selected_task"] = selected_task
         before = durable_snapshot()
         defer_reason = model_bound_defer_reason(args, selected_task)
         if defer_reason:
@@ -4470,8 +4610,15 @@ def main() -> int:
             log(f"rotating to fresh recovery session={current_session}")
         time.sleep(args.sleep_seconds)
     log("autopilot done")
+    autopilot_lock.close()
+    INTERRUPT_CONTEXT["lock"] = None
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt as error:
+        finalize_autopilot_interrupt(str(error) or "user interrupt")
+        log("autopilot interrupted safely; checkpoint written for next run")
+        raise SystemExit(130)

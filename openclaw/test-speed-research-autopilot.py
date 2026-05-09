@@ -313,6 +313,19 @@ def main() -> int:
         second_lock = helper.acquire_autopilot_lock("unit-after-release")
         assert second_lock is not None
         second_lock.close()
+        helper.append_interrupt_checkpoint(
+            2,
+            "unit-session",
+            "SIGINT",
+            selected_task={"id": "active-drafter-task", "status": "ready"},
+        )
+        interrupt_rows = [
+            row for row in helper.all_result_rows(helper.WORKSPACE) if row.get("target") == "autoresearch-user-interrupt"
+        ]
+        assert interrupt_rows and interrupt_rows[-1]["status"] == "keep"
+        interrupt_checkpoint = json.loads((helper.WORKSPACE / "autopilot-interrupt.json").read_text(encoding="utf-8"))
+        assert interrupt_checkpoint["active_task"] == "active-drafter-task"
+        assert "autopilot-user-interrupt" in helper.FINDINGS.read_text(encoding="utf-8")
         helper.write_jsonl(
             helper.TASKS,
             [
