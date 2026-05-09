@@ -1411,6 +1411,27 @@ def is_known_terminal_calibration_blocked_row(row: dict[str, str]) -> bool:
     )
 
 
+def is_memory_safety_blocked_row(row: dict[str, str]) -> bool:
+    if row.get("status") != "blocked":
+        return False
+    if row.get("target") == "autoresearch-external-change-required":
+        return False
+    notes = row.get("notes", "").lower()
+    crash_terms = (
+        "memory gate",
+        "memory pressure",
+        "memory_guard",
+        "memory/crash",
+        "memory crash",
+        "metal crash",
+        "metal error",
+        "python crash",
+        "mlx crash",
+        "crash",
+    )
+    return any(term in notes for term in crash_terms)
+
+
 def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return [
         row
@@ -1521,9 +1542,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
         if row.get("target") == "synthesis-terminal" or "terminal_no_work=True" in row.get("notes", "")
     ]
     bridge_zero = recent_empty_bridge_rows(root, recent, recent_rows=len(recent) or 1)
-    memory_blocks = [
-        row for row in raw_blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
-    ]
+    memory_blocks = [row for row in raw_blocked if is_memory_safety_blocked_row(row)]
     repair_ready = [
         task_id
         for task_id in deterministic_ids
@@ -1546,7 +1565,11 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
         notes = row.get("notes", "").lower()
         target = row.get("target", "")
         run_id = row.get("run_id", "")
-        is_memory_block = any(term in notes for term in ("memory", "metal", "crash"))
+        is_memory_block = is_memory_safety_blocked_row(row)
+        external_blocker_routed = (
+            target == "autoresearch-external-change-required"
+            and bool(repair_ready or breakthrough_lanes or deterministic_ids)
+        )
         dflash_exhausted = target == "frontier-dflash" and "frontier-dflash" in exhausted
         causal_routed = (
             target == "autoresearch-causal-review"
@@ -1559,7 +1582,13 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             and ("draft_model_type_mismatch" in notes or "decision=blocked" in notes)
             and bool("frontier-dflash" in exhausted or repair_ready or breakthrough_lanes)
         )
-        if not is_memory_block and (deterministic_routed or dflash_exhausted or causal_routed or dflash_compatibility_routed):
+        if not is_memory_block and (
+            deterministic_routed
+            or dflash_exhausted
+            or causal_routed
+            or dflash_compatibility_routed
+            or external_blocker_routed
+        ):
             routed_blockers.append(row)
         else:
             unresolved.append(row)
@@ -3863,11 +3892,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
 
     blocked = list(canonical_state.get("unresolved_blocked_rows", []))
     historical_blocked = unresolved_actionable_blocked_rows(recent)
-    memory_blocks = [
-        row for row in blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
-    ]
+    memory_blocks = [row for row in blocked if is_memory_safety_blocked_row(row)]
     historical_memory_blocks = [
-        row for row in historical_blocked if any(term in row.get("notes", "").lower() for term in ("memory", "metal", "crash"))
+        row for row in historical_blocked if is_memory_safety_blocked_row(row)
     ]
     synthesis_rows = [row for row in active_recent if row.get("target") == "synthesis"]
     historical_synthesis_rows = [row for row in recent if row.get("target") == "synthesis"]

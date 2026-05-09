@@ -71,6 +71,16 @@ def main() -> int:
                     {"status": "blocked", "target": "decode-sample"},
                 ]
             ) == [{"status": "blocked", "target": "decode-sample"}]
+            assert helper.is_memory_safety_blocked_row(
+                {
+                    "status": "blocked",
+                    "target": "autoresearch-external-change-required",
+                    "notes": "exhausted_lanes=[drafter-calibration-memory]",
+                }
+            ) is False
+            assert helper.is_memory_safety_blocked_row(
+                {"status": "blocked", "target": "decode-sample", "notes": "memory pressure"}
+            ) is True
             assert (root / "insight-rubric.json").exists()
             assert (root / "research-profile.json").exists()
             assert (root / "evaluator-policy.json").exists()
@@ -1174,6 +1184,19 @@ def main() -> int:
                 )
                 deliberate_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "deliberate_actions" in (root / "findings.jsonl").read_text(encoding="utf-8")
+            helper.append_result(
+                root,
+                run_id="external-change-required-unit",
+                status="blocked",
+                target="autoresearch-external-change-required",
+                hypothesis="old external blocker should not poison a fresh ready prerequisite",
+                commit="unit-test",
+                notes='evidence={"exhausted_lanes":["drafter-calibration-memory"],"ready_tasks":["deliberate-drafter-trace-gate-test"]}',
+            )
+            canonical_with_external = helper.canonical_autoresearch_state(root, recent_rows=120)
+            assert canonical_with_external["noise"]["unresolved_blocked_rows"] == 0
+            assert canonical_with_external["noise"]["memory_blocks"] == 0
+            assert canonical_with_external["state"] == "breakthrough_lane_active"
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
             assert eval_paths
