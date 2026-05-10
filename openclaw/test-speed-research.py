@@ -752,6 +752,79 @@ def main() -> int:
                             123459,
                         )
                         assert handoff_repair == []
+                        repair_done_root = Path(tmp) / "trace-repair-done-root"
+                        helper.ensure_research_state(repair_done_root)
+                        helper.append_result(
+                            repair_done_root,
+                            run_id="supervisor-drafter-calibration-run-trace-distillation-unit",
+                            status="blocked",
+                            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                            hypothesis="unit trace-distillation blocker",
+                            commit="abc123",
+                            notes=(
+                                "calibration-quantized-gradient-unsupported "
+                                "calibration_mode=trace-distillation trace_distillation=True "
+                                "[QuantizedMatmul::vjp] no gradient wrt the quantized weights."
+                            ),
+                        )
+                        first_repair = helper.lane_contract_fallback_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123460,
+                            reason="unit trace repair first",
+                        )
+                        assert first_repair[0]["id"].startswith("trace-distillation-gradient-repair-")
+                        helper.upsert_tasks(repair_done_root, first_repair)
+                        repair_done_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                        for task in repair_done_tasks:
+                            if task["id"] == first_repair[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(repair_done_root / "tasks.jsonl", repair_done_tasks)
+                        assert helper.trace_distillation_repair_attempted(repair_done_root)
+                        after_repair = helper.lane_contract_fallback_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123461,
+                            reason="unit trace repair already passed",
+                        )
+                        assert len(after_repair) == 1
+                        assert after_repair[0]["id"].startswith("frontier-expansion-janq-adapter-path-")
+                        assert not after_repair[0]["id"].startswith("trace-distillation-gradient-repair-")
+                        helper.upsert_tasks(repair_done_root, after_repair)
+                        adapter_path_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                        for task in adapter_path_tasks:
+                            if task["id"] == after_repair[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(repair_done_root / "tasks.jsonl", adapter_path_tasks)
+                        adapter_bridge = helper.lane_contract_fallback_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123462,
+                            reason="unit trace expansion already passed",
+                        )
+                        assert len(adapter_bridge) == 1
+                        assert adapter_bridge[0]["id"].startswith("trace-distillation-adapter-bridge-")
+                        assert adapter_bridge[0]["supervisor_action"] == "focused-test"
+                        assert not helper.task_contract_issues(repair_done_root, adapter_bridge[0])["blockers"]
+                        old_bridge_row = [
+                            {
+                                "timestamp": "2026-05-10T00:00:00+0000",
+                                "run_id": "supervisor-implementation-bridge-unit",
+                                "status": "blocked",
+                                "target": "openclaw/openclaw-speed-research.py",
+                                "hypothesis": "old bridge blocker",
+                                "notes": "seeded=0 ready_deterministic=1 terminal_no_work=False issue=terminal",
+                            },
+                            {
+                                "timestamp": "2026-05-10T00:01:00+0000",
+                                "run_id": "quality-review-unit",
+                                "status": "keep",
+                                "target": "autoresearch-quality",
+                                "hypothesis": "clean quality checkpoint",
+                                "notes": "verdict=healthy score=98 scorecard_overall=97.7",
+                            },
+                        ]
+                        assert helper.unresolved_actionable_blocked_rows(old_bridge_row) == []
                         quality_args = Namespace(
                             recent_rows=120,
                             min_sweeps=3,

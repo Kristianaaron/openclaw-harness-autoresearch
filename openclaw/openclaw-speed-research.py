@@ -1463,6 +1463,7 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
     """
     blocked = actionable_blocked_rows(rows)
     latest_clean_handoff_index = -1
+    latest_clean_review_index = -1
     for index, row in enumerate(rows):
         if row.get("target") != "autoresearch-implementation-handoff":
             continue
@@ -1477,11 +1478,22 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             score = 0.0
         if score >= 90:
             latest_clean_handoff_index = index
+    for index, row in enumerate(rows):
+        if row.get("target") != "autoresearch-quality" or row.get("status") != "keep":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        try:
+            score = float(fields.get("score", "0") or 0)
+        except ValueError:
+            score = 0.0
+        if score >= 90 and fields.get("verdict") in {"healthy", "converged-below-target", "exhaustion-candidate"}:
+            latest_clean_review_index = index
 
-    if latest_clean_handoff_index < 0:
+    latest_clean_checkpoint_index = max(latest_clean_handoff_index, latest_clean_review_index)
+    if latest_clean_checkpoint_index < 0:
         return blocked
 
-    latest_progress_index = latest_clean_handoff_index
+    latest_progress_index = latest_clean_checkpoint_index
     for index, row in enumerate(rows):
         if row.get("status") != "keep":
             continue
@@ -1495,7 +1507,7 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
     for index, row in enumerate(rows):
         if row not in blocked:
             continue
-        if index < latest_clean_handoff_index and (
+        if index < latest_clean_checkpoint_index and (
             row.get("target") == "autoresearch-implementation-handoff"
             or row.get("run_id", "").startswith("supervisor-implementation-bridge-")
         ):
@@ -1566,6 +1578,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
                 "review-janq-drafter-fit",
                 "runtime-overhead",
                 "frontier-expansion",
+                "trace-distillation-adapter-bridge",
                 "calibration-memory-report",
                 "exhaustion",
             )
@@ -2485,6 +2498,56 @@ def trace_distillation_repair_task(timestamp: int, *, task_id: str, priority: in
     }
 
 
+def trace_distillation_adapter_bridge_task(timestamp: int, *, task_id: str, priority: int = 98) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "frontier-expansion",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": [
+            "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "openclaw/openclaw-speed-research.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": (
+            "Trace-distillation repair is proven and the old expansion candidates are exhausted; define the next "
+            "safe implementation path as a trainable adapter or saved-logit distillation head rather than retrying "
+            "quantized projection training."
+        ),
+        "metric": "trace_distillation_repair_gate",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": (
+            "The canary confirms the supervisor can route from failed quantized-gradient calibration to the "
+            "adapter/logit-distillation implementation track without reseeding trace-distillation repair loops."
+        ),
+        "rollback": "No runtime rollback needed; this is a no-model bridge before a future source patch.",
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+        "created_at": timestamp,
+    }
+
+
+def trace_distillation_repair_attempted(root: Path, *, recent_rows: int = 240) -> bool:
+    if any_task_has_prefix(root, "trace-distillation-gradient-repair-"):
+        return True
+    return any(
+        "trace-distillation-gradient-repair-" in " ".join(
+            str(row.get(key, ""))
+            for key in ("run_id", "target", "hypothesis", "notes")
+        )
+        for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
@@ -2918,13 +2981,30 @@ def lane_contract_fallback_tasks(
         if trace_distillation_proof_failed(root, recent_rows=240):
             if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
                 return []
-            if should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+            if not trace_distillation_repair_attempted(root, recent_rows=240) and should_seed_action(
+                root,
+                "trace-distillation-gradient-repair-",
+                recent_rows=240,
+            ):
                 return filter_seedable_tasks(
                     root,
                     [
                         trace_distillation_repair_task(
                             timestamp,
                             task_id=f"trace-distillation-gradient-repair-{timestamp}",
+                        )
+                    ],
+                )
+            expansion_tasks = frontier_expansion_tasks(root, recent_rows, timestamp)
+            if expansion_tasks:
+                return expansion_tasks
+            if not any_task_has_prefix(root, "trace-distillation-adapter-bridge-"):
+                return filter_seedable_tasks(
+                    root,
+                    [
+                        trace_distillation_adapter_bridge_task(
+                            timestamp,
+                            task_id=f"trace-distillation-adapter-bridge-{timestamp}",
                         )
                     ],
                 )
@@ -3181,13 +3261,30 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
                 if trace_distillation_proof_failed(root, recent_rows=240):
                     if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
                         return []
-                    if should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+                    if not trace_distillation_repair_attempted(root, recent_rows=240) and should_seed_action(
+                        root,
+                        "trace-distillation-gradient-repair-",
+                        recent_rows=240,
+                    ):
                         return filter_seedable_tasks(
                             root,
                             [
                                 trace_distillation_repair_task(
                                     timestamp,
                                     task_id=f"trace-distillation-gradient-repair-{timestamp}",
+                                )
+                            ],
+                        )
+                    expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
+                    if expansion_tasks:
+                        return expansion_tasks
+                    if not any_task_has_prefix(root, "trace-distillation-adapter-bridge-"):
+                        return filter_seedable_tasks(
+                            root,
+                            [
+                                trace_distillation_adapter_bridge_task(
+                                    timestamp,
+                                    task_id=f"trace-distillation-adapter-bridge-{timestamp}",
                                 )
                             ],
                         )
@@ -3850,6 +3947,7 @@ def quality_review(args: argparse.Namespace) -> int:
         task_id.startswith("trace-distillation-gradient-repair-")
         for task_id in active_task_ids
     )
+    trace_distillation_repair_done = trace_distillation_repair_attempted(root, recent_rows=max(160, int(args.recent_rows)))
     repeated_canary_ready_no_stage = [
         row
         for row in recent[-60:]
@@ -3899,7 +3997,7 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     if dflash_suppressed:
         recommendations.append("DFlash/JANQ compatibility was hard-blocked and the lane was retired until the draft candidate changes.")
-    if trace_distillation_failed and not has_trace_distillation_repair_route:
+    if trace_distillation_failed and not has_trace_distillation_repair_route and not trace_distillation_repair_done:
         quality_score -= 18
         recommendations.append(
             "trace-distillation proof hit the quantized-gradient blocker; suppress retries and route to adapter/logit-distillation repair."
@@ -4199,6 +4297,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "duplicate_stage_tasks": duplicate_stage_tasks,
         "trace_distillation_gradient_blocks": len(trace_distillation_blocks),
         "trace_distillation_repair_route": has_trace_distillation_repair_route,
+        "trace_distillation_repair_attempted": trace_distillation_repair_done,
         "compacted_stage_tasks": compacted_stage_tasks,
         "compacted_canary_tasks": compacted_canary_tasks,
         "compacted_terminal_tasks": compacted_terminal_tasks,
