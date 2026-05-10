@@ -2559,6 +2559,194 @@ def trace_distillation_repair_attempted(root: Path, *, recent_rows: int = 240) -
     )
 
 
+def drafter_bottleneck_state(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 240,
+) -> dict[str, Any]:
+    """Return the canonical JANQ drafter bottleneck state.
+
+    This keeps the drafter lane from rediscovering the same quantized-gradient
+    failure through calibration, DFlash, and decode fallback loops. The state is
+    deliberately small and deterministic so the supervisor can route to exactly
+    one next action.
+    """
+
+    window = (rows if rows is not None else result_rows(root))[-max(1, recent_rows) :]
+    blocker = recent_calibration_run_hard_blocker(root, recent_rows=recent_rows)
+    terminal_blocks = recent_terminal_calibration_block_rows(
+        root,
+        blocker=CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
+        recent_rows=recent_rows,
+    )
+    trace_paths = existing_drafter_trace_paths()
+    trace_attempted = trace_distillation_attempt_exists(root, recent_rows=recent_rows)
+    trace_failed = trace_distillation_proof_failed(root, recent_rows=recent_rows)
+    repair_attempted = trace_distillation_repair_attempted(root, recent_rows=recent_rows)
+    expansion_attempted = any_task_has_prefix(root, "frontier-expansion-janq-adapter-path-") or recent_result_has_prefix(
+        root,
+        "supervisor-focused-test-",
+        recent_rows=recent_rows,
+    ) and any(
+        "adapter" in row.get("hypothesis", "").lower()
+        for row in window
+        if row.get("run_id", "").startswith("supervisor-focused-test-")
+    )
+    adapter_bridge_attempted = any_task_has_prefix(root, "trace-distillation-adapter-bridge-")
+    fallback_decode_count = recent_lane_contract_decode_fallback_count(root, recent_rows=min(recent_rows, 80))
+
+    if blocker != CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        state = "no_terminal_quantized_blocker"
+        next_step = "continue_current_lane_contract"
+    elif trace_failed and not repair_attempted:
+        state = "trace_distillation_failed"
+        next_step = "seed_trace_distillation_repair"
+    elif trace_failed and repair_attempted and not expansion_attempted:
+        state = "repair_done_need_adapter_expansion"
+        next_step = "seed_janq_adapter_expansion"
+    elif trace_failed and repair_attempted and expansion_attempted and not adapter_bridge_attempted:
+        state = "adapter_expansion_done"
+        next_step = "seed_adapter_bridge"
+    elif trace_failed and repair_attempted and expansion_attempted and adapter_bridge_attempted:
+        state = "adapter_method_required"
+        next_step = "seed_adapter_method_contract"
+    elif trace_attempted:
+        state = "trace_distillation_pending_or_incomplete"
+        next_step = "wait_for_trace_distillation_result"
+    elif not trace_paths:
+        state = "trace_data_missing"
+        next_step = "collect_target_generated_traces"
+    else:
+        state = "trace_data_ready"
+        next_step = "seed_trace_distillation"
+
+    return {
+        "state": state,
+        "next_step": next_step,
+        "calibration_blocker": blocker,
+        "terminal_block_count": len(terminal_blocks),
+        "trace_paths": [str(path) for path in trace_paths],
+        "trace_attempted": trace_attempted,
+        "trace_distillation_failed": trace_failed,
+        "trace_repair_attempted": repair_attempted,
+        "adapter_expansion_attempted": expansion_attempted,
+        "adapter_bridge_attempted": adapter_bridge_attempted,
+        "fallback_decode_count": fallback_decode_count,
+    }
+
+
+def drafter_adapter_method_contract_task(timestamp: int, *, task_id: str, priority: int = 99) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "implementation-gate",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-adapter-method-contract",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": [
+            "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "openclaw/test-mtp-drafter-calibrate-guards.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": (
+            "The JANQ drafter bottleneck is now known: direct and trace-distillation training both hit "
+            "quantized-gradient blockers. The next implementation must use a changed method, such as a "
+            "trainable adapter or saved-logit distillation head, with frozen JANQ target and frozen quantized drafter."
+        ),
+        "metric": "adapter_method_contract",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": (
+            "A contract artifact records the exact changed drafter method, allowed source files, tests, "
+            "promotion gates, and rollback before any source patch or model-loading experiment can run."
+        ),
+        "rollback": "No runtime rollback needed; this only creates a source-patch contract and keeps the live drafter unchanged.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-adapter-method-contract",
+        "created_at": timestamp,
+    }
+
+
+def drafter_bottleneck_next_tasks(
+    root: Path,
+    rows: list[dict[str, str]] | None,
+    timestamp: int,
+    *,
+    reason: str,
+) -> list[dict[str, Any]]:
+    state = drafter_bottleneck_state(root, rows, recent_rows=240)
+    step = state["next_step"]
+    if step in {"seed_janq_adapter_expansion", "seed_adapter_bridge", "seed_adapter_method_contract"} and active_task_has_prefix(
+        root,
+        "trace-distillation-gradient-repair-",
+    ):
+        return []
+    if step == "collect_target_generated_traces":
+        return filter_seedable_tasks(
+            root,
+            [drafter_trace_collect_task(timestamp, task_id=f"drafter-bottleneck-trace-collect-{timestamp}")],
+        )
+    if step == "seed_trace_distillation":
+        distillation_task = trace_distillation_candidate_task(
+            root,
+            timestamp,
+            task_id=f"drafter-trace-distillation-run-{timestamp}",
+        )
+        return filter_seedable_tasks(root, [distillation_task] if distillation_task is not None else [])
+    if step == "seed_trace_distillation_repair":
+        if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
+            return []
+        if not should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+            return []
+        return filter_seedable_tasks(
+            root,
+            [trace_distillation_repair_task(timestamp, task_id=f"trace-distillation-gradient-repair-{timestamp}")],
+        )
+    if step == "seed_janq_adapter_expansion":
+        return frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
+    if step == "seed_adapter_bridge":
+        if any_task_has_prefix(root, "trace-distillation-adapter-bridge-"):
+            return []
+        return filter_seedable_tasks(
+            root,
+            [trace_distillation_adapter_bridge_task(timestamp, task_id=f"trace-distillation-adapter-bridge-{timestamp}")],
+        )
+    if step == "seed_adapter_method_contract":
+        if active_task_has_prefix(root, "drafter-adapter-method-contract-"):
+            return []
+        if not should_seed_action(root, "drafter-adapter-method-contract-", recent_rows=240):
+            return []
+        return filter_seedable_tasks(
+            root,
+            [
+                drafter_adapter_method_contract_task(
+                    timestamp,
+                    task_id=f"drafter-adapter-method-contract-{timestamp}",
+                )
+            ],
+        )
+    if step == "wait_for_trace_distillation_result":
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": "drafter-bottleneck-wait",
+                "finding": "drafter bottleneck review found an in-flight trace-distillation task and refused to seed parallel duplicates",
+                "reason": reason,
+                "evidence": state,
+                "next": "wait_for_existing_trace_distillation_result",
+            },
+        )
+    return []
+
+
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
@@ -3020,6 +3208,9 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        bottleneck_tasks = drafter_bottleneck_next_tasks(root, recent_rows, timestamp, reason=reason)
+        if bottleneck_tasks:
+            return bottleneck_tasks
         if trace_distillation_proof_failed(root, recent_rows=240):
             if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
                 return []
@@ -3300,6 +3491,14 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
             )
         elif calibration_blocker:
             if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+                bottleneck_tasks = drafter_bottleneck_next_tasks(
+                    root,
+                    rows,
+                    timestamp,
+                    reason="Implementation handoff hit the JANQ drafter bottleneck",
+                )
+                if bottleneck_tasks:
+                    return bottleneck_tasks
                 if trace_distillation_proof_failed(root, recent_rows=240):
                     if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
                         return []
@@ -6807,6 +7006,154 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def drafter_bottleneck_review(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    ensure_lane_contracts(root)
+    rows = result_rows(root)
+    timestamp = int(time.time())
+    state = drafter_bottleneck_state(root, rows, recent_rows=int(args.recent_rows))
+    tasks = drafter_bottleneck_next_tasks(
+        root,
+        rows,
+        timestamp,
+        reason="supervisor drafter bottleneck review",
+    )
+    seeded = upsert_tasks(root, tasks) if tasks else 0
+    status = "keep"
+    if state["next_step"] == "continue_current_lane_contract":
+        status = "blocked"
+    elif state["next_step"] == "wait_for_trace_distillation_result":
+        status = "keep"
+    report = {
+        "ok": status == "keep",
+        "kind": "drafter-bottleneck-review",
+        "timestamp": timestamp,
+        "state": state,
+        "seeded_tasks": seeded,
+        "task_ids": [str(task.get("id", "")) for task in tasks],
+        "next": state["next_step"],
+    }
+    path = root / "benchmarks" / f"drafter-bottleneck-review-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-bottleneck-review",
+            "finding": "supervisor classified the JANQ drafter bottleneck and seeded exactly one deterministic next route",
+            "evidence": report,
+            "next": state["next_step"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-bottleneck-review-{timestamp}",
+        status=status,
+        target="janq-drafter-bottleneck",
+        hypothesis="the drafter lane should advance through a canonical state machine instead of retrying blocked calibration",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"state={state['state']} next_step={state['next_step']} seeded_tasks={seeded} "
+            f"terminal_blocks={state['terminal_block_count']} fallback_decode_count={state['fallback_decode_count']}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if status == "keep" else 2
+
+
+def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    state = drafter_bottleneck_state(root, recent_rows=int(args.recent_rows))
+    source_files = [
+        "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "openclaw/test-mtp-drafter-calibrate-guards.py",
+        "openclaw/test-speed-research.py",
+    ]
+    contract = {
+        "ok": state["state"] == "adapter_method_required",
+        "kind": "drafter-adapter-method-contract",
+        "timestamp": timestamp,
+        "state": state,
+        "allowed_source_files": source_files,
+        "forbidden_changes": [
+            "opencode",
+            "live OpenClaw model profile",
+            "target model id",
+            "runtime server defaults",
+            "secrets or env files",
+        ],
+        "implementation_target": (
+            "add a canary-only adapter/logit-distillation calibration path that freezes the JANQ target "
+            "and frozen quantized drafter weights; only newly introduced adapter/head parameters may be trainable"
+        ),
+        "acceptance": [
+            "unit tests prove quantized drafter parameters remain blocked for direct training",
+            "new adapter/logit method is selected explicitly and does not run by default",
+            "no model load is required by the canary test",
+            "normal OpenClaw TUI drafter is unchanged until paired decode TPS benchmarks pass",
+        ],
+        "promotion_gate": [
+            "canary tests pass",
+            "bounded calibration artifact shows acceptance lift",
+            "paired normal TUI decode benchmark improves TPS",
+            "TTFT and memory do not regress materially",
+            "tool/reasoning/stream guards pass",
+        ],
+        "rollback": "discard adapter output and keep the current official MTP drafter/profile if any gate fails",
+    }
+    path = root / "experiments" / f"drafter-adapter-method-contract-{timestamp}.json"
+    path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if contract["ok"]:
+        implementation_task = {
+            "id": f"implementation-drafter-adapter-method-{timestamp}",
+            "status": "ready",
+            "priority": 99,
+            "lane": "implementation-gate",
+            "task_type": "implementation",
+            "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "source_files": source_files,
+            "hypothesis": contract["implementation_target"],
+            "metric": "adapter_method_contract",
+            "guard_checks": [
+                "no_model_load",
+                "canary_only",
+                "tests_pass",
+                "no_live_profile_change",
+                "no_opencode_changes",
+                "rollback_path",
+            ],
+            "acceptance": "; ".join(contract["acceptance"]),
+            "rollback": contract["rollback"],
+            "contract_path": str(path),
+            "next_action": "create a minimal source patch that satisfies the drafter adapter method contract, then run patch-execute",
+        }
+        upsert_tasks(root, [implementation_task])
+    append_jsonl(
+        root / "experiments.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-adapter-method-contract",
+            "status": "keep" if contract["ok"] else "blocked",
+            "path": str(path),
+            "state": state["state"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-adapter-method-contract-{timestamp}",
+        status="keep" if contract["ok"] else "blocked",
+        target="janq-drafter-adapter-method",
+        hypothesis="the supervisor should convert repeated quantized-gradient failures into a constrained adapter/logit implementation contract",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=f"state={state['state']} ok={contract['ok']} path={path}",
+    )
+    print(json.dumps({"path": str(path), **contract}, indent=2, sort_keys=True))
+    return 0 if contract["ok"] else 2
+
+
 def environment_snapshot_command(args: argparse.Namespace) -> int:
     root = workspace_root()
     commit = current_commit(Path(args.repo or repo_root()))
@@ -8071,6 +8418,14 @@ def main() -> int:
     handoff = sub.add_parser("implementation-handoff-audit")
     handoff.add_argument("--min-score", type=int, default=90)
     handoff.set_defaults(func=implementation_handoff_audit)
+
+    bottleneck = sub.add_parser("drafter-bottleneck-review")
+    bottleneck.add_argument("--recent-rows", type=int, default=240)
+    bottleneck.set_defaults(func=drafter_bottleneck_review)
+
+    adapter_contract = sub.add_parser("drafter-adapter-method-contract")
+    adapter_contract.add_argument("--recent-rows", type=int, default=240)
+    adapter_contract.set_defaults(func=drafter_adapter_method_contract)
 
     snapshot = sub.add_parser("environment-snapshot")
     snapshot.add_argument("--label", default="manual")

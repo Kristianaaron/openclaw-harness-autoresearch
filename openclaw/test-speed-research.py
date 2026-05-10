@@ -884,6 +884,34 @@ def main() -> int:
                         assert adapter_bridge[0]["id"].startswith("trace-distillation-adapter-bridge-")
                         assert adapter_bridge[0]["supervisor_action"] == "focused-test"
                         assert not helper.task_contract_issues(repair_done_root, adapter_bridge[0])["blockers"]
+                        helper.upsert_tasks(repair_done_root, adapter_bridge)
+                        bridge_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                        for task in bridge_tasks:
+                            if task["id"] == adapter_bridge[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(repair_done_root / "tasks.jsonl", bridge_tasks)
+                        adapter_contract = helper.lane_contract_fallback_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123463,
+                            reason="unit adapter bridge already passed",
+                        )
+                        assert len(adapter_contract) == 1
+                        assert adapter_contract[0]["id"].startswith("drafter-adapter-method-contract-")
+                        assert adapter_contract[0]["supervisor_action"] == "drafter-adapter-method-contract"
+                        assert adapter_contract[0]["lane"] == "implementation-gate"
+                        assert not helper.task_contract_issues(repair_done_root, adapter_contract[0])["blockers"]
+                        helper.upsert_tasks(repair_done_root, adapter_contract)
+                        with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(repair_done_root)}, clear=False):
+                            assert helper.drafter_bottleneck_review(Namespace(recent_rows=240)) == 0
+                            assert helper.drafter_adapter_method_contract(Namespace(recent_rows=240)) == 0
+                        contract_paths = list((repair_done_root / "experiments").glob("drafter-adapter-method-contract-*.json"))
+                        assert contract_paths
+                        contract = json.loads(contract_paths[-1].read_text(encoding="utf-8"))
+                        assert contract["kind"] == "drafter-adapter-method-contract"
+                        assert "openclaw/openclaw-mtp-drafter-calibrate.py" in contract["allowed_source_files"]
+                        implementation_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                        assert any(str(task.get("id", "")).startswith("implementation-drafter-adapter-method-") for task in implementation_tasks)
                         old_bridge_row = [
                             {
                                 "timestamp": "2026-05-10T00:00:00+0000",

@@ -112,6 +112,20 @@ def check_prompt_and_routing_guards(helper) -> None:
             "next_action": "/Users/kristian/.openclaw/bin/openclaw-drafter-fit plan",
         }
     )
+    assert helper.is_supervisor_drafter_bottleneck_review_task(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-bottleneck-review",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-bottleneck-review",
+        }
+    )
+    assert helper.is_supervisor_drafter_adapter_contract_task(
+        {
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-adapter-method-contract",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-adapter-method-contract",
+        }
+    )
     assert helper.is_supervisor_drafter_trace_gate_task(
         {
             "task_type": "supervisor",
@@ -142,6 +156,12 @@ def check_prompt_and_routing_guards(helper) -> None:
     )
     assert helper.task_runs_without_model(
         {"task_type": "supervisor", "supervisor_action": "drafter-trace-gate"}
+    )
+    assert helper.task_runs_without_model(
+        {"task_type": "supervisor", "supervisor_action": "drafter-bottleneck-review"}
+    )
+    assert helper.task_runs_without_model(
+        {"task_type": "supervisor", "supervisor_action": "drafter-adapter-method-contract"}
     )
     assert helper.task_runs_without_model({"benchmark_mode": "decode-sample"})
     assert not helper.task_runs_without_model(
