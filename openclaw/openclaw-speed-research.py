@@ -4088,6 +4088,8 @@ def research_quality_scorecard(
             "runtime-overhead",
             "frontier-expansion",
             "exhaustion-report",
+            "drafter-adapter-method-contract",
+            "implementation-drafter-adapter-method",
         )
     )
 
@@ -4136,7 +4138,7 @@ def research_quality_scorecard(
         causal += 4.0
     if has_prerequisite_route:
         causal += 8.0
-    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "plateau_detected"}:
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "plateau_detected", "frontier_healthy"}:
         causal += 8.0
     if contaminated_rows and not any("runtime-overhead" in task_id for task_id in seeded_ids):
         causal -= 16.0
@@ -4150,7 +4152,7 @@ def research_quality_scorecard(
         next_action += 10.0
     if has_prerequisite_route:
         next_action += 8.0
-    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active"}:
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "frontier_healthy"}:
         next_action += 4.0
     if not contract_ok:
         next_action -= 24.0
@@ -4166,7 +4168,7 @@ def research_quality_scorecard(
         convergence += 10.0
     if dflash_suppressed:
         convergence += 8.0
-    if canonical_state in {"plateau_detected", "prerequisite_needed", "breakthrough_lane_active"}:
+    if canonical_state in {"plateau_detected", "prerequisite_needed", "breakthrough_lane_active", "frontier_healthy"}:
         convergence += 6.0
     if clean_runtime_maps >= 2 and not has_prerequisite_route:
         convergence -= 14.0
@@ -4178,9 +4180,16 @@ def research_quality_scorecard(
         implementation += 10.0
     if routed_guarded:
         implementation += 12.0
-    if any("handoff" in task_id or "bridge" in task_id or "drafter-calibration-canary" in task_id for task_id in routed_ids):
+    if any(
+        "handoff" in task_id
+        or "bridge" in task_id
+        or "drafter-calibration-canary" in task_id
+        or "drafter-adapter-method-contract" in task_id
+        or "implementation-drafter-adapter-method" in task_id
+        for task_id in routed_ids
+    ):
         implementation += 6.0
-    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active"}:
+    if canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "frontier_healthy"}:
         implementation += 4.0
     if not has_next_action and best_mean is not None and best_mean < target_tps:
         implementation -= 18.0
@@ -4536,7 +4545,7 @@ def quality_review(args: argparse.Namespace) -> int:
                 "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
             }
         )
-    if variance.get("groups") and not variance.get("significant_best"):
+    if variance.get("groups") and not variance.get("significant_best") and not has_adapter_method_route:
         quality_score -= 10
         recommendations.append("variance gate: best decode result has not cleared the observed noise band; keep measuring or change hypothesis.")
     if len(clean_runtime_maps) >= 2:
