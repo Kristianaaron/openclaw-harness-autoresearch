@@ -602,6 +602,84 @@ def main() -> int:
                             helper.recent_calibration_run_hard_blocker(gradient_blocked_root)
                             == "calibration-quantized-gradient-unsupported"
                         )
+                        assert (
+                            helper.calibration_quantized_gradient_issue("calibration-quantized-gradient-unsupported")
+                            == "calibration-quantized-gradient-unsupported"
+                        )
+                        literal_blocked_root = Path(tmp) / "literal-calibration-gradient-block-root"
+                        helper.ensure_research_state(literal_blocked_root)
+                        helper.append_result(
+                            literal_blocked_root,
+                            run_id="drafter-calibration-memory-stage-micro-step-literal",
+                            status="blocked",
+                            target="janq-drafter-calibration-memory-stage",
+                            hypothesis="unit literal gradient blocker",
+                            commit="abc123",
+                            notes=(
+                                "stage=micro-step decision=terminal-blocker "
+                                "failures=probe_exit:2,calibration-quantized-gradient-unsupported "
+                                "blocker=calibration-quantized-gradient-unsupported"
+                            ),
+                        )
+                        assert (
+                            helper.recent_calibration_run_hard_blocker(literal_blocked_root)
+                            == "calibration-quantized-gradient-unsupported"
+                        )
+                        assert helper.filter_seedable_tasks(
+                            literal_blocked_root,
+                            [
+                                helper.drafter_calibration_canary_task(
+                                    123457,
+                                    task_id="lane-contract-drafter-calibration-canary-literal-blocked",
+                                )
+                            ],
+                        ) == []
+                        assert helper.recent_terminal_calibration_block_rows(literal_blocked_root)
+                        helper.append_result(
+                            literal_blocked_root,
+                            run_id="supervisor-drafter-calibration-memory-stage-wrapper",
+                            status="blocked",
+                            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                            hypothesis="unit wrapper row",
+                            commit="abc123",
+                            notes=(
+                                'stage=micro-step reason=terminal-blocker blocker= '
+                                'output_tail=projection.scales\\n", "returncode": 2'
+                            ),
+                        )
+                        wrapper_row = helper.result_rows(literal_blocked_root)[-1]
+                        assert helper.is_known_terminal_calibration_blocked_row(wrapper_row)
+                        assert (
+                            helper.recent_calibration_run_hard_blocker(literal_blocked_root)
+                            == "calibration-quantized-gradient-unsupported"
+                        )
+                        helper.append_result(
+                            literal_blocked_root,
+                            run_id="drafter-calibration-memory-stage-micro-step-literal-repeat",
+                            status="blocked",
+                            target="janq-drafter-calibration-memory-stage",
+                            hypothesis="unit literal gradient blocker repeat",
+                            commit="abc123",
+                            notes=(
+                                "stage=micro-step decision=terminal-blocker "
+                                "failures=probe_exit:2,calibration-quantized-gradient-unsupported "
+                                "blocker=calibration-quantized-gradient-unsupported"
+                            ),
+                        )
+                        with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(literal_blocked_root)}, clear=False):
+                            assert helper.quality_review(
+                                Namespace(recent_rows=80, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+                            ) == 0
+                        literal_review = json.loads(
+                            max(
+                                (literal_blocked_root / "benchmarks").glob("quality-review-*.json"),
+                                key=lambda path: path.stat().st_mtime_ns,
+                            ).read_text(encoding="utf-8")
+                        )
+                        assert literal_review["verdict"] == "needs-repair"
+                        assert literal_review["quality_score"] <= 74
+                        literal_tasks = (literal_blocked_root / "tasks.jsonl").read_text(encoding="utf-8")
+                        assert "lane-contract-drafter-calibration-canary" not in literal_tasks
                         helper.append_result(
                             gradient_blocked_root,
                             run_id="supervisor-drafter-calibration-memory-stage-truncated-unit",

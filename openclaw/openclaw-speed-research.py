@@ -1390,6 +1390,8 @@ def is_certification_blocked_row(row: dict[str, str]) -> bool:
 
 def calibration_quantized_gradient_issue(text: object) -> str:
     lower = str(text).lower()
+    if CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in lower:
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
     if "calibration quantized drafter gradient blocked" in lower:
         return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
     if "differentiating quantized drafter weights" in lower:
@@ -1414,6 +1416,12 @@ def is_known_terminal_calibration_blocked_row(row: dict[str, str]) -> bool:
     return (
         CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in notes
         or calibration_quantized_gradient_issue(notes) == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+        or (
+            run_id.startswith("supervisor-drafter-calibration-memory-stage-")
+            and "reason=terminal-blocker" in notes
+            and "projection.scales" in notes
+            and '"returncode": 2' in notes
+        )
         or (
             row.get("run_id", "").startswith("drafter-calibration-memory-stage-micro-step-")
             and "decision=blocked" in notes
@@ -2619,11 +2627,42 @@ def recent_calibration_run_hard_blocker(root: Path, *, recent_rows: int = 160) -
         gradient_issue = calibration_quantized_gradient_issue(notes)
         if gradient_issue:
             return gradient_issue
+        if (
+            run_id.startswith("supervisor-drafter-calibration-memory-stage-")
+            and "reason=terminal-blocker" in notes
+            and "projection.scales" in notes
+            and '"returncode": 2' in notes
+        ):
+            return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
         if "calibration memory gate blocked: after-load" in notes:
             return "calibration-memory-after-load"
         if "missing-runtime-module:mlx_vlm.speculative" in notes or "no module named 'mlx_vlm.speculative'" in notes:
             return "calibration-runtime-missing-speculative"
     return ""
+
+
+def recent_terminal_calibration_block_rows(
+    root: Path,
+    *,
+    blocker: str = CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
+    recent_rows: int = 160,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for row in result_rows(root)[-max(1, recent_rows) :]:
+        if row.get("status") != "blocked":
+            continue
+        run_id = row.get("run_id", "")
+        target = row.get("target", "")
+        if "calibration" not in run_id and "calibration" not in target:
+            continue
+        notes = row.get("notes", "")
+        if blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER and is_known_terminal_calibration_blocked_row(row):
+            rows.append(row)
+            continue
+        if blocker and blocker not in notes and calibration_quantized_gradient_issue(notes) != blocker:
+            continue
+        rows.append(row)
+    return rows
 
 
 def recent_drafter_fit_plan_ready(root: Path, *, recent_rows: int = 160) -> bool:
@@ -3946,11 +3985,28 @@ def quality_review(args: argparse.Namespace) -> int:
         recent_rows=max(160, int(args.recent_rows)),
     )
     trace_distillation_failed = bool(trace_distillation_blocks)
+    terminal_calibration_blocks = recent_terminal_calibration_block_rows(
+        root,
+        blocker=CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
+        recent_rows=max(160, int(args.recent_rows)),
+    )
     has_trace_distillation_repair_route = any(
         task_id.startswith("trace-distillation-gradient-repair-")
         for task_id in active_task_ids
     )
     trace_distillation_repair_done = trace_distillation_repair_attempted(root, recent_rows=max(160, int(args.recent_rows)))
+    has_changed_calibration_route = any(
+        task_id.startswith(
+            (
+                "drafter-trace-distillation-run-",
+                "trace-distillation-gradient-repair-",
+                "trace-distillation-adapter-bridge-",
+                "frontier-expansion-janq-adapter-path-",
+                "calibration-memory-report-",
+            )
+        )
+        for task_id in active_task_ids
+    )
     repeated_canary_ready_no_stage = [
         row
         for row in recent[-60:]
@@ -4012,6 +4068,21 @@ def quality_review(args: argparse.Namespace) -> int:
                     now,
                     task_id=f"trace-distillation-gradient-repair-{now}",
                     priority=99,
+                )
+            )
+    repeated_terminal_calibration = len(terminal_calibration_blocks) >= 2
+    if repeated_terminal_calibration and not has_changed_calibration_route:
+        quality_score -= 28
+        recommendations.append(
+            "direct drafter calibration repeatedly hit the quantized-gradient terminal blocker; suppress canary reseeding and route to a changed adapter/logit-distillation path."
+        )
+        if should_seed_action(root, "terminal-calibration-route-", recent_rows=240):
+            seeded_tasks.extend(
+                lane_contract_fallback_tasks(
+                    root,
+                    rows,
+                    int(time.time()),
+                    reason="Quality review detected repeated terminal quantized-gradient calibration blockers",
                 )
             )
     repeated_deliberate_dflash = [
@@ -4216,7 +4287,7 @@ def quality_review(args: argparse.Namespace) -> int:
     coverage_gap = bool(missing_required_blocks and not has_calibration_route and not durable_sweep_coverage)
     if exhaustion_candidate:
         verdict = "exhaustion-candidate"
-    elif coverage_gap or blocked:
+    elif coverage_gap or blocked or (repeated_terminal_calibration and not has_changed_calibration_route):
         verdict = "needs-repair"
     elif plateau_below_target:
         verdict = "converged-below-target"
