@@ -1640,11 +1640,27 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             and ("draft_model_type_mismatch" in notes or "decision=blocked" in notes)
             and bool("frontier-dflash" in exhausted or repair_ready or breakthrough_lanes)
         )
+        implementation_model_guard_routed = (
+            run_id.startswith("supervisor-implementation-guard-")
+            and target.startswith("openclaw/")
+            and any(
+                marker in notes
+                for marker in (
+                    "malformed hidden/tool output",
+                    "tool result synthesis grace",
+                    "tool result cap",
+                    "implementation task requires deterministic patch-executor path",
+                    "turn timeout",
+                )
+            )
+            and any_task_has_prefix(root, "implementation-drafter-adapter-method-")
+        )
         if not is_memory_block and (
             deterministic_routed
             or dflash_exhausted
             or causal_routed
             or dflash_compatibility_routed
+            or implementation_model_guard_routed
             or external_blocker_routed
         ):
             routed_blockers.append(row)
@@ -2890,7 +2906,7 @@ def drafter_bottleneck_next_tasks(
             ],
         )
     if step == "seed_adapter_method_implementation":
-        if active_task_has_prefix(root, "implementation-drafter-adapter-method-"):
+        if any_task_has_prefix(root, "implementation-drafter-adapter-method-"):
             return []
         return filter_seedable_tasks(
             root,

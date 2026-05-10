@@ -177,6 +177,16 @@ def check_prompt_and_routing_guards(helper) -> None:
     ) == ""
     with patch.object(helper, "model_ready", return_value=True):
         assert helper.model_bound_defer_reason(
+            Namespace(allow_model_bound_research_turns=False, allow_implementation_model_turns=False),
+            {
+                "id": "implementation-drafter-adapter-method-current",
+                "task_type": "implementation",
+                "lane": "implementation-gate",
+                "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            },
+        ) == "implementation task requires deterministic patch-executor path"
+    with patch.object(helper, "model_ready", return_value=True):
+        assert helper.model_bound_defer_reason(
             Namespace(allow_model_bound_research_turns=False, allow_implementation_model_turns=True),
             {
                 "id": "implementation-drafter-adapter-method-current",
@@ -921,6 +931,31 @@ def main() -> int:
         )
         assert helper.block_stale_rejected_implementation_tasks() == 1
         assert '"status": "blocked"' in helper.TASKS.read_text(encoding="utf-8")
+        model_bound_impl = {
+            "id": "model-bound-impl",
+            "status": "ready",
+            "task_type": "implementation",
+            "target": "openclaw/example.py",
+            "next_action": "inspect and patch the implementation",
+        }
+        helper.write_jsonl(helper.TASKS, [model_bound_impl])
+        assert (
+            helper.block_model_bound_implementation_tasks(
+                Namespace(allow_implementation_model_turns=False)
+            )
+            == 1
+        )
+        blocked_model_bound_text = helper.TASKS.read_text(encoding="utf-8")
+        assert '"status": "blocked"' in blocked_model_bound_text
+        assert "deterministic patch-executor path" in blocked_model_bound_text
+        helper.write_jsonl(helper.TASKS, [model_bound_impl])
+        assert (
+            helper.block_model_bound_implementation_tasks(
+                Namespace(allow_implementation_model_turns=True)
+            )
+            == 0
+        )
+        assert '"status": "ready"' in helper.TASKS.read_text(encoding="utf-8")
         helper.write_jsonl(
             helper.TASKS,
             [

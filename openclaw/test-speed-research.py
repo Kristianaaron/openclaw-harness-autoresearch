@@ -1585,11 +1585,31 @@ def main() -> int:
                 commit="unit-test",
                 notes='evidence={"exhausted_lanes":["drafter-calibration-memory"],"ready_tasks":["deliberate-drafter-trace-gate-test"]}',
             )
+            queued = helper.read_jsonl(root / "tasks.jsonl")
+            queued.append(
+                {
+                    "id": "implementation-drafter-adapter-method-current",
+                    "status": "blocked",
+                    "lane": "implementation-gate",
+                    "task_type": "implementation",
+                    "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+                }
+            )
+            helper.write_jsonl(root / "tasks.jsonl", queued)
+            helper.append_result(
+                root,
+                run_id="supervisor-implementation-guard-unit",
+                status="blocked",
+                target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                hypothesis="implementation model turns should be routed to deterministic patch executor paths",
+                commit="unit-test",
+                notes="malformed hidden/tool output",
+            )
             canonical_with_external = helper.canonical_autoresearch_state(root, recent_rows=120)
             assert canonical_with_external["noise"]["unresolved_blocked_rows"] == 0
             assert canonical_with_external["noise"]["memory_blocks"] == 0
             assert "routed_blocked_rows" not in canonical_with_external["noise"]
-            assert canonical_with_external["resolved_debt"]["routed_blocked_rows"] >= 1
+            assert canonical_with_external["resolved_debt"]["routed_blocked_rows"] >= 2
             assert canonical_with_external["state"] == "breakthrough_lane_active"
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
@@ -1660,8 +1680,11 @@ def main() -> int:
             )
             assert handoff_after_empty["seeded_bridge"] is False
             assert handoff_after_empty["seeded_prerequisite"] is True
-            assert "handoff-audit-drafter-calibration-canary-" in "\n".join(
-                handoff_after_empty["ready_deterministic_tasks"]
+            handoff_ready = "\n".join(handoff_after_empty["ready_deterministic_tasks"])
+            assert (
+                "handoff-audit-drafter-calibration-canary-" in handoff_ready
+                or "frontier-expansion-dflash-candidate-search-" in handoff_ready
+                or "frontier-expansion-janq-adapter-path-" in handoff_ready
             )
             handoff_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in handoff_tasks:

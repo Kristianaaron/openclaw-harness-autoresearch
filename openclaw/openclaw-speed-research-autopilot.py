@@ -1209,7 +1209,13 @@ def model_bound_defer_reason(args: argparse.Namespace, task: dict[str, object] |
     if (
         task
         and task.get("task_type") == "implementation"
-        and getattr(args, "allow_implementation_model_turns", True)
+        and not getattr(args, "allow_implementation_model_turns", False)
+    ):
+        return "implementation task requires deterministic patch-executor path"
+    if (
+        task
+        and task.get("task_type") == "implementation"
+        and getattr(args, "allow_implementation_model_turns", False)
     ):
         if not model_ready():
             return "model endpoint offline after memory recovery"
@@ -1295,6 +1301,44 @@ def block_stale_rejected_implementation_tasks() -> int:
             if block_task_after_repeated_guard(task, "OpenClaw blocked a broad local tool command", threshold=3):
                 blocked += 1
     return blocked
+
+
+def block_model_bound_implementation_tasks(args: argparse.Namespace) -> int:
+    if getattr(args, "allow_implementation_model_turns", False):
+        return 0
+    tasks = read_jsonl(TASKS)
+    blocked_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    blocked_ids: list[str] = []
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task.get("task_type") != "implementation":
+            continue
+        if task_runs_without_model(task):
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = blocked_at
+        task["blocked_reason"] = "implementation task requires deterministic patch-executor path"
+        task["next"] = (
+            "convert implementation into a supervisor patch-executor task with canary, "
+            "acceptance, and rollback gates before it can run"
+        )
+        blocked_ids.append(str(task.get("id", "unknown")))
+    if not blocked_ids:
+        return 0
+    write_jsonl(TASKS, tasks)
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": blocked_at,
+            "task_id": "implementation-model-turn-guard",
+            "finding": "supervisor quarantined model-bound implementation tasks before selection",
+            "blocked_tasks": blocked_ids,
+            "reason": "implementation tasks must use deterministic patch-executor gates by default",
+            "next": "run quality review or synthesis to seed a safe deterministic bridge",
+        },
+    )
+    return len(blocked_ids)
 
 
 def recent_hard_dflash_blocker(limit: int = 120) -> str:
@@ -3938,6 +3982,7 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
 
 
 def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path) -> tuple[bool, str]:
+    model_bound_impl_blocked = block_model_bound_implementation_tasks(args)
     stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
     exhausted_lane_blocked = block_ready_exhausted_lane_tasks()
     stale_causal_blocked = block_stale_model_bound_causal_tasks()
@@ -3956,12 +4001,14 @@ def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path)
                 f"frontier={status['frontier_score']} handoff={status['handoff_score']} "
                 f"quality={status['quality_score']} deterministic={len(status['deterministic_ready_tasks'])} "
                 f"stale_lane_blocked={stale_lane_blocked} exhausted_lane_blocked={exhausted_lane_blocked} "
-                f"stale_causal_blocked={stale_causal_blocked} empty_bridge_blocked={empty_bridge_blocked}"
+                f"stale_causal_blocked={stale_causal_blocked} empty_bridge_blocked={empty_bridge_blocked} "
+                f"model_bound_impl_blocked={model_bound_impl_blocked}"
             ),
         )
         return True, ""
     repair_issue = "; ".join(str(issue) for issue in status["issues"])
     run_supervisor_synthesis(args, 0, "startup-certification-repair", log_file)
+    block_model_bound_implementation_tasks(args)
     block_stale_hard_blocked_lane_tasks()
     block_ready_exhausted_lane_tasks()
     block_stale_model_bound_causal_tasks()
@@ -4293,8 +4340,8 @@ def main() -> int:
     parser.add_argument(
         "--allow-implementation-model-turns",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_IMPLEMENTATION_TURNS", "1") != "0",
-        help="allow scoped implementation-gate tasks to use the local model while keeping generic research turns deferred",
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_IMPLEMENTATION_TURNS", "0") == "1",
+        help="allow scoped implementation-gate tasks to use the local model; disabled by default so implementation flows through deterministic patch-executor gates",
     )
     parser.add_argument(
         "--certify-startup",
@@ -4422,6 +4469,9 @@ def main() -> int:
         stale_blocked = block_stale_rejected_implementation_tasks()
         if stale_blocked:
             log(f"supervisor blocked stale rejected implementation tasks count={stale_blocked}")
+        model_bound_impl_blocked = block_model_bound_implementation_tasks(args)
+        if model_bound_impl_blocked:
+            log(f"supervisor quarantined model-bound implementation tasks count={model_bound_impl_blocked}")
         stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
         if stale_lane_blocked:
             log(f"supervisor quarantined stale hard-blocked lane tasks count={stale_lane_blocked}")
