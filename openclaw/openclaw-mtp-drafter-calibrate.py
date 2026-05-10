@@ -297,6 +297,16 @@ def detach_target_trace(trace: dict[str, Any]) -> dict[str, Any]:
     return {key: tree_map(freeze, value) for key, value in trace.items()}
 
 
+def quantized_trainable_parameter_names(trainable: dict[str, Any]) -> list[str]:
+    """Return trainable parameter names that MLX cannot safely differentiate."""
+    quantized_suffixes = (".scales", ".biases")
+    return sorted(
+        name
+        for name in trainable
+        if name.endswith(quantized_suffixes) or ".quantized" in name.lower()
+    )
+
+
 def build_traces(model: Any, processor: Any, prompts: list[str], positions_per_prompt: int) -> list[dict[str, Any]]:
     traces: list[dict[str, Any]] = []
     for prompt in prompts:
@@ -339,6 +349,14 @@ def train(args: argparse.Namespace) -> int:
     drafter.pre_projection.unfreeze()
     trainable = dict(tree_flatten(drafter.trainable_parameters()))
     log("trainable parameters: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in trainable.items()))
+    quantized_trainables = quantized_trainable_parameter_names(trainable)
+    if quantized_trainables and not args.allow_quantized_drafter_training:
+        raise RuntimeError(
+            "calibration quantized drafter gradient blocked: pre_projection exposes quantized "
+            "trainable parameters; use a trainable adapter or saved-logit distillation head "
+            "instead of differentiating quantized drafter weights. "
+            f"trainable_quantized_parameters={','.join(quantized_trainables)}"
+        )
 
     prompts = list(DEFAULT_PROMPTS)
     if args.prompts_file:
@@ -540,6 +558,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
     parser.add_argument("--target-trace-policy", choices=["stop-gradient"], default="stop-gradient")
+    parser.add_argument(
+        "--allow-quantized-drafter-training",
+        action="store_true",
+        help="Unsafe escape hatch for experiments; default blocks known MLX QuantizedMatmul gradient failures.",
+    )
     parser.add_argument(
         "--probe-stage",
         choices=["metadata", "drafter-load", "target-load", "combined-load", "micro-step"],

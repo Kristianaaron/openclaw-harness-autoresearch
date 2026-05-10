@@ -59,6 +59,13 @@ def main() -> int:
     grad = helper.mx.grad(lambda value: helper.mx.sum(helper.detach_target_trace({"x": value})["x"]))(x)
     helper.mx.eval(grad)
     assert float(grad.item()) == 0.0
+    assert helper.quantized_trainable_parameter_names(
+        {
+            "pre_projection.weight": object(),
+            "pre_projection.scales": object(),
+            "pre_projection.biases": object(),
+        }
+    ) == ["pre_projection.biases", "pre_projection.scales"]
     assert helper.parse_args(
         [
             "--target-path",

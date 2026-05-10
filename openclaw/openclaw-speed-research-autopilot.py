@@ -3404,6 +3404,7 @@ def run_supervisor_focused_test_task(
     allowed = {
         "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
         "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-drafter-fit.py",
+        "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-mtp-drafter-calibrate-guards.py",
         "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research-autopilot.py",
     }
     if action not in allowed:

@@ -98,6 +98,7 @@ def main() -> int:
             assert "policy-optimization" in profile["scope"]["allowed_lanes"]
             assert "frontier-expansion" in profile["scope"]["allowed_lanes"]
             assert "frontier_candidate_gate" in profile["metrics"]["secondary"]
+            assert "trace_distillation_repair_gate" in profile["metrics"]["secondary"]
             assert "autoresearch_quality_delta" in profile["metrics"]["secondary"]
             policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
             assert "benchmark-manifest.json" in policy["immutable_paths"]
@@ -690,17 +691,67 @@ def main() -> int:
                         consumed_distillation_tasks = helper.read_jsonl(gradient_blocked_root / "tasks.jsonl")
                         for task in consumed_distillation_tasks:
                             if task["id"] == gradient_fallback[0]["id"]:
-                                task["status"] = "done"
+                                task["status"] = "blocked"
+                                task["supervisor_summary"] = {
+                                    "reason": (
+                                        "calibration-quantized-gradient-unsupported "
+                                        "calibration_mode=trace-distillation trace_distillation=True "
+                                        "[QuantizedMatmul::vjp] no gradient wrt the quantized weights."
+                                    )
+                                }
                         helper.write_jsonl(gradient_blocked_root / "tasks.jsonl", consumed_distillation_tasks)
-                        gradient_report_fallback = helper.lane_contract_fallback_tasks(
+                        helper.append_result(
+                            gradient_blocked_root,
+                            run_id="supervisor-drafter-calibration-run-trace-distillation-unit",
+                            status="blocked",
+                            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                            hypothesis="unit trace-distillation blocker",
+                            commit="abc123",
+                            notes=(
+                                "calibration-quantized-gradient-unsupported "
+                                "calibration_mode=trace-distillation trace_distillation=True "
+                                "target_gradient_policy=stop-gradient "
+                                "[QuantizedMatmul::vjp] no gradient wrt the quantized weights."
+                            ),
+                        )
+                        assert helper.trace_distillation_proof_failed(gradient_blocked_root)
+                        assert helper.filter_seedable_tasks(
+                            gradient_blocked_root,
+                            [
+                                helper.drafter_trace_distillation_run_task(
+                                    123458,
+                                    task_id="drafter-trace-distillation-run-repeat",
+                                    bounded_command=["python3", "calibrate.py"],
+                                )
+                            ],
+                        ) == []
+                        gradient_repair_fallback = helper.lane_contract_fallback_tasks(
                             gradient_blocked_root,
                             helper.result_rows(gradient_blocked_root),
                             123458,
                             reason="unit gradient blocker",
                         )
-                        assert len(gradient_report_fallback) == 1
-                        assert gradient_report_fallback[0]["supervisor_action"] == "calibration-memory-report"
-                        helper.upsert_tasks(gradient_blocked_root, gradient_report_fallback)
+                        assert len(gradient_repair_fallback) == 1
+                        assert gradient_repair_fallback[0]["id"].startswith("trace-distillation-gradient-repair-")
+                        assert gradient_repair_fallback[0]["supervisor_action"] == "focused-test"
+                        assert "test-mtp-drafter-calibrate-guards.py" in gradient_repair_fallback[0]["next_action"]
+                        assert not helper.task_contract_issues(gradient_blocked_root, gradient_repair_fallback[0])["blockers"]
+                        helper.upsert_tasks(gradient_blocked_root, gradient_repair_fallback)
+                        helper.append_result(
+                            gradient_blocked_root,
+                            run_id="supervisor-drafter-fit-plan-trace-distillation-unit",
+                            status="keep",
+                            target="/tmp/fit-plan.json",
+                            hypothesis="unit plan ready",
+                            commit="abc123",
+                            notes="decision=ready-for-target-generated-trace-data",
+                        )
+                        handoff_repair = helper.concrete_handoff_prerequisite_tasks(
+                            gradient_blocked_root,
+                            helper.result_rows(gradient_blocked_root),
+                            123459,
+                        )
+                        assert handoff_repair == []
                         quality_args = Namespace(
                             recent_rows=120,
                             min_sweeps=3,

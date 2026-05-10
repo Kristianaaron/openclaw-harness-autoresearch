@@ -1390,6 +1390,10 @@ def is_certification_blocked_row(row: dict[str, str]) -> bool:
 
 def calibration_quantized_gradient_issue(text: object) -> str:
     lower = str(text).lower()
+    if "calibration quantized drafter gradient blocked" in lower:
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+    if "differentiating quantized drafter weights" in lower:
+        return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
     if "no gradient wrt the quantized weights" in lower:
         return CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
     if "quantizedmatmul::vjp" in lower and "no gradient" in lower:
@@ -1886,6 +1890,7 @@ def compact_terminal_calibration_tasks(root: Path) -> int:
     blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     if blocker not in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return 0
+    distillation_failed = trace_distillation_proof_failed(root, recent_rows=240)
     tasks = read_jsonl(root / "tasks.jsonl")
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     compacted = 0
@@ -1901,13 +1906,14 @@ def compact_terminal_calibration_tasks(root: Path) -> int:
             or "drafter-calibration-run" in task_id
         ):
             continue
-        if task.get("trace_distillation") is True or task.get("calibration_mode") == CALIBRATION_TRACE_DISTILLATION_MODE:
+        if is_trace_distillation_task(task) and not distillation_failed:
             continue
         task["status"] = "done"
         task["completed_at"] = now
         task["supervisor_summary"] = {
             "reason": "terminal calibration blocker suppressed queued retry",
             "blocker": blocker,
+            "trace_distillation_proof_failed": distillation_failed,
         }
         compacted += 1
     if compacted:
@@ -2387,6 +2393,98 @@ def existing_drafter_trace_paths() -> list[Path]:
     return [path for path in drafter_trace_candidates() if path.exists() and path.stat().st_size > 0]
 
 
+def is_trace_distillation_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    return (
+        task.get("trace_distillation") is True
+        or task.get("calibration_mode") == CALIBRATION_TRACE_DISTILLATION_MODE
+        or "trace-distillation-run" in task_id
+    )
+
+
+def trace_distillation_gradient_block_rows(root: Path, *, recent_rows: int = 240) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for row in result_rows(root)[-max(1, recent_rows) :]:
+        text = " ".join(
+            str(row.get(key, ""))
+            for key in ("run_id", "target", "hypothesis", "notes")
+        )
+        lower = text.lower()
+        if "trace-distillation" not in lower and "trace_distillation=true" not in lower:
+            continue
+        if calibration_quantized_gradient_issue(text) != CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+            continue
+        rows.append(row)
+    return rows
+
+
+def trace_distillation_attempt_exists(root: Path, *, recent_rows: int = 240) -> bool:
+    tasks = read_jsonl(root / "tasks.jsonl")
+    if any(is_trace_distillation_task(task) for task in tasks):
+        return True
+    return any(
+        "trace-distillation" in " ".join(
+            str(row.get(key, ""))
+            for key in ("run_id", "target", "hypothesis", "notes")
+        ).lower()
+        for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
+def trace_distillation_proof_failed(root: Path, *, recent_rows: int = 240) -> bool:
+    if trace_distillation_gradient_block_rows(root, recent_rows=recent_rows):
+        return True
+    for task in read_jsonl(root / "tasks.jsonl"):
+        if not is_trace_distillation_task(task):
+            continue
+        if task.get("status") != "blocked":
+            continue
+        summary_text = json.dumps(task.get("supervisor_summary", {}), sort_keys=True)
+        if calibration_quantized_gradient_issue(summary_text) == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+            return True
+    return False
+
+
+def trace_distillation_repair_task(timestamp: int, *, task_id: str, priority: int = 99) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "frontier-expansion",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": [
+            "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "openclaw/openclaw-speed-research.py",
+            "openclaw/openclaw-speed-research-autopilot.py",
+            "openclaw/test-mtp-drafter-calibrate-guards.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": (
+            "Trace distillation proved that the current drafter fit path still differentiates quantized "
+            "drafter parameters. The next safe path is an adapter or saved-logit distillation head that "
+            "keeps JANQ target and quantized drafter weights frozen."
+        ),
+        "metric": "trace_distillation_repair_gate",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": (
+            "Canary tests prove repeated trace-distillation failures are suppressed and routed to an "
+            "adapter/logit-distillation repair path before any model-loading experiment can run again."
+        ),
+        "rollback": "No runtime rollback needed; this is a no-model canary gate before any future source patch.",
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-mtp-drafter-calibrate-guards.py",
+        "created_at": timestamp,
+    }
+
+
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
@@ -2817,8 +2915,25 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        if trace_distillation_proof_failed(root, recent_rows=240):
+            if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
+                return []
+            if should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+                return filter_seedable_tasks(
+                    root,
+                    [
+                        trace_distillation_repair_task(
+                            timestamp,
+                            task_id=f"trace-distillation-gradient-repair-{timestamp}",
+                        )
+                    ],
+                )
+            return filter_seedable_tasks(
+                root,
+                calibration_blocker_report_tasks(root, timestamp, blocker=calibration_blocker),
+            )
         if (
-            not any_task_has_prefix(root, "drafter-trace-distillation-run-")
+            not trace_distillation_attempt_exists(root, recent_rows=240)
             and should_seed_action(root, "drafter-trace-distillation-run-", recent_rows=240)
         ):
             distillation_task = trace_distillation_candidate_task(
@@ -3005,7 +3120,9 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
                 action == "drafter-calibration-memory-stage"
                 or "drafter-calibration-memory-stage" in task_id
             )
-            if task.get("trace_distillation") is True or task.get("calibration_mode") == CALIBRATION_TRACE_DISTILLATION_MODE:
+            if is_trace_distillation_task(task) and not trace_distillation_proof_failed(root, recent_rows=240):
+                calibration_blocked_action = False
+            if task_id.startswith("trace-distillation-gradient-repair-"):
                 calibration_blocked_action = False
         if calibration_blocker and calibration_blocked_action:
             continue
@@ -3061,13 +3178,27 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
             )
         elif calibration_blocker:
             if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
-                distillation_task = trace_distillation_candidate_task(
-                    root,
-                    timestamp,
-                    task_id=f"handoff-audit-drafter-trace-distillation-run-{timestamp}",
-                )
-                if distillation_task is not None:
-                    return filter_seedable_tasks(root, [distillation_task])
+                if trace_distillation_proof_failed(root, recent_rows=240):
+                    if active_task_has_prefix(root, "trace-distillation-gradient-repair-"):
+                        return []
+                    if should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+                        return filter_seedable_tasks(
+                            root,
+                            [
+                                trace_distillation_repair_task(
+                                    timestamp,
+                                    task_id=f"trace-distillation-gradient-repair-{timestamp}",
+                                )
+                            ],
+                        )
+                elif not trace_distillation_attempt_exists(root, recent_rows=240):
+                    distillation_task = trace_distillation_candidate_task(
+                        root,
+                        timestamp,
+                        task_id=f"handoff-audit-drafter-trace-distillation-run-{timestamp}",
+                    )
+                    if distillation_task is not None:
+                        return filter_seedable_tasks(root, [distillation_task])
             plateau = recent_calibration_fallback_plateau(root, rows, recent_rows=100)
             if plateau:
                 return filter_seedable_tasks(
@@ -3710,6 +3841,15 @@ def quality_review(args: argparse.Namespace) -> int:
         and any("drafter-calibration-canary" in task_id for task_id in active_task_ids)
     )
     has_calibration_route = has_calibration_canary_route or has_calibration_stage_route or has_terminal_calibration_route
+    trace_distillation_blocks = trace_distillation_gradient_block_rows(
+        root,
+        recent_rows=max(160, int(args.recent_rows)),
+    )
+    trace_distillation_failed = bool(trace_distillation_blocks)
+    has_trace_distillation_repair_route = any(
+        task_id.startswith("trace-distillation-gradient-repair-")
+        for task_id in active_task_ids
+    )
     repeated_canary_ready_no_stage = [
         row
         for row in recent[-60:]
@@ -3759,6 +3899,20 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     if dflash_suppressed:
         recommendations.append("DFlash/JANQ compatibility was hard-blocked and the lane was retired until the draft candidate changes.")
+    if trace_distillation_failed and not has_trace_distillation_repair_route:
+        quality_score -= 18
+        recommendations.append(
+            "trace-distillation proof hit the quantized-gradient blocker; suppress retries and route to adapter/logit-distillation repair."
+        )
+        if should_seed_action(root, "trace-distillation-gradient-repair-", recent_rows=240):
+            now = int(time.time())
+            seeded_tasks.append(
+                trace_distillation_repair_task(
+                    now,
+                    task_id=f"trace-distillation-gradient-repair-{now}",
+                    priority=99,
+                )
+            )
     repeated_deliberate_dflash = [
         row
         for row in recent[-40:]
@@ -4043,6 +4197,8 @@ def quality_review(args: argparse.Namespace) -> int:
         "measurement_artifact": artifact_check,
         "task_contract": contract,
         "duplicate_stage_tasks": duplicate_stage_tasks,
+        "trace_distillation_gradient_blocks": len(trace_distillation_blocks),
+        "trace_distillation_repair_route": has_trace_distillation_repair_route,
         "compacted_stage_tasks": compacted_stage_tasks,
         "compacted_canary_tasks": compacted_canary_tasks,
         "compacted_terminal_tasks": compacted_terminal_tasks,
