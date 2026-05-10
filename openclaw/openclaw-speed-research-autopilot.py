@@ -1206,6 +1206,14 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
 def model_bound_defer_reason(args: argparse.Namespace, task: dict[str, object] | None) -> str:
     if task_runs_without_model(task):
         return ""
+    if (
+        task
+        and task.get("task_type") == "implementation"
+        and getattr(args, "allow_implementation_model_turns", True)
+    ):
+        if not model_ready():
+            return "model endpoint offline after memory recovery"
+        return ""
     if not getattr(args, "allow_model_bound_research_turns", False):
         return "model-bound research turn deferred for local 31B stability"
     if not model_ready():
@@ -4281,6 +4289,12 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_MODEL_BOUND_TURNS", "0") == "1",
         help="allow non-supervisor autoresearch turns to call the local model; disabled by default for 31B stability",
+    )
+    parser.add_argument(
+        "--allow-implementation-model-turns",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_IMPLEMENTATION_TURNS", "1") != "0",
+        help="allow scoped implementation-gate tasks to use the local model while keeping generic research turns deferred",
     )
     parser.add_argument(
         "--certify-startup",

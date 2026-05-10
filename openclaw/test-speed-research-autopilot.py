@@ -175,6 +175,26 @@ def check_prompt_and_routing_guards(helper) -> None:
         Namespace(allow_model_bound_research_turns=False),
         {"task_type": "supervisor", "supervisor_action": "runtime-overhead-map"},
     ) == ""
+    with patch.object(helper, "model_ready", return_value=True):
+        assert helper.model_bound_defer_reason(
+            Namespace(allow_model_bound_research_turns=False, allow_implementation_model_turns=True),
+            {
+                "id": "implementation-drafter-adapter-method-current",
+                "task_type": "implementation",
+                "lane": "implementation-gate",
+                "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            },
+        ) == ""
+    with patch.object(helper, "model_ready", return_value=False):
+        assert helper.model_bound_defer_reason(
+            Namespace(allow_model_bound_research_turns=False, allow_implementation_model_turns=True),
+            {
+                "id": "implementation-drafter-adapter-method-current",
+                "task_type": "implementation",
+                "lane": "implementation-gate",
+                "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            },
+        ) == "model endpoint offline after memory recovery"
     with patch.object(helper, "model_ready", return_value=False):
         assert helper.model_bound_defer_reason(
             Namespace(allow_model_bound_research_turns=True),

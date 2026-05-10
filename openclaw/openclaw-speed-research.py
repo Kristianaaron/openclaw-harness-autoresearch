@@ -1511,9 +1511,32 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             continue
         latest_progress_index = max(latest_progress_index, index)
 
+    latest_adapter_route_index = -1
+    for index, row in enumerate(rows):
+        if row.get("status") != "keep":
+            continue
+        run_id = row.get("run_id", "")
+        if run_id.startswith(("drafter-bottleneck-review-", "drafter-adapter-method-contract-")):
+            latest_adapter_route_index = index
+
     unresolved: list[dict[str, str]] = []
     for index, row in enumerate(rows):
         if row not in blocked:
+            continue
+        run_id = row.get("run_id", "")
+        target = row.get("target", "")
+        notes = row.get("notes", "")
+        if (
+            index < latest_adapter_route_index
+            and run_id.startswith("drafter-adapter-method-contract-")
+            and target == "janq-drafter-adapter-method"
+        ):
+            continue
+        if (
+            index < latest_progress_index
+            and target == "autopilot"
+            and "model-bound research turn deferred" in notes
+        ):
             continue
         if index < latest_clean_checkpoint_index and (
             row.get("target") == "autoresearch-implementation-handoff"
@@ -1587,6 +1610,8 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
                 "runtime-overhead",
                 "frontier-expansion",
                 "trace-distillation-adapter-bridge",
+                "drafter-adapter-method-contract",
+                "implementation-drafter-adapter-method",
                 "calibration-memory-report",
                 "exhaustion",
             )
@@ -3768,6 +3793,19 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     drafter_plan_ready = recent_drafter_fit_plan_ready(root, recent_rows=160)
     dflash_suppressed = suppress_hard_blocked_dflash_lane(root, recent_rows=160)
     dflash_blocked = dflash_suppressed or dflash_lane_is_blocked(root, recent_rows=160) or "frontier-dflash" in exhausted
+    bottleneck_state = drafter_bottleneck_state(root, rows, recent_rows=240)
+
+    if bottleneck_state["state"] != "no_terminal_quantized_blocker":
+        bottleneck_tasks = drafter_bottleneck_next_tasks(
+            root,
+            rows,
+            timestamp,
+            reason="Synthesis detected the canonical JANQ drafter bottleneck route",
+        )
+        if bottleneck_tasks:
+            return bottleneck_tasks
+        if str(bottleneck_state["next_step"]).startswith("wait_for_"):
+            return []
 
     if block_sweep_converged and below_practical_floor:
         mark_lane_exhausted(

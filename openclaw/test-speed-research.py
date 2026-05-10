@@ -975,6 +975,15 @@ def main() -> int:
                             "seed_adapter_method_implementation",
                             "wait_for_adapter_method_implementation",
                         }
+                        synthesized_route = helper.synthesis_deliberate_action_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123465,
+                        )
+                        assert all(
+                            not str(task.get("id", "")).startswith("deliberate-drafter-fit-plan-")
+                            for task in synthesized_route
+                        )
                         old_bridge_row = [
                             {
                                 "timestamp": "2026-05-10T00:00:00+0000",
