@@ -5056,6 +5056,11 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
     contract = task_contract_report(root)
     artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
+    burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
+    burn_in_gates = burn_in.get("gates") if isinstance(burn_in.get("gates"), dict) else {}
+    burn_in_ok = bool(burn_in.get("ok")) and bool(burn_in_gates) and all(
+        bool(value) for value in burn_in_gates.values()
+    )
     frontier_lanes = {
         str(task.get("lane", ""))
         for task in ready
@@ -5211,6 +5216,18 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if any(row.get("run_id", "").startswith("gepa-policy-promotion-") for row in recent):
         scores["self_improvement"] += 0.2
         strengths.append("GEPA reviewer policy path is active")
+    if burn_in_ok:
+        scores["karpathy_core_loop"] += 0.4
+        scores["crash_memory_safety"] += 0.4
+        scores["research_quality"] += 0.3
+        scores["implementation_handoff"] += 0.3
+        scores["self_improvement"] += 0.3
+        scores["modularity"] += 0.6
+        strengths.append("aggressive stability burn-in passed all deterministic gates")
+    elif burn_in:
+        scores["karpathy_core_loop"] -= 0.2
+        scores["crash_memory_safety"] -= 0.2
+        gaps.append("latest stability burn-in did not pass every deterministic gate")
     if decode_mean is not None and decode_mean < 20:
         gaps.append(f"decode still below practical floor: {decode_mean} tok/s")
         if not deterministic_ready:
@@ -5219,7 +5236,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             scores["self_improvement"] -= 0.3
             gaps.append("no deterministic ready task while decode remains below target")
 
-    scores = {key: round(max(0.0, min(value, 9.8)), 2) for key, value in scores.items()}
+    score_cap = 10.0 if burn_in_ok else 9.8
+    scores = {key: round(max(0.0, min(value, score_cap)), 2) for key, value in scores.items()}
     overall = round(sum(scores.values()) / len(scores), 2)
     blocking_gap_terms = (
         "contract",
@@ -5241,6 +5259,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         and latest_scorecard_overall >= 95.0
         and latest_quality_verdict == "healthy"
         and contract.get("ok")
+        and (not burn_in or burn_in_ok)
     )
     readiness = (
         "frontier"
@@ -5266,6 +5285,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             "latest_quality_scorecard_at_least_95": latest_scorecard_overall is not None and latest_scorecard_overall >= 95.0,
             "latest_quality_healthy": latest_quality_verdict == "healthy",
             "task_contract_clean": bool(contract.get("ok")),
+            "stability_burn_in_clean": burn_in_ok,
         },
         "scores": scores,
         "decode_mean_tps": decode_mean,
@@ -5300,6 +5320,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "latest_quality_artifact": latest_quality_artifact.get("_artifact_path", ""),
         "task_contract": contract,
         "measurement_artifact": artifact,
+        "stability_burn_in": burn_in,
         "strengths": strengths,
         "gaps": gaps,
         "next": (
@@ -5481,6 +5502,145 @@ def frontier_eval(args: argparse.Namespace) -> int:
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
     return 0 if report["overall"] >= args.min_score or args.allow_fail else 2
+
+
+def stability_burn_in_report(
+    root: Path,
+    *,
+    recent_rows: int = 120,
+    min_free_mb: int = 8192,
+    max_compressor_mb: int = 8192,
+    max_swap_mb: int = 8192,
+) -> dict[str, Any]:
+    ensure_research_state(root)
+    replay = replay_checks(root)
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    quality = latest_json_artifact(root, "quality-review-*.json")
+    handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
+    contract = task_contract_report(root)
+    memory = memory_snapshot()
+    ready = [
+        task
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    ]
+    model_bound_implementation_ready = [
+        str(task.get("id", ""))
+        for task in ready
+        if task.get("task_type") == "implementation" and not is_deterministic_research_task(task)
+    ]
+    unsafe_ready_tasks: list[str] = []
+    for task in ready:
+        if str(task.get("supervisor_action", "")).startswith("drafter-calibration"):
+            checks = {str(item) for item in task.get("guard_checks", []) if item}
+            required = {"memory_gate", "no_live_profile_change", "no_opencode_changes"}
+            if not required.issubset(checks):
+                unsafe_ready_tasks.append(str(task.get("id", "")))
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    replay_cases = set(replay.get("cases", [])) if isinstance(replay.get("cases"), list) else set()
+    required_replay_cases = {
+        "malformed-tool-fallback",
+        "memory-pressure-breaker",
+        "contaminated-decode-wall-clock",
+        "repeated-gepa-canary-promotion",
+        "plateau-pivot-state",
+    }
+    quality_score = quality.get("quality_score")
+    scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    scorecard_overall = scorecard.get("overall")
+    handoff_score = handoff.get("score")
+    duplicate_stages = calibration_stage_duplicate_count(root)
+    gates = {
+        "replay_ok": bool(replay.get("ok")),
+        "required_replay_cases_present": required_replay_cases.issubset(replay_cases),
+        "canonical_clean": bool(canonical.get("clean")),
+        "zero_active_noise": all(
+            int(noise.get(key, 0) or 0) == 0
+            for key in (
+                "unresolved_blocked_rows",
+                "terminal_synthesis_rows",
+                "bridge_zero_rows",
+                "memory_blocks",
+            )
+        ),
+        "quality_healthy": quality.get("verdict") == "healthy",
+        "quality_score_at_least_95": isinstance(quality_score, (int, float)) and quality_score >= 95,
+        "scorecard_at_least_95": isinstance(scorecard_overall, (int, float)) and scorecard_overall >= 95,
+        "handoff_at_least_95": isinstance(handoff_score, (int, float)) and handoff_score >= 95,
+        "task_contract_clean": bool(contract.get("ok")),
+        "no_model_bound_implementation_ready": not model_bound_implementation_ready,
+        "no_duplicate_stage_tasks": duplicate_stages == 0,
+        "ready_tasks_guarded": not unsafe_ready_tasks,
+        "memory_free_headroom": int(memory.get("free_mb", 0)) >= min_free_mb,
+        "memory_compressor_bounded": int(memory.get("compressor_mb", 0)) <= max_compressor_mb,
+        "memory_swap_bounded": int(memory.get("swap_used_mb", 0)) <= max_swap_mb,
+    }
+    return {
+        "ok": all(gates.values()),
+        "kind": "stability-burn-in",
+        "timestamp": int(time.time()),
+        "recent_rows": recent_rows,
+        "gates": gates,
+        "memory": memory,
+        "thresholds": {
+            "min_free_mb": min_free_mb,
+            "max_compressor_mb": max_compressor_mb,
+            "max_swap_mb": max_swap_mb,
+        },
+        "quality": {
+            "artifact": quality.get("_artifact_path", ""),
+            "verdict": quality.get("verdict", ""),
+            "quality_score": quality_score,
+            "scorecard_overall": scorecard_overall,
+        },
+        "handoff": {
+            "artifact": handoff.get("_artifact_path", ""),
+            "score": handoff_score,
+            "ok": handoff.get("ok"),
+        },
+        "canonical_state": {
+            "state": canonical.get("state"),
+            "clean": canonical.get("clean"),
+            "noise": noise,
+            "deterministic_ready_tasks": canonical.get("deterministic_ready_tasks", []),
+            "breakthrough_lanes": canonical.get("breakthrough_lanes", []),
+        },
+        "replay_cases": sorted(replay_cases),
+        "missing_replay_cases": sorted(required_replay_cases - replay_cases),
+        "model_bound_implementation_ready": model_bound_implementation_ready,
+        "unsafe_ready_tasks": unsafe_ready_tasks,
+        "task_contract": contract,
+        "duplicate_stage_tasks": duplicate_stages,
+    }
+
+
+def stability_burn_in(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    report = stability_burn_in_report(
+        root,
+        recent_rows=args.recent_rows,
+        min_free_mb=args.min_free_mb,
+        max_compressor_mb=args.max_compressor_mb,
+        max_swap_mb=args.max_swap_mb,
+    )
+    path = root / "benchmarks" / f"stability-burn-in-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"stability-burn-in-{report['timestamp']}",
+        status="keep" if report["ok"] else "blocked",
+        target="autoresearch-stability-burn-in",
+        hypothesis="aggressive deterministic burn-in should prove clean handoff, replay, memory, and noise gates before 10/10 certification",
+        commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
+        notes=(
+            f"ok={report['ok']} failed_gates="
+            + ",".join(key for key, value in report["gates"].items() if not value)
+            + f" quality={report['quality']['quality_score']} scorecard={report['quality']['scorecard_overall']} "
+            f"handoff={report['handoff']['score']} noise={report['canonical_state']['noise']} path={path}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if report["ok"] or args.allow_fail else 2
 
 
 def gepa_escalation(args: argparse.Namespace) -> int:
@@ -8681,6 +8841,14 @@ def main() -> int:
     frontier_eval_parser.add_argument("--min-score", type=float, default=9.0)
     frontier_eval_parser.add_argument("--allow-fail", action="store_true")
     frontier_eval_parser.set_defaults(func=frontier_eval)
+
+    burn_in = sub.add_parser("stability-burn-in")
+    burn_in.add_argument("--recent-rows", type=int, default=120)
+    burn_in.add_argument("--min-free-mb", type=int, default=8192)
+    burn_in.add_argument("--max-compressor-mb", type=int, default=8192)
+    burn_in.add_argument("--max-swap-mb", type=int, default=8192)
+    burn_in.add_argument("--allow-fail", action="store_true")
+    burn_in.set_defaults(func=stability_burn_in)
 
     rank = sub.add_parser("hypothesis-rank")
     rank.add_argument("--limit", type=int, default=12)

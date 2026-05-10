@@ -117,6 +117,71 @@ def main() -> int:
             assert "decode-token-source-required" in replay_cases
             assert "profile-variant-paired-control" in replay_cases
             assert helper.replay(Namespace(allow_fail=False)) == 0
+            (root / "benchmarks").mkdir(parents=True, exist_ok=True)
+            (root / "benchmarks" / "quality-review-999.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "quality-review",
+                        "verdict": "healthy",
+                        "quality_score": 100,
+                        "scorecard": {
+                            "overall": 98.0,
+                            "interpretation": "high_quality_exhaustion_or_prerequisite_route",
+                        },
+                        "canonical_state": {
+                            "clean": True,
+                            "noise": {
+                                "unresolved_blocked_rows": 0,
+                                "terminal_synthesis_rows": 0,
+                                "bridge_zero_rows": 0,
+                                "memory_blocks": 0,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "benchmarks" / "implementation-handoff-audit-999.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "implementation-handoff-audit",
+                        "ok": True,
+                        "score": 100,
+                        "gaps": [],
+                        "gates": {
+                            "deterministic_ready_task": True,
+                            "implementation_candidates_present": True,
+                            "scoped_candidates_have_guards": True,
+                            "ready_contracts_clean": True,
+                            "patch_executor_contract_ready": True,
+                            "safe_patch_tests_allowlisted": True,
+                            "patch_executor_blocks_secret_content": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            helper.write_jsonl(
+                root / "tasks.jsonl",
+                [
+                    helper.drafter_calibration_memory_stage_task(
+                        999,
+                        stage="target-load",
+                        task_id="burn-in-memory-stage",
+                        bounded_command=["openclaw-speed-research", "drafter-calibration-memory-stage", "--stage", "target-load"],
+                    )
+                ],
+            )
+            with patch.object(
+                helper,
+                "memory_snapshot",
+                return_value={"free_mb": 16384, "compressor_mb": 1024, "swap_used_mb": 0},
+            ):
+                burn = helper.stability_burn_in_report(root)
+            assert burn["ok"] is True
+            assert all(burn["gates"].values())
+            assert burn["gates"]["no_model_bound_implementation_ready"] is True
+            assert burn["gates"]["ready_tasks_guarded"] is True
             assert helper.environment_snapshot_command(
                 Namespace(label="unit", repo="/Users/kristian/Documents/openclaw-harness-autoresearch", allow_fail=False)
             ) == 0
