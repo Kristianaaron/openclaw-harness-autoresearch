@@ -10,6 +10,7 @@ local prefix_warmer="$HOME/.openclaw/bin/openclaw-prefix-warmer"
 local runtime_deps_guard="$HOME/.openclaw/bin/openclaw-runtime-deps-guard"
 local speed_research="$HOME/.openclaw/bin/openclaw-speed-research"
 local speed_research_autopilot="$HOME/.openclaw/bin/openclaw-speed-research-autopilot"
+local speed_research_watchdog="$HOME/.openclaw/bin/openclaw-autoresearch-watchdog"
 local model_env_override="$HOME/.openclaw/runtime/model-env.override.json"
 local model_label="local.openclaw-model-server"
 local model_plist="$HOME/Library/LaunchAgents/${model_label}.plist"
@@ -381,6 +382,11 @@ case "${1:-}" in
   speed-research-self-improve|research-speed-self-improve)
     shift
     "$speed_research" self-improve "$@"
+    return $?
+    ;;
+  speed-research-watchdog|research-speed-watchdog)
+    shift
+    "$speed_research_watchdog" "$@"
     return $?
     ;;
   speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)

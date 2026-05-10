@@ -129,6 +129,33 @@ The goal is a stable evolutionary layer: the system can learn from repeated
 failure modes and improve its own research instructions without destabilizing the
 main OpenClaw runtime.
 
+### Autoresearch Watchdog
+
+`openclaw-autoresearch-watchdog` is the independent reviewer layer. It is
+deliberately deterministic: it reads the active research workspace, checks the
+autopilot lock, latest log freshness, quality review, frontier eval,
+implementation handoff, stability burn-in, active noise, and decode metrics, then
+writes a review artifact under `~/.openclaw/research/speed/watchdog/`.
+
+The watchdog does not edit `tasks.jsonl` while autopilot owns the workspace. That
+keeps the main loop stable and avoids hidden races. Its job is to do the
+Codex-style health/quality review automatically and state the next deterministic
+move: continue, repair routing, investigate a stall, or seed the next candidate.
+
+Run once:
+
+```bash
+openclaw speed-research-watchdog --allow-degraded
+```
+
+Install the provided LaunchAgent template if you want it to run every 10 minutes:
+
+```bash
+cp launchagents/local.openclaw-autoresearch-watchdog.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/local.openclaw-autoresearch-watchdog.plist
+launchctl kickstart -k "gui/$UID/local.openclaw-autoresearch-watchdog"
+```
+
 ## Referenced Ideas And Repositories
 
 This project is custom OpenClaw harness code, but several external projects and
@@ -195,6 +222,7 @@ Common checks:
 python3 openclaw/test-speed-research.py
 python3 openclaw/test-speed-research-autopilot.py
 python3 openclaw/test-self-improvement.py
+python3 openclaw/test-autoresearch-watchdog.py
 python3 -m compileall -q openclaw
 zsh -n openclaw/openclaw-wrapper.zsh
 ```
@@ -224,12 +252,14 @@ openclaw/
   openclaw-model-proxy.py              # OpenAI-compatible proxy guardrails
   openclaw-speed-research.py           # deterministic research helper commands
   openclaw-speed-research-autopilot.py # overnight supervisor loop
+  openclaw-autoresearch-watchdog.py    # independent deterministic reviewer
   openclaw-drafter-fit.py              # JANQ drafter-fit promotion gates
   openclaw-mtp-drafter-calibrate.py    # bounded calibration helpers
   test-*.py                            # focused safety and behavior tests
 
 launchagents/
   local.openclaw-model-server.plist    # optional macOS LaunchAgent template
+  local.openclaw-autoresearch-watchdog.plist
 
 docs/case-studies/
   *.md                                 # portfolio-readable case study logs

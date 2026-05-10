@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.openclaw-autoresearch-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kristian/.openclaw/bin/openclaw-autoresearch-watchdog</string>
+    <string>--allow-degraded</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/kristian/.openclaw/logs/autoresearch-watchdog.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/kristian/.openclaw/logs/autoresearch-watchdog.err.log</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
