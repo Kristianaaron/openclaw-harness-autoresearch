@@ -1641,12 +1641,14 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
     unresolved_bridge_zero_rows = [] if routed_bridge_zero_rows else bridge_zero
     noise = {
         "unresolved_blocked_rows": len(unresolved),
-        "routed_blocked_rows": len(routed_blockers),
         "terminal_synthesis_rows": len(unresolved_terminal_synthesis_rows),
-        "routed_terminal_synthesis_rows": len(routed_terminal_synthesis_rows),
         "bridge_zero_rows": len(unresolved_bridge_zero_rows),
-        "routed_bridge_zero_rows": len(routed_bridge_zero_rows),
         "memory_blocks": len(memory_blocks),
+    }
+    resolved_debt = {
+        "routed_blocked_rows": len(routed_blockers),
+        "routed_terminal_synthesis_rows": len(routed_terminal_synthesis_rows),
+        "routed_bridge_zero_rows": len(routed_bridge_zero_rows),
     }
     return {
         "version": 1,
@@ -1665,6 +1667,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
         "unresolved_blocked_rows": unresolved,
         "routed_blocked_rows": routed_blockers,
         "noise": noise,
+        "resolved_debt": resolved_debt,
         "next": (
             "run deterministic prerequisite"
             if repair_ready

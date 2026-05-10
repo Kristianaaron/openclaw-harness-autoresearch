@@ -1410,6 +1410,8 @@ def main() -> int:
             canonical_with_external = helper.canonical_autoresearch_state(root, recent_rows=120)
             assert canonical_with_external["noise"]["unresolved_blocked_rows"] == 0
             assert canonical_with_external["noise"]["memory_blocks"] == 0
+            assert "routed_blocked_rows" not in canonical_with_external["noise"]
+            assert canonical_with_external["resolved_debt"]["routed_blocked_rows"] >= 1
             assert canonical_with_external["state"] == "breakthrough_lane_active"
             assert helper.frontier_eval(Namespace(recent_rows=120, min_score=8.0, allow_fail=False)) == 0
             eval_paths = list((root / "benchmarks").glob("frontier-system-eval-*.json"))
