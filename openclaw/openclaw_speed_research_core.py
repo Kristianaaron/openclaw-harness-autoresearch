@@ -157,6 +157,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "promotion_confidence",
             "frontier_candidate_gate",
             "trace_distillation_repair_gate",
+            "adapter_method_contract",
             "autoresearch_quality_delta",
         ],
     },

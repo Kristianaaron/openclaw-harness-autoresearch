@@ -99,6 +99,7 @@ def main() -> int:
             assert "frontier-expansion" in profile["scope"]["allowed_lanes"]
             assert "frontier_candidate_gate" in profile["metrics"]["secondary"]
             assert "trace_distillation_repair_gate" in profile["metrics"]["secondary"]
+            assert "adapter_method_contract" in profile["metrics"]["secondary"]
             assert "autoresearch_quality_delta" in profile["metrics"]["secondary"]
             policy = json.loads((root / "evaluator-policy.json").read_text(encoding="utf-8"))
             assert "benchmark-manifest.json" in policy["immutable_paths"]
@@ -815,6 +816,9 @@ def main() -> int:
                         assert "test-mtp-drafter-calibrate-guards.py" in gradient_repair_fallback[0]["next_action"]
                         assert not helper.task_contract_issues(gradient_blocked_root, gradient_repair_fallback[0])["blockers"]
                         helper.upsert_tasks(gradient_blocked_root, gradient_repair_fallback)
+                        active_repair_state = helper.drafter_bottleneck_state(gradient_blocked_root)
+                        assert active_repair_state["state"] == "trace_distillation_repair_active"
+                        assert active_repair_state["next_step"] == "wait_for_trace_distillation_repair"
                         helper.append_result(
                             gradient_blocked_root,
                             run_id="supervisor-drafter-fit-plan-trace-distillation-unit",
@@ -851,7 +855,7 @@ def main() -> int:
                             123460,
                             reason="unit trace repair first",
                         )
-                        assert first_repair[0]["id"].startswith("trace-distillation-gradient-repair-")
+                        assert first_repair[0]["id"] == "trace-distillation-gradient-repair-current"
                         helper.upsert_tasks(repair_done_root, first_repair)
                         repair_done_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
                         for task in repair_done_tasks:
@@ -881,7 +885,7 @@ def main() -> int:
                             reason="unit trace expansion already passed",
                         )
                         assert len(adapter_bridge) == 1
-                        assert adapter_bridge[0]["id"].startswith("trace-distillation-adapter-bridge-")
+                        assert adapter_bridge[0]["id"] == "trace-distillation-adapter-bridge-current"
                         assert adapter_bridge[0]["supervisor_action"] == "focused-test"
                         assert not helper.task_contract_issues(repair_done_root, adapter_bridge[0])["blockers"]
                         helper.upsert_tasks(repair_done_root, adapter_bridge)
@@ -897,11 +901,26 @@ def main() -> int:
                             reason="unit adapter bridge already passed",
                         )
                         assert len(adapter_contract) == 1
-                        assert adapter_contract[0]["id"].startswith("drafter-adapter-method-contract-")
+                        assert adapter_contract[0]["id"] == "drafter-adapter-method-contract-current"
                         assert adapter_contract[0]["supervisor_action"] == "drafter-adapter-method-contract"
                         assert adapter_contract[0]["lane"] == "implementation-gate"
                         assert not helper.task_contract_issues(repair_done_root, adapter_contract[0])["blockers"]
                         helper.upsert_tasks(repair_done_root, adapter_contract)
+                        helper.upsert_tasks(repair_done_root, adapter_contract)
+                        assert (
+                            len(
+                                [
+                                    task
+                                    for task in helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                                    if str(task.get("id", "")).startswith("drafter-adapter-method-contract-")
+                                    and task.get("status") == "ready"
+                                ]
+                            )
+                            == 1
+                        )
+                        active_contract_state = helper.drafter_bottleneck_state(repair_done_root)
+                        assert active_contract_state["state"] == "adapter_method_contract_active"
+                        assert active_contract_state["next_step"] == "wait_for_adapter_method_contract"
                         with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(repair_done_root)}, clear=False):
                             assert helper.drafter_bottleneck_review(Namespace(recent_rows=240)) == 0
                             assert helper.drafter_adapter_method_contract(Namespace(recent_rows=240)) == 0

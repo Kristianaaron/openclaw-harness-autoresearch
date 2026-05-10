@@ -2583,7 +2583,9 @@ def drafter_bottleneck_state(
     trace_paths = existing_drafter_trace_paths()
     trace_attempted = trace_distillation_attempt_exists(root, recent_rows=recent_rows)
     trace_failed = trace_distillation_proof_failed(root, recent_rows=recent_rows)
+    active_repair = active_task_has_prefix(root, "trace-distillation-gradient-repair-")
     repair_attempted = trace_distillation_repair_attempted(root, recent_rows=recent_rows)
+    repair_completed = repair_attempted and not active_repair
     expansion_attempted = any_task_has_prefix(root, "frontier-expansion-janq-adapter-path-") or recent_result_has_prefix(
         root,
         "supervisor-focused-test-",
@@ -2593,24 +2595,39 @@ def drafter_bottleneck_state(
         for row in window
         if row.get("run_id", "").startswith("supervisor-focused-test-")
     )
+    active_adapter_bridge = active_task_has_prefix(root, "trace-distillation-adapter-bridge-")
     adapter_bridge_attempted = any_task_has_prefix(root, "trace-distillation-adapter-bridge-")
+    active_adapter_contract = active_task_has_prefix(root, "drafter-adapter-method-contract-")
+    adapter_contract_attempted = any_task_has_prefix(root, "drafter-adapter-method-contract-")
     fallback_decode_count = recent_lane_contract_decode_fallback_count(root, recent_rows=min(recent_rows, 80))
 
     if blocker != CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
         state = "no_terminal_quantized_blocker"
         next_step = "continue_current_lane_contract"
-    elif trace_failed and not repair_attempted:
+    elif trace_failed and active_repair:
+        state = "trace_distillation_repair_active"
+        next_step = "wait_for_trace_distillation_repair"
+    elif trace_failed and not repair_completed:
         state = "trace_distillation_failed"
         next_step = "seed_trace_distillation_repair"
-    elif trace_failed and repair_attempted and not expansion_attempted:
+    elif trace_failed and repair_completed and not expansion_attempted:
         state = "repair_done_need_adapter_expansion"
         next_step = "seed_janq_adapter_expansion"
-    elif trace_failed and repair_attempted and expansion_attempted and not adapter_bridge_attempted:
+    elif trace_failed and repair_completed and expansion_attempted and active_adapter_bridge:
+        state = "adapter_bridge_active"
+        next_step = "wait_for_adapter_bridge"
+    elif trace_failed and repair_completed and expansion_attempted and not adapter_bridge_attempted:
         state = "adapter_expansion_done"
         next_step = "seed_adapter_bridge"
-    elif trace_failed and repair_attempted and expansion_attempted and adapter_bridge_attempted:
+    elif trace_failed and repair_completed and expansion_attempted and adapter_bridge_attempted and active_adapter_contract:
+        state = "adapter_method_contract_active"
+        next_step = "wait_for_adapter_method_contract"
+    elif trace_failed and repair_completed and expansion_attempted and adapter_bridge_attempted and not adapter_contract_attempted:
         state = "adapter_method_required"
         next_step = "seed_adapter_method_contract"
+    elif trace_failed and repair_completed and expansion_attempted and adapter_bridge_attempted:
+        state = "adapter_method_contract_ready"
+        next_step = "wait_for_adapter_method_implementation"
     elif trace_attempted:
         state = "trace_distillation_pending_or_incomplete"
         next_step = "wait_for_trace_distillation_result"
@@ -2630,8 +2647,13 @@ def drafter_bottleneck_state(
         "trace_attempted": trace_attempted,
         "trace_distillation_failed": trace_failed,
         "trace_repair_attempted": repair_attempted,
+        "trace_repair_active": active_repair,
+        "trace_repair_completed": repair_completed,
         "adapter_expansion_attempted": expansion_attempted,
+        "adapter_bridge_active": active_adapter_bridge,
         "adapter_bridge_attempted": adapter_bridge_attempted,
+        "adapter_method_contract_active": active_adapter_contract,
+        "adapter_method_contract_attempted": adapter_contract_attempted,
         "fallback_decode_count": fallback_decode_count,
     }
 
@@ -2683,10 +2705,23 @@ def drafter_bottleneck_next_tasks(
 ) -> list[dict[str, Any]]:
     state = drafter_bottleneck_state(root, rows, recent_rows=240)
     step = state["next_step"]
-    if step in {"seed_janq_adapter_expansion", "seed_adapter_bridge", "seed_adapter_method_contract"} and active_task_has_prefix(
-        root,
-        "trace-distillation-gradient-repair-",
-    ):
+    if step.startswith("wait_for_"):
+        recent_wait = any(
+            item.get("task_id") == "drafter-bottleneck-wait" and item.get("next") == step
+            for item in read_jsonl(root / "findings.jsonl")[-20:]
+        )
+        if not recent_wait:
+            append_jsonl(
+                root / "findings.jsonl",
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "drafter-bottleneck-wait",
+                    "finding": "drafter bottleneck review found active downstream work and refused to seed a duplicate route",
+                    "reason": reason,
+                    "evidence": state,
+                    "next": step,
+                },
+            )
         return []
     if step == "collect_target_generated_traces":
         return filter_seedable_tasks(
@@ -2707,7 +2742,7 @@ def drafter_bottleneck_next_tasks(
             return []
         return filter_seedable_tasks(
             root,
-            [trace_distillation_repair_task(timestamp, task_id=f"trace-distillation-gradient-repair-{timestamp}")],
+            [trace_distillation_repair_task(timestamp, task_id="trace-distillation-gradient-repair-current")],
         )
     if step == "seed_janq_adapter_expansion":
         return frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
@@ -2716,7 +2751,7 @@ def drafter_bottleneck_next_tasks(
             return []
         return filter_seedable_tasks(
             root,
-            [trace_distillation_adapter_bridge_task(timestamp, task_id=f"trace-distillation-adapter-bridge-{timestamp}")],
+            [trace_distillation_adapter_bridge_task(timestamp, task_id="trace-distillation-adapter-bridge-current")],
         )
     if step == "seed_adapter_method_contract":
         if active_task_has_prefix(root, "drafter-adapter-method-contract-"):
@@ -2728,21 +2763,9 @@ def drafter_bottleneck_next_tasks(
             [
                 drafter_adapter_method_contract_task(
                     timestamp,
-                    task_id=f"drafter-adapter-method-contract-{timestamp}",
+                    task_id="drafter-adapter-method-contract-current",
                 )
             ],
-        )
-    if step == "wait_for_trace_distillation_result":
-        append_jsonl(
-            root / "findings.jsonl",
-            {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "task_id": "drafter-bottleneck-wait",
-                "finding": "drafter bottleneck review found an in-flight trace-distillation task and refused to seed parallel duplicates",
-                "reason": reason,
-                "evidence": state,
-                "next": "wait_for_existing_trace_distillation_result",
-            },
         )
     return []
 
@@ -7073,7 +7096,7 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
         "openclaw/test-speed-research.py",
     ]
     contract = {
-        "ok": state["state"] == "adapter_method_required",
+        "ok": state["state"] in {"adapter_method_required", "adapter_method_contract_active"},
         "kind": "drafter-adapter-method-contract",
         "timestamp": timestamp,
         "state": state,
