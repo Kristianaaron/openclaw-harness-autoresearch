@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from argparse import Namespace
@@ -921,6 +922,30 @@ def main() -> int:
                         active_contract_state = helper.drafter_bottleneck_state(repair_done_root)
                         assert active_contract_state["state"] == "adapter_method_contract_active"
                         assert active_contract_state["next_step"] == "wait_for_adapter_method_contract"
+                        revived_root = Path(tmp) / "revived-adapter-contract"
+                        shutil.copytree(repair_done_root, revived_root)
+                        revived_tasks = helper.read_jsonl(revived_root / "tasks.jsonl")
+                        for task in revived_tasks:
+                            if task["id"] == "drafter-adapter-method-contract-current":
+                                task["status"] = "blocked"
+                                task["blocked_at"] = "2026-05-10T00:00:00+0000"
+                        helper.write_jsonl(revived_root / "tasks.jsonl", revived_tasks)
+                        revived_seed = helper.lane_contract_fallback_tasks(
+                            revived_root,
+                            helper.result_rows(revived_root),
+                            123464,
+                            reason="unit revive blocked adapter contract",
+                        )
+                        assert len(revived_seed) == 1
+                        assert revived_seed[0]["id"] == "drafter-adapter-method-contract-current"
+                        assert helper.upsert_tasks(revived_root, revived_seed) == 1
+                        assert any(
+                            task["id"] == "drafter-adapter-method-contract-current"
+                            and task.get("status") == "ready"
+                            and task.get("revived_at")
+                            and "blocked_at" not in task
+                            for task in helper.read_jsonl(revived_root / "tasks.jsonl")
+                        )
                         with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(repair_done_root)}, clear=False):
                             assert helper.drafter_bottleneck_review(Namespace(recent_rows=240)) == 0
                             assert helper.drafter_adapter_method_contract(Namespace(recent_rows=240)) == 0
@@ -931,6 +956,25 @@ def main() -> int:
                         assert "openclaw/openclaw-mtp-drafter-calibrate.py" in contract["allowed_source_files"]
                         implementation_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
                         assert any(str(task.get("id", "")).startswith("implementation-drafter-adapter-method-") for task in implementation_tasks)
+                        for index in range(260):
+                            helper.append_result(
+                                repair_done_root,
+                                run_id=f"decode-noise-after-adapter-contract-{index}",
+                                status="keep",
+                                target="decode-sample",
+                                hypothesis="unit decode rows should not erase the JANQ bottleneck route",
+                                commit="abc123",
+                                notes="mode=decode-sample wall_decode_tps=16.0 server_decode_tps=16.0 draft_block_size=2 contaminated=0",
+                            )
+                        historical_state = helper.drafter_bottleneck_state(repair_done_root)
+                        assert historical_state["state"] in {
+                            "adapter_method_contract_ready",
+                            "adapter_method_implementation_active",
+                        }
+                        assert historical_state["next_step"] in {
+                            "seed_adapter_method_implementation",
+                            "wait_for_adapter_method_implementation",
+                        }
                         old_bridge_row = [
                             {
                                 "timestamp": "2026-05-10T00:00:00+0000",
