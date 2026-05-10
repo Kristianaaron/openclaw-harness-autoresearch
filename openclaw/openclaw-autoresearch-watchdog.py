@@ -22,6 +22,19 @@ from typing import Any
 
 DEFAULT_WORKSPACE = Path.home() / ".openclaw" / "research" / "speed"
 DEFAULT_TARGET_TPS = 30.0
+ARCHITECTURE_VERSION = 1
+
+
+CORE_ARCHITECTURE_FILES = [
+    "program.md",
+    "research-profile.json",
+    "insight-rubric.json",
+    "benchmark-manifest.json",
+    "tasks.jsonl",
+    "results.tsv",
+    "experiments.jsonl",
+    "findings.jsonl",
+]
 
 
 def workspace_root() -> Path:
@@ -200,6 +213,153 @@ def count_recent_terminal_noise(rows: list[dict[str, str]]) -> dict[str, int]:
     }
 
 
+def architecture_contract(root: Path) -> dict[str, Any]:
+    """Describe the live autoresearch system from local evidence.
+
+    This gives the sidecar a Pi-style "North Star" and a Hermes-style promotion
+    contract without asking an LLM to infer the architecture from memory.
+    """
+
+    files = {
+        rel: {
+            "exists": (root / rel).exists(),
+            "size": (root / rel).stat().st_size if (root / rel).exists() else 0,
+        }
+        for rel in CORE_ARCHITECTURE_FILES
+    }
+    return {
+        "version": ARCHITECTURE_VERSION,
+        "north_star": "improve normal OpenClaw TUI decode speed while preserving stability, quality, and model identity",
+        "primary_metric": "decode_tps",
+        "target_tps": DEFAULT_TARGET_TPS,
+        "immutable": [
+            "OpenClaw only; never touch opencode",
+            "do not change the target model unless explicitly requested",
+            "do not mutate live profile/settings from watchdog",
+            "do not count repeated synthesis or self-review as progress without new evidence",
+            "architectural/source changes require patch-executor canary, tests, rollback, and approval gates",
+        ],
+        "mutable": [
+            "task queue",
+            "research strategy",
+            "candidate artifacts",
+            "self-improvement skills and rubrics after canary validation",
+        ],
+        "evidence_sources": [
+            "results.tsv",
+            "benchmarks/quality-review-*.json",
+            "benchmarks/frontier-system-eval-*.json",
+            "benchmarks/implementation-handoff-audit-*.json",
+            "benchmarks/stability-burn-in-*.json",
+            "autopilot.lock",
+            "logs/autopilot-*.log",
+        ],
+        "sidecar_authority": {
+            "may_write": ["watchdog/*.json", "watchdog/reviews.jsonl"],
+            "may_not_write": ["tasks.jsonl", "results.tsv", "research-profile.json", "program.md", "live OpenClaw profile"],
+            "candidate_mode": "advisory-only",
+        },
+        "files": files,
+    }
+
+
+def evidence_linked_candidates(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Create sidecar ideas only from deterministic report evidence.
+
+    These candidates are intentionally advisory. The autopilot/patch-executor
+    owns live task mutation and promotion, which prevents sidecar idea noise.
+    """
+
+    canonical = report.get("canonical_state", {})
+    decode = report.get("decode", {})
+    quality = report.get("quality", {})
+    frontier = report.get("frontier", {})
+    ready = canonical.get("deterministic_ready_tasks") or []
+    exhausted = canonical.get("exhausted_lanes") or []
+    lanes = canonical.get("breakthrough_lanes") or []
+    candidates: list[dict[str, Any]] = []
+    base_gate = {
+        "quality_healthy": report.get("gates", {}).get("quality_healthy") is True,
+        "zero_active_noise": report.get("gates", {}).get("zero_active_noise") is True,
+        "handoff_high": report.get("gates", {}).get("handoff_high") is True,
+        "frontier_high": report.get("gates", {}).get("frontier_high") is True,
+    }
+
+    if report.get("severity") in {"critical", "degraded"}:
+        candidates.append(
+            {
+                "id": "repair-before-new-research",
+                "kind": "repair",
+                "status": "advisory",
+                "allowed_for_live_queue": False,
+                "reason": "watchdog gates are not healthy; new ideas would add noise before repair",
+                "evidence": {
+                    "severity": report.get("severity"),
+                    "blockers": report.get("blockers", []),
+                    "quality": quality,
+                    "frontier": frontier,
+                },
+                "next": report.get("next_command"),
+            }
+        )
+        return candidates
+
+    if ready:
+        candidates.append(
+            {
+                "id": "continue-ready-deterministic-work",
+                "kind": "continue",
+                "status": "advisory",
+                "allowed_for_live_queue": False,
+                "reason": "deterministic ready work already exists; sidecar must not add duplicate tasks",
+                "evidence": {
+                    "ready_tasks": ready[:8],
+                    "breakthrough_lanes": lanes,
+                    "decode": decode,
+                },
+                "next": "let autopilot execute the existing deterministic task",
+            }
+        )
+
+    if not ready and canonical.get("state") in {"blocked_until_external_change", "plateau_detected"}:
+        candidates.append(
+            {
+                "id": "frontier-candidate-synthesis",
+                "kind": "candidate-search",
+                "status": "advisory",
+                "allowed_for_live_queue": False,
+                "reason": "clean plateau/external-blocker state needs exactly one next-candidate synthesis by autopilot",
+                "evidence": {
+                    "canonical_state": canonical.get("state"),
+                    "exhausted_lanes": exhausted,
+                    "quality": quality,
+                    "frontier": frontier,
+                },
+                "next": "~/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+            }
+        )
+
+    if decode.get("mean_wall_decode_tps") is not None and float(decode["mean_wall_decode_tps"]) < DEFAULT_TARGET_TPS:
+        candidates.append(
+            {
+                "id": "decode-breakthrough-track",
+                "kind": "metric-focus",
+                "status": "advisory",
+                "allowed_for_live_queue": False,
+                "reason": "decode remains below target; only paired benchmark wins should promote",
+                "evidence": {
+                    "decode": decode,
+                    "breakthrough_lanes": lanes,
+                    "exhausted_lanes": exhausted,
+                    "gates": base_gate,
+                },
+                "next": "continue or synthesize only through autopilot gates; reject unpaired speed claims",
+            }
+        )
+
+    return candidates
+
+
 def watchdog_review(
     root: Path,
     *,
@@ -345,6 +505,14 @@ def run_once(args: argparse.Namespace) -> int:
         max_log_stale_seconds=args.max_log_stale_seconds,
         max_result_stale_seconds=args.max_result_stale_seconds,
     )
+    report["architecture_contract"] = architecture_contract(root)
+    report["advisory_candidates"] = evidence_linked_candidates(report)
+    report["sidecar_safety"] = {
+        "mode": "advisory-only",
+        "live_task_mutation": False,
+        "reason": "autopilot and patch-executor own task mutation and promotion gates",
+        "noise_guard": "sidecar ideas are report artifacts only; duplicate live tasks are not written by watchdog",
+    }
     out_dir = root / "watchdog"
     write_json(out_dir / "autoresearch-watchdog-latest.json", report)
     write_json(out_dir / f"autoresearch-watchdog-{report['timestamp']}.json", report)

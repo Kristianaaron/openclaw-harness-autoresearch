@@ -142,6 +142,12 @@ keeps the main loop stable and avoids hidden races. Its job is to do the
 Codex-style health/quality review automatically and state the next deterministic
 move: continue, repair routing, investigate a stall, or seed the next candidate.
 
+The watchdog also writes an explicit architecture contract and advisory candidate
+list into each report. These candidates are evidence-linked and marked
+`allowed_for_live_queue=false`: the sidecar may propose, but only the autopilot
+and patch-executor can mutate live tasks after their normal quality, canary, and
+rollback gates pass. This keeps new ideas from becoming duplicate task noise.
+
 Run once:
 
 ```bash

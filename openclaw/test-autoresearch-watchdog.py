@@ -98,6 +98,13 @@ def main() -> int:
         assert report["decision"] == "continue-breakthrough-lane"
         assert report["gates"]["zero_active_noise"] is True
         assert report["decode"]["mean_wall_decode_tps"] == 15.2
+        contract = helper.architecture_contract(root)
+        assert contract["sidecar_authority"]["candidate_mode"] == "advisory-only"
+        assert "tasks.jsonl" in contract["sidecar_authority"]["may_not_write"]
+        candidates = helper.evidence_linked_candidates(report)
+        assert candidates
+        assert all(candidate["allowed_for_live_queue"] is False for candidate in candidates)
+        assert candidates[0]["id"] == "continue-ready-deterministic-work"
 
         write_json(
             root / "benchmarks" / "quality-review-2.json",
@@ -121,6 +128,9 @@ def main() -> int:
         assert degraded["severity"] == "degraded"
         assert degraded["decision"] == "repair-routing"
         assert "scorecard_high" in degraded["blockers"]
+        repair_candidates = helper.evidence_linked_candidates(degraded)
+        assert repair_candidates[0]["id"] == "repair-before-new-research"
+        assert repair_candidates[0]["allowed_for_live_queue"] is False
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -162,6 +172,9 @@ def main() -> int:
         assert blocked["severity"] == "attention"
         assert blocked["decision"] == "seed-next-candidate"
         assert "synthesize --kind frontier" in blocked["next_command"]
+        blocked_candidates = helper.evidence_linked_candidates(blocked)
+        assert any(candidate["id"] == "frontier-candidate-synthesis" for candidate in blocked_candidates)
+        assert all(candidate["status"] == "advisory" for candidate in blocked_candidates)
 
     print("autoresearch watchdog checks passed")
     return 0
