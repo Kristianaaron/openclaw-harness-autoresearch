@@ -106,11 +106,13 @@ The drafter training/calibration loop should be staged:
 
 1. collect target-generated traces from JANQ prompts;
 2. evaluate baseline drafter acceptance and decode speed;
-3. tune only the drafter or adapter components;
-4. re-evaluate acceptance on held-out JANQ traces;
-5. benchmark normal TUI decode speed;
-6. replay tool/thinking/stream guards;
-7. promote only if speed and safety both improve.
+3. detach JANQ target traces with stop-gradient so calibration never
+   differentiates through quantized target weights;
+4. tune only the drafter or adapter components;
+5. re-evaluate acceptance on held-out JANQ traces;
+6. benchmark normal TUI decode speed;
+7. replay tool/thinking/stream guards;
+8. promote only if speed and safety both improve.
 
 ## Crash And Memory Guardrails
 

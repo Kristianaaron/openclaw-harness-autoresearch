@@ -3306,6 +3306,7 @@ def run_supervisor_drafter_calibration_run_task(
                 "next": "suppress calibration until a trainable adapter path avoids gradients through quantized weights",
             },
         )
+    calibration_mode = str(task.get("calibration_mode", ""))
     append_result(
         WORKSPACE,
         run_id=f"supervisor-drafter-calibration-run-{cycle}",
@@ -3313,7 +3314,10 @@ def run_supervisor_drafter_calibration_run_task(
         target=str(task.get("target", "drafter-calibration-run")),
         hypothesis=str(task.get("hypothesis", "run bounded JANQ drafter calibration")),
         commit=current_commit(),
-        notes=clean_tsv(f"{reason} blocker={gradient_issue or ''} output_tail={result.stdout[-500:]}"),
+        notes=clean_tsv(
+            f"{reason} calibration_mode={calibration_mode} trace_distillation={bool(task.get('trace_distillation'))} "
+            f"blocker={gradient_issue or ''} output_tail={result.stdout[-500:]}"
+        ),
     )
     complete_supervisor_task(
         task,
@@ -3324,6 +3328,8 @@ def run_supervisor_drafter_calibration_run_task(
             "runtime_issue": runtime_issue,
             "memory_gate_issue": memory_gate_issue,
             "gradient_issue": gradient_issue,
+            "calibration_mode": calibration_mode,
+            "trace_distillation": bool(task.get("trace_distillation")),
             "output_tail": result.stdout[-1200:],
             "command": command,
         },

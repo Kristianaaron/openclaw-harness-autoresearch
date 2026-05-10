@@ -505,7 +505,7 @@ def main() -> int:
                             "p.add_argument('--eval-every'); p.add_argument('--min-free-mb'); "
                             "p.add_argument('--max-compressor-mb'); p.add_argument('--max-swap-mb'); "
                             "p.add_argument('--min-pressure-free-percent'); p.add_argument('--gpu-memory-utilization'); "
-                            "p.add_argument('--mlx-cache-gb'); a=p.parse_args(); "
+                            "p.add_argument('--mlx-cache-gb'); p.add_argument('--target-trace-policy'); a=p.parse_args(); "
                             "out=pathlib.Path(a.output_path); out.mkdir(parents=True, exist_ok=True); "
                             "payload={'ok': True, 'status': 'keep', 'stage': a.probe_stage, 'timestamp': int(time.time())}; "
                             "(out / f'openclaw-calibration-probe-{a.probe_stage}.json').write_text(json.dumps(payload)); "
@@ -678,8 +678,29 @@ def main() -> int:
                             reason="unit gradient blocker",
                         )
                         assert len(gradient_fallback) == 1
-                        assert gradient_fallback[0]["supervisor_action"] == "calibration-memory-report"
+                        assert gradient_fallback[0]["id"].startswith("drafter-trace-distillation-run-")
+                        assert gradient_fallback[0]["supervisor_action"] == "drafter-calibration-run"
+                        assert gradient_fallback[0]["trace_distillation"] is True
+                        assert "--target-trace-policy" in gradient_fallback[0]["bounded_command"]
+                        assert "stop-gradient" in gradient_fallback[0]["bounded_command"]
+                        assert not helper.task_contract_issues(gradient_blocked_root, gradient_fallback[0])["blockers"]
                         helper.upsert_tasks(gradient_blocked_root, gradient_fallback)
+                        distillation_task_text = (gradient_blocked_root / "tasks.jsonl").read_text(encoding="utf-8")
+                        assert "trace-distillation" in distillation_task_text
+                        consumed_distillation_tasks = helper.read_jsonl(gradient_blocked_root / "tasks.jsonl")
+                        for task in consumed_distillation_tasks:
+                            if task["id"] == gradient_fallback[0]["id"]:
+                                task["status"] = "done"
+                        helper.write_jsonl(gradient_blocked_root / "tasks.jsonl", consumed_distillation_tasks)
+                        gradient_report_fallback = helper.lane_contract_fallback_tasks(
+                            gradient_blocked_root,
+                            helper.result_rows(gradient_blocked_root),
+                            123458,
+                            reason="unit gradient blocker",
+                        )
+                        assert len(gradient_report_fallback) == 1
+                        assert gradient_report_fallback[0]["supervisor_action"] == "calibration-memory-report"
+                        helper.upsert_tasks(gradient_blocked_root, gradient_report_fallback)
                         quality_args = Namespace(
                             recent_rows=120,
                             min_sweeps=3,

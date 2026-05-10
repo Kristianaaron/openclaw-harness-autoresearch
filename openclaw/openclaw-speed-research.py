@@ -68,6 +68,7 @@ DEFAULT_MTP_CALIBRATOR_SCRIPT = (
 )
 CALIBRATION_MEMORY_STAGES = ("metadata", "drafter-load", "target-load", "combined-load", "micro-step")
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
+CALIBRATION_TRACE_DISTILLATION_MODE = "trace-distillation"
 CALIBRATION_CANARY_TERMINAL_BLOCKERS = {
     "calibration-runtime-missing-speculative",
     CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
@@ -1900,6 +1901,8 @@ def compact_terminal_calibration_tasks(root: Path) -> int:
             or "drafter-calibration-run" in task_id
         ):
             continue
+        if task.get("trace_distillation") is True or task.get("calibration_mode") == CALIBRATION_TRACE_DISTILLATION_MODE:
+            continue
         task["status"] = "done"
         task["completed_at"] = now
         task["supervisor_summary"] = {
@@ -2200,6 +2203,8 @@ def calibration_probe_command(
         "0.50",
         "--mlx-cache-gb",
         "1",
+        "--target-trace-policy",
+        "stop-gradient",
         "--probe-stage",
         stage,
     ]
@@ -2246,7 +2251,52 @@ def calibration_full_run_command(
         "0.55",
         "--mlx-cache-gb",
         "2",
+        "--target-trace-policy",
+        "stop-gradient",
     ]
+
+
+def drafter_trace_distillation_run_task(
+    timestamp: int,
+    *,
+    task_id: str,
+    bounded_command: list[str],
+    priority: int = 99,
+) -> dict[str, Any]:
+    return {
+        "id": task_id,
+        "status": "ready",
+        "priority": priority,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-calibration-run",
+        "trace_distillation": True,
+        "calibration_mode": CALIBRATION_TRACE_DISTILLATION_MODE,
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-speed-research.py"],
+        "hypothesis": (
+            "Direct JANQ calibration hit quantized-gradient failure; retry through trace distillation by "
+            "detaching JANQ target traces and training only the drafter-side projection."
+        ),
+        "metric": "acceptance_delta_then_decode_tps",
+        "guard_checks": [
+            "stop_live_model_first",
+            "memory_gate",
+            "bounded_training",
+            "canary_only",
+            "no_target_weight_gradient",
+            "no_live_profile_change",
+            "no_opencode_changes",
+        ],
+        "acceptance": (
+            "The run writes calibration metrics with training_mode=trace-distillation and target_gradient_policy=stop-gradient; "
+            "promotion still requires later paired decode TPS and tool/reasoning guards."
+        ),
+        "rollback": "Discard the output directory and keep the current official q4 drafter unless later paired promotion gates pass.",
+        "bounded_command": bounded_command,
+        "next_action": " ".join(bounded_command),
+        "created_at": timestamp,
+    }
 
 
 def calibration_stage_helper_command(
@@ -2354,6 +2404,39 @@ def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -
         root,
         "drafter-calibration-run-",
         recent_rows=recent_rows,
+    )
+
+
+def trace_distillation_candidate_task(root: Path, timestamp: int, *, task_id: str) -> dict[str, Any] | None:
+    trace_paths = existing_drafter_trace_paths()
+    if not trace_paths:
+        return None
+    output_dir = home() / "drafter-fit"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prompts_path = output_dir / "calibration-canary-prompts.txt"
+    if not prompts_path.exists():
+        try:
+            trace_rows = read_trace_rows(trace_paths[0])
+            prompts = [prompt for row in trace_rows if (prompt := trace_prompt_text(row))]
+            if prompts:
+                prompts_path.write_text("\n".join(prompts[:4]) + "\n", encoding="utf-8")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+    target_path = os.environ.get("OPENCLAW_JANQ_TARGET_PATH", DEFAULT_JANQ_TARGET_PATH)
+    drafter_path = os.environ.get(
+        "OPENCLAW_MTP_DRAFT_PATH",
+        os.environ.get("OPENCLAW_JANG_DRAFT_MODEL", DEFAULT_MTP_DRAFT_PATH),
+    )
+    bounded_command = calibration_full_run_command(
+        target_path=target_path,
+        drafter_path=drafter_path,
+        output_path=output_dir / f"trace-distilled-drafter-{timestamp}",
+        prompts_path=prompts_path,
+    )
+    return drafter_trace_distillation_run_task(
+        timestamp,
+        task_id=task_id,
+        bounded_command=bounded_command,
     )
 
 
@@ -2734,6 +2817,27 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        if (
+            not any_task_has_prefix(root, "drafter-trace-distillation-run-")
+            and should_seed_action(root, "drafter-trace-distillation-run-", recent_rows=240)
+        ):
+            distillation_task = trace_distillation_candidate_task(
+                root,
+                timestamp,
+                task_id=f"drafter-trace-distillation-run-{timestamp}",
+            )
+            if distillation_task is not None:
+                return filter_seedable_tasks(root, [distillation_task])
+        if not existing_drafter_trace_paths():
+            return filter_seedable_tasks(
+                root,
+                [
+                    drafter_trace_collect_task(
+                        timestamp,
+                        task_id=f"lane-contract-drafter-trace-collect-for-distillation-{timestamp}",
+                    )
+                ],
+            )
         return filter_seedable_tasks(
             root,
             calibration_blocker_report_tasks(root, timestamp, blocker=calibration_blocker),
@@ -2901,6 +3005,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
                 action == "drafter-calibration-memory-stage"
                 or "drafter-calibration-memory-stage" in task_id
             )
+            if task.get("trace_distillation") is True or task.get("calibration_mode") == CALIBRATION_TRACE_DISTILLATION_MODE:
+                calibration_blocked_action = False
         if calibration_blocker and calibration_blocked_action:
             continue
         seedable.append(task)
@@ -2954,6 +3060,14 @@ def concrete_handoff_prerequisite_tasks(root: Path, rows: list[dict[str, str]], 
                 )
             )
         elif calibration_blocker:
+            if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+                distillation_task = trace_distillation_candidate_task(
+                    root,
+                    timestamp,
+                    task_id=f"handoff-audit-drafter-trace-distillation-run-{timestamp}",
+                )
+                if distillation_task is not None:
+                    return filter_seedable_tasks(root, [distillation_task])
             plateau = recent_calibration_fallback_plateau(root, rows, recent_rows=100)
             if plateau:
                 return filter_seedable_tasks(

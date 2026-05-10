@@ -30,7 +30,7 @@ if OPENCLAW_RUNTIME_SITE.exists():
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map
 
 
 DEFAULT_PROMPTS = [
@@ -275,8 +275,26 @@ def target_traces(model: Any, processor: Any, prompt_text: str, count: int) -> l
         bonus = label
         mx.eval(label, hidden, bonus)
         trace["label"] = label
-        traces.append(trace)
+        traces.append(detach_target_trace(trace))
     return traces
+
+
+def detach_target_trace(trace: dict[str, Any]) -> dict[str, Any]:
+    """Freeze JANQ-generated trace tensors before drafter training.
+
+    The JANQ target is quantized for inference. If MLX keeps graph history from
+    those target tensors, value_and_grad can try to differentiate through a
+    QuantizedMatmul and fail with "no gradient wrt the quantized weights".
+    Trace distillation should train only the drafter side, so every target
+    tensor is explicitly stop-gradient detached here.
+    """
+
+    def freeze(value: Any) -> Any:
+        if hasattr(value, "dtype") and hasattr(value, "shape"):
+            return mx.stop_gradient(value)
+        return value
+
+    return {key: tree_map(freeze, value) for key, value in trace.items()}
 
 
 def build_traces(model: Any, processor: Any, prompts: list[str], positions_per_prompt: int) -> list[dict[str, Any]]:
@@ -381,6 +399,9 @@ def train(args: argparse.Namespace) -> int:
     metrics = {
         "baseline_first_draft_acceptance": baseline,
         "best_first_draft_acceptance": best_acceptance,
+        "target_trace_policy": args.target_trace_policy,
+        "target_gradient_policy": "stop-gradient",
+        "training_mode": "trace-distillation",
         "steps": args.steps,
         "learning_rate": args.learning_rate,
         "train_samples": len(train_traces),
@@ -518,6 +539,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-check-every", type=int, default=2)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
+    parser.add_argument("--target-trace-policy", choices=["stop-gradient"], default="stop-gradient")
     parser.add_argument(
         "--probe-stage",
         choices=["metadata", "drafter-load", "target-load", "combined-load", "micro-step"],

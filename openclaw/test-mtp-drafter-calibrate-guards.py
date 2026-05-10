@@ -55,6 +55,10 @@ def main() -> int:
         assert "compressor=5000MB>=4096MB" in helper.memory_block_reason(args(), phase="after-load")
     with patch.object(helper, "memory_snapshot", return_value=swapped):
         assert "swap=2048MB>=1024MB" in helper.memory_block_reason(args(), phase="train-step-2")
+    x = helper.mx.array([1.0])
+    grad = helper.mx.grad(lambda value: helper.mx.sum(helper.detach_target_trace({"x": value})["x"]))(x)
+    helper.mx.eval(grad)
+    assert float(grad.item()) == 0.0
     assert helper.parse_args(
         [
             "--target-path",

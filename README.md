@@ -71,8 +71,9 @@ refocus tranche by default instead of stopping and waiting for manual prompting.
 When the active speed lanes exhaust, the supervisor now opens one new bounded
 candidate path instead of repeating the same synthesis or stopping:
 
-- JANQ quantized-gradient calibration blockers route to an adapter or
-  logit-distillation candidate path.
+- JANQ quantized-gradient calibration blockers route to a trace-distillation
+  candidate that detaches target traces and trains only the drafter-side
+  projection.
 - DFlash/JANQ blocker loops route to a candidate-search gate that only reopens
   DFlash when the drafter candidate changes.
 - Settled MTP block-size sweeps route to verify/cache/rollback instrumentation.
@@ -98,8 +99,9 @@ Examples:
   target-generated trace requirements are satisfied.
 - Settled block-size sweeps stop reseeding repeated work once evidence shows the
   current block is the winner.
-- Drafter calibration fails closed when quantized gradient or memory constraints
-  make local training unsafe.
+- Drafter calibration fails closed when memory constraints make local training
+  unsafe, and uses stop-gradient target traces so quantized JANQ weights are not
+  differentiated through.
 - Runtime-overhead work is routed separately from raw decode-speed work so
   measurement contamination does not masquerade as model speed.
 
