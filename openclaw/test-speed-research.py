@@ -1046,6 +1046,33 @@ def main() -> int:
                             "seed_adapter_method_implementation",
                             "wait_for_adapter_method_implementation",
                         }
+                        implementation_done_tasks = helper.read_jsonl(repair_done_root / "tasks.jsonl")
+                        for task in implementation_done_tasks:
+                            if str(task.get("id", "")).startswith("implementation-drafter-adapter-method-"):
+                                task["status"] = "done"
+                                task["completed_at"] = "2026-05-10T00:02:00+0000"
+                        helper.write_jsonl(repair_done_root / "tasks.jsonl", implementation_done_tasks)
+                        helper.append_result(
+                            repair_done_root,
+                            run_id="supervisor-focused-test-adapter-method-unit",
+                            status="keep",
+                            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                            hypothesis="adapter method implementation unit pass",
+                            commit="abc123",
+                            notes="focused test passed adapter",
+                        )
+                        adapter_state = helper.drafter_bottleneck_state(repair_done_root)
+                        assert adapter_state["state"] == "adapter_method_implementation_done"
+                        assert adapter_state["next_step"] == "seed_adapter_calibration_canary"
+                        adapter_tasks = helper.drafter_bottleneck_next_tasks(
+                            repair_done_root,
+                            helper.result_rows(repair_done_root),
+                            123466,
+                            reason="unit adapter route",
+                        )
+                        assert len(adapter_tasks) == 1
+                        assert adapter_tasks[0]["id"] == "adapter-drafter-calibration-canary-current"
+                        assert adapter_tasks[0]["calibration_mode"] == "adapter-logit-distillation"
                         synthesized_route = helper.synthesis_deliberate_action_tasks(
                             repair_done_root,
                             helper.result_rows(repair_done_root),
@@ -1723,13 +1750,18 @@ def main() -> int:
                     key=lambda path: path.stat().st_mtime_ns,
                 ).read_text(encoding="utf-8")
             )
-            assert handoff_report["seeded_bridge"] is True
-            assert "handoff-audit-deterministic-bridge" in "\n".join(handoff_report["ready_deterministic_tasks"])
+            assert handoff_report["seeded_bridge"] is False
+            assert handoff_report["seeded_prerequisite"] or handoff_report["seeded_expansion"]
+            assert handoff_report["ready_deterministic_tasks"]
             bridge_tasks = helper.read_jsonl(root / "tasks.jsonl")
-            bridge = next(task for task in bridge_tasks if str(task["id"]).startswith("handoff-audit-deterministic-bridge-"))
-            assert "canary_only" in bridge["guard_checks"]
-            assert bridge["acceptance"]
-            assert bridge["rollback"]
+            seeded_ready = [
+                task
+                for task in bridge_tasks
+                if task.get("status") == "ready" and helper.is_deterministic_research_task(task)
+            ]
+            assert seeded_ready
+            assert all(task.get("acceptance") for task in seeded_ready)
+            assert all(task.get("rollback") for task in seeded_ready)
             for task in bridge_tasks:
                 task["status"] = "done"
             helper.write_jsonl(root / "tasks.jsonl", bridge_tasks)
@@ -1756,6 +1788,7 @@ def main() -> int:
                 "handoff-audit-drafter-calibration-canary-" in handoff_ready
                 or "frontier-expansion-dflash-candidate-search-" in handoff_ready
                 or "frontier-expansion-janq-adapter-path-" in handoff_ready
+                or "frontier-expansion-mtp-verify-cache-" in handoff_ready
             )
             handoff_tasks = helper.read_jsonl(root / "tasks.jsonl")
             for task in handoff_tasks:

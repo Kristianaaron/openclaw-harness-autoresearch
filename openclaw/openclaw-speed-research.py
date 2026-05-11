@@ -69,6 +69,9 @@ DEFAULT_MTP_CALIBRATOR_SCRIPT = (
 CALIBRATION_MEMORY_STAGES = ("metadata", "drafter-load", "target-load", "combined-load", "micro-step")
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
 CALIBRATION_TRACE_DISTILLATION_MODE = "trace-distillation"
+CALIBRATION_DIRECT_MODE = "direct-pre-projection"
+CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
+CALIBRATION_MODES = {CALIBRATION_DIRECT_MODE, CALIBRATION_ADAPTER_MODE}
 CALIBRATION_CANARY_TERMINAL_BLOCKERS = {
     "calibration-runtime-missing-speculative",
     CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
@@ -1816,6 +1819,15 @@ def parse_note_fields(notes: str) -> dict[str, str]:
     return fields
 
 
+def calibration_mode(value: Any = None) -> str:
+    mode = str(value or CALIBRATION_DIRECT_MODE)
+    return mode if mode in CALIBRATION_MODES else CALIBRATION_DIRECT_MODE
+
+
+def calibration_task_mode(task: dict[str, Any]) -> str:
+    return calibration_mode(task.get("calibration_mode"))
+
+
 def calibration_memory_stage_name(task: dict[str, Any]) -> str:
     if str(task.get("supervisor_action", "")) != "drafter-calibration-memory-stage":
         return ""
@@ -1832,6 +1844,13 @@ def calibration_memory_stage_name(task: dict[str, Any]) -> str:
     return ""
 
 
+def calibration_memory_stage_key(task: dict[str, Any]) -> str:
+    stage = calibration_memory_stage_name(task)
+    if not stage:
+        return ""
+    return f"{calibration_task_mode(task)}:{stage}"
+
+
 def active_calibration_memory_stage_tasks(root: Path) -> list[dict[str, Any]]:
     return [
         task
@@ -1840,27 +1859,63 @@ def active_calibration_memory_stage_tasks(root: Path) -> list[dict[str, Any]]:
     ]
 
 
-def completed_calibration_memory_stages(root: Path, *, recent_rows: int = 600) -> set[str]:
+def completed_calibration_memory_stages(
+    root: Path,
+    *,
+    recent_rows: int = 600,
+    calibration_mode_filter: str = CALIBRATION_DIRECT_MODE,
+) -> set[str]:
+    mode_filter = calibration_mode(calibration_mode_filter)
     completed: set[str] = set()
     for row in result_rows(root)[-max(1, recent_rows) :]:
         if row.get("status") != "keep":
             continue
         run_id = row.get("run_id", "")
         notes = row.get("notes", "")
+        fields = parse_note_fields(notes)
+        row_mode = calibration_mode(fields.get("calibration_mode"))
+        if row_mode != mode_filter:
+            continue
         for stage in CALIBRATION_MEMORY_STAGES:
             if run_id.startswith(f"drafter-calibration-memory-stage-{stage}-"):
                 completed.add(stage)
             elif run_id.startswith("supervisor-drafter-calibration-memory-stage-"):
-                if parse_note_fields(notes).get("stage") == stage:
+                if fields.get("stage") == stage:
                     completed.add(stage)
     return completed
 
 
-def first_seedable_calibration_memory_stage(root: Path) -> str:
-    active = {calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)}
+def completed_calibration_memory_stage_keys(root: Path, *, recent_rows: int = 600) -> set[str]:
+    keys: set[str] = set()
+    for mode in CALIBRATION_MODES:
+        keys.update(
+            f"{mode}:{stage}"
+            for stage in completed_calibration_memory_stages(
+                root,
+                recent_rows=recent_rows,
+                calibration_mode_filter=mode,
+            )
+        )
+    return keys
+
+
+def first_seedable_calibration_memory_stage(
+    root: Path,
+    *,
+    calibration_mode_filter: str = CALIBRATION_DIRECT_MODE,
+) -> str:
+    mode_filter = calibration_mode(calibration_mode_filter)
+    active = {
+        calibration_memory_stage_name(task)
+        for task in active_calibration_memory_stage_tasks(root)
+        if calibration_task_mode(task) == mode_filter
+    }
     if active:
         return ""
-    completed = completed_calibration_memory_stages(root)
+    completed = completed_calibration_memory_stages(
+        root,
+        calibration_mode_filter=mode_filter,
+    )
     for stage in CALIBRATION_MEMORY_STAGES:
         if stage not in completed:
             return stage
@@ -1870,7 +1925,7 @@ def first_seedable_calibration_memory_stage(root: Path) -> str:
 def calibration_stage_duplicate_count(root: Path) -> int:
     counts: dict[str, int] = {}
     for task in active_calibration_memory_stage_tasks(root):
-        stage = calibration_memory_stage_name(task)
+        stage = calibration_memory_stage_key(task)
         counts[stage] = counts.get(stage, 0) + 1
     return sum(max(0, count - 1) for count in counts.values())
 
@@ -1883,7 +1938,7 @@ def compact_duplicate_calibration_stage_tasks(root: Path) -> int:
     for index, task in enumerate(tasks):
         if task.get("status", "ready") not in {"ready", "rework"}:
             continue
-        stage = calibration_memory_stage_name(task)
+        stage = calibration_memory_stage_key(task)
         if not stage:
             continue
         if stage not in keep_by_stage:
@@ -1893,7 +1948,8 @@ def compact_duplicate_calibration_stage_tasks(root: Path) -> int:
         task["blocked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         task["supervisor_summary"] = {
             "reason": "duplicate calibration memory stage suppressed",
-            "stage": stage,
+            "stage": calibration_memory_stage_name(task),
+            "calibration_mode": calibration_task_mode(task),
             "kept_task_id": tasks[keep_by_stage[stage]].get("id", ""),
         }
         compacted += 1
@@ -2001,16 +2057,16 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     existing = read_jsonl(path)
     existing_by_id = {str(task.get("id", "")): index for index, task in enumerate(existing)}
     active_stage_keys = {
-        calibration_memory_stage_name(task)
+        calibration_memory_stage_key(task)
         for task in existing
-        if task.get("status", "ready") in {"ready", "rework"} and calibration_memory_stage_name(task)
+        if task.get("status", "ready") in {"ready", "rework"} and calibration_memory_stage_key(task)
     }
-    completed_stages = completed_calibration_memory_stages(root)
+    completed_stages = completed_calibration_memory_stage_keys(root)
     additions = 0
     changed = False
     for task in tasks:
         task_id = str(task.get("id", ""))
-        stage_key = calibration_memory_stage_name(task)
+        stage_key = calibration_memory_stage_key(task)
         if stage_key and (stage_key in active_stage_keys or stage_key in completed_stages):
             continue
         if task_id not in existing_by_id:
@@ -2207,7 +2263,14 @@ def drafter_trace_collect_task(timestamp: int, *, task_id: str, priority: int = 
     }
 
 
-def drafter_calibration_canary_task(timestamp: int, *, task_id: str, priority: int = 98) -> dict[str, Any]:
+def drafter_calibration_canary_task(
+    timestamp: int,
+    *,
+    task_id: str,
+    priority: int = 98,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
+) -> dict[str, Any]:
+    mode = calibration_mode(calibration_mode_value)
     return {
         "id": task_id,
         "status": "ready",
@@ -2215,6 +2278,7 @@ def drafter_calibration_canary_task(timestamp: int, *, task_id: str, priority: i
         "lane": "drafter-alignment",
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-canary",
+        "calibration_mode": mode,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-drafter-fit.py"],
         "hypothesis": "Once JANQ target traces exist, drafter calibration should advance through a bounded canary gate instead of repeating trace checks.",
@@ -2222,7 +2286,7 @@ def drafter_calibration_canary_task(timestamp: int, *, task_id: str, priority: i
         "guard_checks": ["memory_gate", "canary_only", "tests_pass", "no_live_profile_change", "no_opencode_changes"],
         "acceptance": "A canary artifact validates trace data, fit-plan gates, cheap drafter tests, and the exact bounded calibration command.",
         "rollback": "No runtime rollback needed; no model profile or drafter path is changed by this canary.",
-        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-calibration-canary",
+        "next_action": f"/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-calibration-canary --calibration-mode {mode}",
     }
 
 
@@ -2232,7 +2296,9 @@ def drafter_calibration_run_task(
     task_id: str,
     bounded_command: list[str],
     priority: int = 97,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> dict[str, Any]:
+    mode = calibration_mode(calibration_mode_value)
     return {
         "id": task_id,
         "status": "ready",
@@ -2240,6 +2306,7 @@ def drafter_calibration_run_task(
         "lane": "drafter-alignment",
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-run",
+        "calibration_mode": mode,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-jang-vlm-server.py"],
         "hypothesis": "A validated JANQ trace canary should advance into exactly one bounded calibration experiment.",
@@ -2260,9 +2327,11 @@ def calibration_probe_command(
     drafter_path: str,
     output_path: Path,
     prompts_path: Path,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> list[str]:
     script = os.environ.get("OPENCLAW_MTP_CALIBRATOR_SCRIPT", DEFAULT_MTP_CALIBRATOR_SCRIPT)
-    return [
+    mode = calibration_mode(calibration_mode_value)
+    command = [
         calibration_python(),
         script,
         "--target-path",
@@ -2300,6 +2369,9 @@ def calibration_probe_command(
         "--probe-stage",
         stage,
     ]
+    if mode != CALIBRATION_DIRECT_MODE:
+        command.extend(["--calibration-mode", mode])
+    return command
 
 
 def calibration_full_run_command(
@@ -2308,9 +2380,11 @@ def calibration_full_run_command(
     drafter_path: str,
     output_path: Path,
     prompts_path: Path,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> list[str]:
     script = os.environ.get("OPENCLAW_MTP_CALIBRATOR_SCRIPT", DEFAULT_MTP_CALIBRATOR_SCRIPT)
-    return [
+    mode = calibration_mode(calibration_mode_value)
+    command = [
         calibration_python(),
         script,
         "--target-path",
@@ -2346,6 +2420,9 @@ def calibration_full_run_command(
         "--target-trace-policy",
         "stop-gradient",
     ]
+    if mode != CALIBRATION_DIRECT_MODE:
+        command.extend(["--calibration-mode", mode])
+    return command
 
 
 def drafter_trace_distillation_run_task(
@@ -2399,7 +2476,9 @@ def calibration_stage_helper_command(
     output_dir: str,
     min_traces: int = 4,
     max_prompts: int = 6,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> list[str]:
+    mode = calibration_mode(calibration_mode_value)
     command = [
         "/Users/kristian/.openclaw/bin/openclaw-speed-research",
         "drafter-calibration-memory-stage",
@@ -2413,6 +2492,8 @@ def calibration_stage_helper_command(
         str(min_traces),
         "--max-prompts",
         str(max_prompts),
+        "--calibration-mode",
+        mode,
     ]
     if trace_data:
         command.extend(["--trace-data", trace_data])
@@ -2436,7 +2517,9 @@ def drafter_calibration_memory_stage_task(
     task_id: str,
     bounded_command: list[str],
     priority: int = 98,
+    calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> dict[str, Any]:
+    mode = calibration_mode(calibration_mode_value)
     return {
         "id": task_id,
         "status": "ready",
@@ -2444,6 +2527,7 @@ def drafter_calibration_memory_stage_task(
         "lane": "drafter-alignment",
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-memory-stage",
+        "calibration_mode": mode,
         "stage": stage,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-speed-research.py"],
@@ -2675,6 +2759,17 @@ def drafter_bottleneck_state(
             recent_rows=max(240, recent_rows),
         )
     )
+    adapter_calibration_active = any(
+        task.get("status", "ready") in {"ready", "rework"}
+        and calibration_task_mode(task) == CALIBRATION_ADAPTER_MODE
+        and str(task.get("supervisor_action", "")).startswith("drafter-calibration")
+        for task in read_jsonl(root / "tasks.jsonl")
+    )
+    adapter_calibration_attempted = adapter_calibration_active or any(
+        "calibration_mode=adapter-logit-distillation" in row.get("notes", "")
+        or "adapter-logit-distillation" in row.get("run_id", "")
+        for row in window
+    )
     fallback_decode_count = recent_lane_contract_decode_fallback_count(root, recent_rows=min(recent_rows, 80))
     historical_bottleneck = (
         blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
@@ -2686,6 +2781,7 @@ def drafter_bottleneck_state(
         or adapter_contract_attempted
         or adapter_contract_succeeded
         or adapter_implementation_attempted
+        or adapter_calibration_attempted
     )
 
     if not historical_bottleneck:
@@ -2694,6 +2790,15 @@ def drafter_bottleneck_state(
     elif active_adapter_implementation:
         state = "adapter_method_implementation_active"
         next_step = "wait_for_adapter_method_implementation"
+    elif adapter_calibration_active:
+        state = "adapter_calibration_active"
+        next_step = "wait_for_adapter_calibration"
+    elif adapter_calibration_attempted:
+        state = "adapter_calibration_attempted"
+        next_step = "wait_for_adapter_calibration_result"
+    elif adapter_implementation_attempted:
+        state = "adapter_method_implementation_done"
+        next_step = "seed_adapter_calibration_canary"
     elif adapter_contract_succeeded:
         state = "adapter_method_contract_ready"
         next_step = "seed_adapter_method_implementation"
@@ -2750,6 +2855,8 @@ def drafter_bottleneck_state(
         "adapter_method_contract_succeeded": adapter_contract_succeeded,
         "adapter_method_implementation_active": active_adapter_implementation,
         "adapter_method_implementation_attempted": adapter_implementation_attempted,
+        "adapter_calibration_active": adapter_calibration_active,
+        "adapter_calibration_attempted": adapter_calibration_attempted,
         "fallback_decode_count": fallback_decode_count,
     }
 
@@ -2915,6 +3022,22 @@ def drafter_bottleneck_next_tasks(
         return filter_seedable_tasks(
             root,
             [drafter_adapter_method_implementation_task(timestamp)],
+        )
+    if step == "seed_adapter_calibration_canary":
+        if active_task_has_prefix(root, "adapter-drafter-calibration-canary-"):
+            return []
+        if recent_result_has_prefix(root, "adapter-drafter-calibration-canary-", recent_rows=240):
+            return []
+        return filter_seedable_tasks(
+            root,
+            [
+                drafter_calibration_canary_task(
+                    timestamp,
+                    task_id="adapter-drafter-calibration-canary-current",
+                    priority=99,
+                    calibration_mode_value=CALIBRATION_ADAPTER_MODE,
+                )
+            ],
         )
     return []
 
@@ -6211,6 +6334,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
     timestamp = int(time.time())
+    mode = calibration_mode(getattr(args, "calibration_mode", CALIBRATION_DIRECT_MODE))
     plan_path = Path(args.plan).expanduser()
     trace_paths = existing_drafter_trace_paths()
     trace_path = Path(args.trace_data).expanduser() if args.trace_data else (trace_paths[0] if trace_paths else None)
@@ -6286,6 +6410,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         drafter_path=drafter_path,
         output_path=calibrated_output,
         prompts_path=prompts_path,
+        calibration_mode_value=mode,
     )
     status = "keep" if not failures else "blocked"
     report = {
@@ -6302,6 +6427,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "prompts_file": str(prompts_path) if prompts else "",
         "test_result": test_result,
         "bounded_calibration_command": bounded_command,
+        "calibration_mode": mode,
         "memory_before_mb": before_memory,
         "memory_after_mb": memory_snapshot(),
         "timestamp": timestamp,
@@ -6319,6 +6445,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
             output_dir=str(output_dir),
             min_traces=int(args.min_traces),
             max_prompts=int(args.max_prompts),
+            calibration_mode_value=mode,
         )
         seeded_stage_task = upsert_tasks(
             root,
@@ -6328,6 +6455,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
                     stage=stage,
                     task_id=f"drafter-calibration-memory-stage-{stage}-{timestamp}",
                     bounded_command=stage_command,
+                    calibration_mode_value=mode,
                 )
             ],
         )
@@ -6357,6 +6485,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         commit=current_commit(repo_root()),
         notes=(
             f"decision={report['decision']} trace_rows={len(trace_rows)} "
+            f"calibration_mode={mode} "
             f"test_ok={test_result.get('ok')} failures={len(failures)} seeded_stage_task={seeded_stage_task}"
         ),
     )
@@ -6369,6 +6498,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
     ensure_research_state(root)
     timestamp = int(time.time())
     stage = str(args.stage)
+    mode = calibration_mode(getattr(args, "calibration_mode", CALIBRATION_DIRECT_MODE))
     plan_path = Path(args.plan).expanduser()
     trace_paths = existing_drafter_trace_paths()
     trace_path = Path(args.trace_data).expanduser() if args.trace_data else (trace_paths[0] if trace_paths else None)
@@ -6414,6 +6544,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
         drafter_path=drafter_path,
         output_path=stage_output,
         prompts_path=prompts_path,
+        calibration_mode_value=mode,
     )
     timeout = {
         "metadata": 90.0,
@@ -6454,8 +6585,15 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
     status = "keep" if not failures and returncode == 0 else "blocked"
     next_stage = ""
     if status == "keep":
-        completed = completed_calibration_memory_stages(root) | {stage}
-        active = {calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)}
+        completed = completed_calibration_memory_stages(
+            root,
+            calibration_mode_filter=mode,
+        ) | {stage}
+        active = {
+            calibration_memory_stage_name(task)
+            for task in active_calibration_memory_stage_tasks(root)
+            if calibration_task_mode(task) == mode
+        }
         for candidate in CALIBRATION_MEMORY_STAGES:
             if candidate in completed or candidate in active:
                 continue
@@ -6471,6 +6609,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
             output_dir=str(output_dir),
             min_traces=int(args.min_traces),
             max_prompts=int(args.max_prompts),
+            calibration_mode_value=mode,
         )
         seeded_next_stage = upsert_tasks(
             root,
@@ -6480,6 +6619,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
                     stage=next_stage,
                     task_id=f"drafter-calibration-memory-stage-{next_stage}-{timestamp}",
                     bounded_command=next_command,
+                    calibration_mode_value=mode,
                 )
             ],
         )
@@ -6490,6 +6630,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
             drafter_path=drafter_path,
             output_path=calibrated_output,
             prompts_path=prompts_path,
+            calibration_mode_value=mode,
         )
         seeded_run_task = upsert_tasks(
             root,
@@ -6498,6 +6639,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
                     timestamp,
                     task_id=f"drafter-calibration-run-{timestamp}",
                     bounded_command=run_command,
+                    calibration_mode_value=mode,
                 )
             ],
         )
@@ -6514,6 +6656,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
         "decision": decision,
         "failures": failures,
         "command": command,
+        "calibration_mode": mode,
         "returncode": returncode,
         "output_tail": stdout[-1600:],
         "stage_output": str(stage_output),
@@ -6549,6 +6692,7 @@ def drafter_calibration_memory_stage(args: argparse.Namespace) -> int:
         commit=current_commit(repo_root()),
         notes=(
             f"stage={stage} decision={decision} failures={','.join(failures) or 'none'} "
+            f"calibration_mode={mode} "
             f"blocker={CALIBRATION_QUANTIZED_GRADIENT_BLOCKER if CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in failures else ''} "
             f"seeded_next_stage={seeded_next_stage} seeded_run_task={seeded_run_task}"
         ),
@@ -7256,6 +7400,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     terminal_handoff_exhausted = False
     bridge_zero = recent_empty_bridge_rows(root, rows, recent_rows=120)
     bridge_only_ready = bool(deterministic_ready) and all(is_implementation_bridge_task(task) for task in deterministic_ready)
+    canonical = canonical_autoresearch_state(root, recent_rows=120)
+    canonical_state = str(canonical.get("state", ""))
     if not deterministic_ready or (bridge_only_ready and bridge_zero):
         if bridge_zero:
             prerequisite_tasks = concrete_handoff_prerequisite_tasks(root, rows, timestamp)
@@ -7270,6 +7416,23 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
                     rows,
                     timestamp,
                     reason="Implementation handoff found an empty bridge and no concrete handoff prerequisite",
+                )
+                seeded_fallback = bool(upsert_tasks(root, fallback_tasks))
+                seeded_prerequisite = seeded_fallback
+            terminal_handoff_exhausted = not seeded_prerequisite
+        elif canonical_state in {"blocked_until_external_change", "plateau_detected", "prerequisite_needed"}:
+            prerequisite_tasks = concrete_handoff_prerequisite_tasks(root, rows, timestamp)
+            seeded_prerequisite = bool(upsert_tasks(root, prerequisite_tasks))
+            if not seeded_prerequisite:
+                expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
+                seeded_expansion = bool(upsert_tasks(root, expansion_tasks))
+                seeded_prerequisite = seeded_expansion
+            if not seeded_prerequisite:
+                fallback_tasks = lane_contract_fallback_tasks(
+                    root,
+                    rows,
+                    timestamp,
+                    reason=f"Implementation handoff reached canonical {canonical_state} without ready work",
                 )
                 seeded_fallback = bool(upsert_tasks(root, fallback_tasks))
                 seeded_prerequisite = seeded_fallback
@@ -8917,6 +9080,11 @@ def main() -> int:
     calibration_canary.add_argument("--output-dir", default="/Users/kristian/.openclaw/drafter-fit")
     calibration_canary.add_argument("--min-traces", type=int, default=4)
     calibration_canary.add_argument("--max-prompts", type=int, default=6)
+    calibration_canary.add_argument(
+        "--calibration-mode",
+        choices=sorted(CALIBRATION_MODES),
+        default=CALIBRATION_DIRECT_MODE,
+    )
     calibration_canary.add_argument("--test-timeout", type=float, default=60.0)
     calibration_canary.add_argument("--skip-test", action="store_true")
     calibration_canary.set_defaults(func=drafter_calibration_canary)
@@ -8931,6 +9099,11 @@ def main() -> int:
     calibration_stage.add_argument("--output-dir", default="/Users/kristian/.openclaw/drafter-fit")
     calibration_stage.add_argument("--min-traces", type=int, default=4)
     calibration_stage.add_argument("--max-prompts", type=int, default=6)
+    calibration_stage.add_argument(
+        "--calibration-mode",
+        choices=sorted(CALIBRATION_MODES),
+        default=CALIBRATION_DIRECT_MODE,
+    )
     calibration_stage.set_defaults(func=drafter_calibration_memory_stage)
 
     dflash_gate = sub.add_parser("dflash-compatibility-gate")

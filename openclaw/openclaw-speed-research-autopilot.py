@@ -3196,6 +3196,9 @@ def run_supervisor_drafter_calibration_canary_task(
     log_file: Path,
 ) -> tuple[int, str]:
     cmd = [args.research_helper_bin, "drafter-calibration-canary"]
+    mode = str(task.get("calibration_mode", "")).strip()
+    if mode:
+        cmd.extend(["--calibration-mode", mode])
     with log_file.open("a", encoding="utf-8") as file:
         file.write(
             f"\n===== cycle {cycle} session {session} supervisor drafter calibration canary "
