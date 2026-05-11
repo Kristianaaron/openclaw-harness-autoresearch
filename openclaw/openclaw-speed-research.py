@@ -1223,6 +1223,216 @@ def self_improve(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown self-improve action: {args.action}")
 
 
+def latest_watchdog_artifact(root: Path) -> dict[str, Any]:
+    path = root / "watchdog" / "autoresearch-watchdog-latest.json"
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    """Score whether the sidecar can replace manual health-check/repair work.
+
+    The score is intentionally artifact-based. LLM ideas can feed the sidecar,
+    but this eval only rewards durable evidence: review artifacts, canary-only
+    evolution, shadow/replay records, rollback containment, and zero active
+    mutation of live skills or runtimes.
+    """
+    ensure_research_state(root)
+    try:
+        self_improvement = load_self_improvement_module()
+        self_improvement.ensure_self_improvement_state(root)
+        status = self_improvement.status(root)
+    except RuntimeError as error:
+        return {
+            "ok": False,
+            "kind": "self-improvement-alive-eval",
+            "timestamp": int(time.time()),
+            "total_score": 0,
+            "readiness": "missing",
+            "reason": str(error),
+            "gates": {"sidecar_installed": False},
+            "hard_gate_failures": ["sidecar_installed"],
+            "components": {},
+            "next": "install openclaw_self_improvement.py next to the research helper",
+        }
+    required_skills = {
+        "decode-speed-research",
+        "implementation-gate",
+        "reviewer-quality",
+        "self-improvement-curator",
+    }
+    skills = set(str(item) for item in status.get("skills", []))
+    latest_quality = latest_json_artifact(root, "quality-review-*.json")
+    latest_frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
+    latest_autonomy = latest_json_artifact(root, "frontier-autonomy-score-*.json")
+    latest_handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
+    latest_burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
+    latest_watchdog = latest_watchdog_artifact(root)
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    bad_rows = recent_bad_behavior_rows(root, recent_rows=recent_rows)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    deterministic_ready = [task for task in ready_tasks if is_deterministic_research_task(task)]
+    last_evolution = status.get("last_evolution") if isinstance(status.get("last_evolution"), dict) else {}
+    last_summary = status.get("last_summary") if isinstance(status.get("last_summary"), dict) else {}
+    usage = status.get("usage") if isinstance(status.get("usage"), dict) else {}
+    all_usage_recorded = all(
+        isinstance(usage.get(skill), dict) and int(usage[skill].get("use_count") or 0) > 0
+        for skill in required_skills
+    )
+    decisions = int(status.get("decisions") or 0)
+    held_variants = int(status.get("held_variants") or 0)
+    shadow_reviews = int(status.get("shadow_reviews") or 0)
+    promotions = int(status.get("promotions") or 0)
+    rollbacks = int(status.get("rollbacks") or 0)
+    rolled_back = int(status.get("rolled_back_promotions") or 0)
+    active_skill_mutated = bool(last_evolution.get("active_skill_mutated"))
+    evolution_generated = isinstance(last_evolution.get("decisions"), dict) and int(
+        last_evolution["decisions"].get("generated") or 0
+    ) > 0
+    gates = {
+        "sidecar_installed": True,
+        "required_skills_present": required_skills.issubset(skills),
+        "durable_memory_present": int(status.get("lessons") or 0) > 0
+        and int(status.get("trajectories") or 0) > 0
+        and int(status.get("proposals") or 0) > 0,
+        "eval_cases_present": int(status.get("eval_cases") or 0) > 0,
+        "evolution_canaries_present": decisions > 0 and held_variants > 0,
+        "shadow_review_present": shadow_reviews > 0,
+        "staged_or_rollback_awareness": promotions > 0 or rollbacks > 0 or rolled_back > 0,
+        "no_active_skill_mutation": not active_skill_mutated,
+        "review_artifacts_present": bool(latest_quality) and bool(latest_frontier) and bool(latest_handoff),
+        "autonomy_gate_present": bool(latest_autonomy),
+        "stability_evidence_present": bool(latest_burn_in),
+        "watchdog_or_route_present": bool(latest_watchdog) or bool(deterministic_ready),
+        "canonical_clean": bool(canonical.get("clean")),
+        "zero_active_noise": all(int(noise.get(key, 0) or 0) == 0 for key in noise),
+        "no_bad_behavior_rows": not bad_rows,
+        "skills_used": all_usage_recorded,
+    }
+    components = {
+        "observe": 20
+        if gates["review_artifacts_present"] and gates["watchdog_or_route_present"]
+        else 12
+        if gates["review_artifacts_present"]
+        else 0,
+        "diagnose": 20
+        if gates["autonomy_gate_present"] and gates["canonical_clean"] and gates["zero_active_noise"]
+        else 10
+        if gates["canonical_clean"]
+        else 0,
+        "route_and_repair": 20
+        if deterministic_ready or str(latest_watchdog.get("decision", "")) in {
+            "healthy",
+            "seed-next-candidate",
+            "repair-routing",
+            "autonomy-repair",
+            "frontier-repair",
+            "self-improvement-repair",
+        }
+        else 0,
+        "evolve": 20
+        if gates["durable_memory_present"] and gates["eval_cases_present"] and gates["evolution_canaries_present"] and gates["shadow_review_present"]
+        else 12
+        if gates["durable_memory_present"] and gates["eval_cases_present"]
+        else 0,
+        "containment": 20
+        if gates["no_active_skill_mutation"] and gates["staged_or_rollback_awareness"] and gates["no_bad_behavior_rows"]
+        else 10
+        if gates["no_active_skill_mutation"]
+        else 0,
+    }
+    total = int(sum(components.values()))
+    hard_gate_failures = [
+        key
+        for key in (
+            "sidecar_installed",
+            "required_skills_present",
+            "no_active_skill_mutation",
+            "canonical_clean",
+            "zero_active_noise",
+            "no_bad_behavior_rows",
+        )
+        if not gates.get(key)
+    ]
+    readiness = (
+        "frontier-alive"
+        if total >= 95 and not hard_gate_failures
+        else "operational"
+        if total >= 80 and not hard_gate_failures
+        else "warming"
+        if total >= 60
+        else "needs-repair"
+    )
+    return {
+        "ok": total >= 95 and not hard_gate_failures,
+        "kind": "self-improvement-alive-eval",
+        "timestamp": int(time.time()),
+        "total_score": total,
+        "readiness": readiness,
+        "components": components,
+        "gates": gates,
+        "hard_gate_failures": hard_gate_failures,
+        "status": {
+            "lessons": status.get("lessons", 0),
+            "trajectories": status.get("trajectories", 0),
+            "proposals": status.get("proposals", 0),
+            "eval_cases": status.get("eval_cases", 0),
+            "decisions": decisions,
+            "held_variants": held_variants,
+            "shadow_reviews": shadow_reviews,
+            "promotions": promotions,
+            "rollbacks": rollbacks,
+            "rolled_back_promotions": rolled_back,
+            "skills": sorted(skills),
+        },
+        "evidence": {
+            "quality": latest_quality.get("_artifact_path", ""),
+            "frontier": latest_frontier.get("_artifact_path", ""),
+            "autonomy": latest_autonomy.get("_artifact_path", ""),
+            "handoff": latest_handoff.get("_artifact_path", ""),
+            "burn_in": latest_burn_in.get("_artifact_path", ""),
+            "watchdog_decision": latest_watchdog.get("decision", ""),
+            "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic_ready[:8]],
+            "bad_behavior_rows": [row.get("run_id", "") for row in bad_rows[:8]],
+            "last_evolution_generated": evolution_generated,
+            "last_summary": last_summary,
+        },
+        "next": (
+            "allow autonomous repair/promotion gates to proceed"
+            if total >= 95 and not hard_gate_failures
+            else "run self-improve curate/evolve plus quality/frontier/autonomy review before promotion"
+        ),
+    }
+
+
+def alive_eval(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    report = self_improvement_alive_report(root, recent_rows=args.recent_rows)
+    path = root / "benchmarks" / f"self-improvement-alive-eval-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"self-improvement-alive-eval-{report['timestamp']}",
+        status="keep" if report["ok"] else "blocked",
+        target="autoresearch-self-improvement-alive",
+        hypothesis="self-improvement should autonomously observe, diagnose, route, canary, review, and contain its own upgrades",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"score={report['total_score']} readiness={report['readiness']} "
+            f"failures={','.join(report['hard_gate_failures'])} path={path}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if report["ok"] or args.allow_fail else 2
+
+
 def add_source(args: argparse.Namespace) -> int:
     root = workspace_root()
     sources = root / "sources"
@@ -1437,6 +1647,8 @@ CERTIFICATION_TARGETS = {
     "autoresearch-quality",
     "autoresearch-frontier-eval",
     "autoresearch-frontier-certification",
+    "autoresearch-self-improvement-alive",
+    "frontier-autonomy-score",
 }
 
 
@@ -5244,6 +5456,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     contract = task_contract_report(root)
     artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
     burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
+    alive = self_improvement_alive_report(root, recent_rows=recent_rows)
     burn_in_gates = burn_in.get("gates") if isinstance(burn_in.get("gates"), dict) else {}
     burn_in_ok = bool(burn_in.get("ok")) and bool(burn_in_gates) and all(
         bool(value) for value in burn_in_gates.values()
@@ -5403,6 +5616,16 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     if any(row.get("run_id", "").startswith("gepa-policy-promotion-") for row in recent):
         scores["self_improvement"] += 0.2
         strengths.append("GEPA reviewer policy path is active")
+    alive_score = float(alive.get("total_score") or 0.0)
+    if alive_score >= 95.0 and alive.get("ok"):
+        scores["self_improvement"] += 0.7
+        strengths.append("self-improvement alive eval proves observe/diagnose/route/evolve/contain loop")
+    elif alive_score >= 80.0:
+        scores["self_improvement"] += 0.2
+        gaps.append(f"self-improvement alive eval is operational but not frontier score={alive_score}")
+    else:
+        scores["self_improvement"] -= 1.0
+        gaps.append(f"self-improvement alive eval below operational floor score={alive_score}")
     if burn_in_ok:
         scores["karpathy_core_loop"] += 0.4
         scores["crash_memory_safety"] += 0.4
@@ -5440,6 +5663,9 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         and scores["crash_memory_safety"] >= 9.5
         and scores["research_quality"] >= 9.4
         and scores["implementation_handoff"] >= 9.5
+        and scores["self_improvement"] >= 9.5
+        and alive_score >= 95.0
+        and alive.get("ok")
         and latest_quality_score is not None
         and latest_quality_score >= 95.0
         and latest_scorecard_overall is not None
@@ -5468,6 +5694,8 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
             "safety_at_least_9_5": scores["crash_memory_safety"] >= 9.5,
             "research_quality_at_least_9_4": scores["research_quality"] >= 9.4,
             "implementation_handoff_at_least_9_5": scores["implementation_handoff"] >= 9.5,
+            "self_improvement_at_least_9_5": scores["self_improvement"] >= 9.5,
+            "alive_eval_at_least_95": alive_score >= 95.0 and bool(alive.get("ok")),
             "latest_quality_score_at_least_95": latest_quality_score is not None and latest_quality_score >= 95.0,
             "latest_quality_scorecard_at_least_95": latest_scorecard_overall is not None and latest_scorecard_overall >= 95.0,
             "latest_quality_healthy": latest_quality_verdict == "healthy",
@@ -5508,6 +5736,7 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
         "task_contract": contract,
         "measurement_artifact": artifact,
         "stability_burn_in": burn_in,
+        "self_improvement_alive": alive,
         "strengths": strengths,
         "gaps": gaps,
         "next": (
@@ -9310,6 +9539,11 @@ def main() -> int:
         default="advisory",
     )
     self_improve_parser.set_defaults(func=self_improve)
+
+    alive_parser = sub.add_parser("alive-eval")
+    alive_parser.add_argument("--recent-rows", type=int, default=160)
+    alive_parser.add_argument("--allow-fail", action="store_true")
+    alive_parser.set_defaults(func=alive_eval)
 
     prompt = sub.add_parser("prompt")
     prompt.set_defaults(func=lambda _args: print(prompt_text(workspace_root())) or 0)

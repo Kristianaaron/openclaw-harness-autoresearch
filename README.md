@@ -178,6 +178,20 @@ patches must pass Crabbox first, then local canary, then the same score gate.
 Passing promotions append to `stable-builds.jsonl`; failed or incomplete
 candidates are blocked/quarantined instead of mutating the live runtime.
 
+### Self-Improvement Alive Eval
+
+`alive-eval` scores whether the self-improvement layer is actually doing the
+manual work we were previously doing from Codex: observe health, diagnose
+quality loss, route one repair, evolve canary skills, shadow-review the change,
+and contain or roll back anything unsafe.
+
+The eval is deterministic and artifact-based. It checks durable lessons,
+trajectories, proposals, eval cases, canary variants, shadow reviews, rollback
+records, watchdog/routing evidence, zero active noise, and proof that active
+skills were not mutated directly. `frontier-eval` now includes this score, so
+the system cannot call itself frontier-level unless the self-improvement loop is
+alive enough to replace manual check-and-patch intervention.
+
 Run once:
 
 ```bash

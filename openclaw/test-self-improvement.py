@@ -196,6 +196,71 @@ def main() -> int:
         assert status_after_evolution["promotions"] >= len(promotions)
         assert status_after_evolution["rollbacks"] >= len(rollbacks)
         assert status_after_evolution["rolled_back_promotions"] >= 1
+        write_json = lambda path, payload: path.parent.mkdir(parents=True, exist_ok=True) or path.write_text(  # noqa: E731
+            json.dumps(payload) + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            root / "benchmarks" / "quality-review-1.json",
+            {
+                "kind": "quality-review",
+                "verdict": "healthy",
+                "quality_score": 100,
+                "scorecard": {"overall": 99.5, "interpretation": "high_quality_exhaustion_or_prerequisite_route"},
+            },
+        )
+        write_json(
+            root / "benchmarks" / "frontier-system-eval-1.json",
+            {
+                "kind": "frontier-system-eval",
+                "overall": 10.0,
+                "readiness": "frontier",
+                "frontier_certified": True,
+                "canonical_state": {
+                    "clean": True,
+                    "noise": {
+                        "unresolved_blocked_rows": 0,
+                        "terminal_synthesis_rows": 0,
+                        "bridge_zero_rows": 0,
+                        "memory_blocks": 0,
+                    },
+                },
+            },
+        )
+        write_json(root / "benchmarks" / "implementation-handoff-audit-1.json", {"ok": True, "score": 100})
+        write_json(root / "benchmarks" / "frontier-autonomy-score-1.json", {"ok": True, "total_score": 100})
+        write_json(
+            root / "benchmarks" / "stability-burn-in-1.json",
+            {"ok": True, "gates": {"replay_ok": True, "zero_active_noise": True}},
+        )
+        helper.write_jsonl(
+            root / "tasks.jsonl",
+            [
+                {
+                    "id": "alive-eval-deterministic-next-action",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "lane": "reviewer-quality",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research quality-review --allow-fail",
+                }
+            ],
+        )
+        (root / "results.tsv").write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        helper.append_result(
+            root,
+            run_id="frontier-system-eval-1",
+            status="keep",
+            target="autoresearch-frontier-eval",
+            hypothesis="certified checkpoint",
+            commit="unit",
+            notes="overall=10 readiness=frontier",
+        )
+        alive = helper.self_improvement_alive_report(root, recent_rows=120)
+        assert alive["ok"] is True, alive
+        assert alive["total_score"] >= 95
+        assert alive["readiness"] == "frontier-alive"
+        assert alive["gates"]["no_active_skill_mutation"] is True
+        assert alive["components"]["evolve"] == 20
 
         bad_variant = {
             "id": "bad",
