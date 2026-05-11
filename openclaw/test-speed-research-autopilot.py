@@ -438,7 +438,8 @@ def main() -> int:
         first_lock.close()
         second_lock = helper.acquire_autopilot_lock("unit-after-release")
         assert second_lock is not None
-        second_lock.close()
+        helper.release_autopilot_lock(second_lock)
+        assert not helper.AUTOPILOT_LOCK.exists()
         helper.append_interrupt_checkpoint(
             2,
             "unit-session",

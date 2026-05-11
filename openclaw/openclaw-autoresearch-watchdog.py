@@ -84,8 +84,36 @@ def autopilot_lock(root: Path) -> dict[str, Any]:
     payload = read_json(lock)
     pid = int(payload.get("pid", 0) or 0)
     payload["path"] = str(lock)
+    payload["exists"] = lock.exists()
     payload["active"] = process_alive(pid)
     return payload
+
+
+def repair_stale_autopilot_lock(root: Path) -> dict[str, Any]:
+    """Archive and remove an autopilot lock whose owner process is gone."""
+    lock_path = root / "autopilot.lock"
+    payload = read_json(lock_path)
+    pid = int(payload.get("pid", 0) or 0)
+    if not lock_path.exists() or process_alive(pid):
+        return {"repaired": False, "reason": "no stale lock"}
+    timestamp = int(time.time())
+    recovery = {
+        "kind": "stale-autopilot-lock-recovery",
+        "timestamp": timestamp,
+        "repaired": True,
+        "reason": "autopilot lock owner process is not alive",
+        "lock": payload,
+        "lock_path": str(lock_path),
+    }
+    archive = root / "watchdog" / "stale-locks" / f"autopilot-lock-{timestamp}.json"
+    write_json(archive, recovery)
+    append_jsonl(root / "watchdog" / "stale-locks.jsonl", recovery | {"archive": str(archive)})
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    recovery["archive"] = str(archive)
+    return recovery
 
 
 def latest_autopilot_log(root: Path) -> dict[str, Any]:
@@ -395,10 +423,13 @@ def watchdog_review(
     scorecard_overall = parse_float(scorecard.get("overall"))
     frontier_overall = parse_float(frontier.get("overall"))
     handoff_score = parse_float(handoff.get("score"))
+    lock_exists = bool(lock.get("exists"))
+    lock_active = bool(lock.get("active"))
+    cleanly_idle = not lock_exists and not lock_active
     gates = {
-        "autopilot_lock_active_or_cleanly_absent": bool(lock.get("active")) or not (root / "autopilot.lock").exists(),
-        "log_fresh": bool(log) and float(log.get("age_seconds", 999999)) <= max_log_stale_seconds,
-        "results_fresh": result_age is not None and result_age <= max_result_stale_seconds,
+        "autopilot_lock_active_or_cleanly_absent": lock_active or cleanly_idle,
+        "log_fresh": cleanly_idle or (bool(log) and float(log.get("age_seconds", 999999)) <= max_log_stale_seconds),
+        "results_fresh": cleanly_idle or (result_age is not None and result_age <= max_result_stale_seconds),
         "quality_healthy": quality.get("verdict") == "healthy",
         "quality_score_high": quality_score is not None and quality_score >= min_quality,
         "scorecard_high": scorecard_overall is not None and scorecard_overall >= min_scorecard,
@@ -421,6 +452,11 @@ def watchdog_review(
         severity = "critical"
         next_command = "tail -120 ~/.openclaw/research/speed/logs/$(ls -t ~/.openclaw/research/speed/logs/autopilot-*.log | head -1)"
         reason = "autopilot output stopped advancing inside the watchdog freshness window"
+    elif cleanly_idle:
+        decision = "idle-ready"
+        severity = "healthy"
+        next_command = "openclaw speed-research --max-hours 10 --cycles 80"
+        reason = "no active autopilot lock; latest artifacts are healthy enough for a fresh run"
     elif "zero_active_noise" in blockers or scorecard_overall is not None and scorecard_overall < min_scorecard:
         decision = "repair-routing"
         severity = "degraded"
@@ -495,6 +531,7 @@ def watchdog_review(
 
 def run_once(args: argparse.Namespace) -> int:
     root = workspace_root()
+    stale_lock_recovery = repair_stale_autopilot_lock(root) if args.repair_stale_lock else {"repaired": False, "reason": "disabled"}
     report = watchdog_review(
         root,
         recent=args.recent_rows,
@@ -513,6 +550,7 @@ def run_once(args: argparse.Namespace) -> int:
         "reason": "autopilot and patch-executor own task mutation and promotion gates",
         "noise_guard": "sidecar ideas are report artifacts only; duplicate live tasks are not written by watchdog",
     }
+    report["stale_lock_recovery"] = stale_lock_recovery
     out_dir = root / "watchdog"
     write_json(out_dir / "autoresearch-watchdog-latest.json", report)
     write_json(out_dir / f"autoresearch-watchdog-{report['timestamp']}.json", report)
@@ -530,6 +568,7 @@ def main() -> int:
     parser.add_argument("--min-frontier", type=float, default=9.5)
     parser.add_argument("--max-log-stale-seconds", type=float, default=300.0)
     parser.add_argument("--max-result-stale-seconds", type=float, default=600.0)
+    parser.add_argument("--repair-stale-lock", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-degraded", action="store_true")
     return run_once(parser.parse_args())
 

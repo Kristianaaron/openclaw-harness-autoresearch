@@ -171,6 +171,28 @@ def acquire_autopilot_lock(session: str) -> object | None:
     return handle
 
 
+def release_autopilot_lock(handle: object | None) -> None:
+    """Release the workspace lock and remove our lock marker if it is ours."""
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        pass
+    try:
+        payload = json.loads(AUTOPILOT_LOCK.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if int(payload.get("pid", 0) or 0) != os.getpid():
+        return
+    try:
+        AUTOPILOT_LOCK.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        log(f"warning: failed to remove autopilot lock marker: {error}")
+
+
 def results_line_count() -> int:
     try:
         return len(RESULTS.read_text(encoding="utf-8", errors="replace").splitlines())
@@ -228,10 +250,8 @@ def finalize_autopilot_interrupt(reason: str = "user interrupt") -> None:
             setattr(args, "memory_cooldown_after_stop_seconds", previous_cooldown)
     lock = INTERRUPT_CONTEXT.get("lock")
     if lock is not None:
-        try:
-            lock.close()
-        except Exception:
-            pass
+        release_autopilot_lock(lock)
+        INTERRUPT_CONTEXT["lock"] = None
 
 
 def calibration_subprocess_env() -> dict[str, str]:
@@ -4861,7 +4881,7 @@ def main() -> int:
             log(f"rotating to fresh recovery session={current_session}")
         time.sleep(args.sleep_seconds)
     log("autopilot done")
-    autopilot_lock.close()
+    release_autopilot_lock(autopilot_lock)
     INTERRUPT_CONTEXT["lock"] = None
     return 0
 

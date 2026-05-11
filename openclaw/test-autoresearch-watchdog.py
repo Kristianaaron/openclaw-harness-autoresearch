@@ -176,6 +176,31 @@ def main() -> int:
         assert any(candidate["id"] == "frontier-candidate-synthesis" for candidate in blocked_candidates)
         assert all(candidate["status"] == "advisory" for candidate in blocked_candidates)
 
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        healthy_workspace(root)
+        write_json(root / "autopilot.lock", {"pid": 999999, "session": "dead"})
+        with patch.object(helper, "process_alive", return_value=False):
+            recovery = helper.repair_stale_autopilot_lock(root)
+        assert recovery["repaired"] is True
+        assert not (root / "autopilot.lock").exists()
+        assert Path(recovery["archive"]).exists()
+        with patch.object(helper.time, "time", return_value=1778439780):
+            idle = helper.watchdog_review(
+                root,
+                recent=120,
+                target_tps=30,
+                min_quality=95,
+                min_scorecard=95,
+                min_frontier=9.5,
+                max_log_stale_seconds=1,
+                max_result_stale_seconds=1,
+            )
+        assert idle["severity"] == "healthy"
+        assert idle["decision"] == "idle-ready"
+        assert idle["gates"]["log_fresh"] is True
+        assert idle["gates"]["results_fresh"] is True
+
     print("autoresearch watchdog checks passed")
     return 0
 

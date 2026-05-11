@@ -148,6 +148,11 @@ list into each report. These candidates are evidence-linked and marked
 and patch-executor can mutate live tasks after their normal quality, canary, and
 rollback gates pass. This keeps new ideas from becoming duplicate task noise.
 
+It also repairs stale autopilot locks. If a previous autopilot process is gone
+but `autopilot.lock` still points at that dead PID, the watchdog archives the
+lock under `watchdog/stale-locks/`, removes the stale marker, and reports an
+idle-ready state instead of leaving the next run blocked by old state.
+
 Run once:
 
 ```bash
