@@ -259,6 +259,12 @@ def main() -> int:
         assert alive["ok"] is True, alive
         assert alive["total_score"] >= 95
         assert alive["readiness"] == "frontier-alive"
+        assert alive["verdict"] == "certified"
+        assert alive["gates"]["evidence_requirements_complete"] is True
+        assert all(section["passed"] for section in alive["evidence_requirements"].values())
+        assert alive["evidence_requirements"]["observe"]["evidence"]["quality"]
+        assert alive["evidence_requirements"]["diagnose"]["evidence"]["autonomy"]
+        assert alive["evidence_requirements"]["route_and_repair"]["evidence"]["deterministic_ready_tasks"]
         assert alive["gates"]["no_active_skill_mutation"] is True
         assert alive["components"]["evolve"] == 20
 

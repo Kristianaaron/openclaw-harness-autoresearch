@@ -1279,6 +1279,7 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
     tasks = read_jsonl(root / "tasks.jsonl")
     ready_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     deterministic_ready = [task for task in ready_tasks if is_deterministic_research_task(task)]
+    deterministic_ready_ids = [str(task.get("id", "")) for task in deterministic_ready[:8]]
     last_evolution = status.get("last_evolution") if isinstance(status.get("last_evolution"), dict) else {}
     last_summary = status.get("last_summary") if isinstance(status.get("last_summary"), dict) else {}
     usage = status.get("usage") if isinstance(status.get("usage"), dict) else {}
@@ -1296,6 +1297,15 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
     evolution_generated = isinstance(last_evolution.get("decisions"), dict) and int(
         last_evolution["decisions"].get("generated") or 0
     ) > 0
+    watchdog_decision = str(latest_watchdog.get("decision", ""))
+    accepted_watchdog_decisions = {
+        "healthy",
+        "seed-next-candidate",
+        "repair-routing",
+        "autonomy-repair",
+        "frontier-repair",
+        "self-improvement-repair",
+    }
     gates = {
         "sidecar_installed": True,
         "required_skills_present": required_skills.issubset(skills),
@@ -1316,34 +1326,109 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
         "no_bad_behavior_rows": not bad_rows,
         "skills_used": all_usage_recorded,
     }
+    evidence_requirements = {
+        "observe": {
+            "required": ["quality_artifact", "frontier_artifact", "handoff_artifact", "watchdog_or_route"],
+            "present": {
+                "quality_artifact": bool(latest_quality),
+                "frontier_artifact": bool(latest_frontier),
+                "handoff_artifact": bool(latest_handoff),
+                "watchdog_or_route": gates["watchdog_or_route_present"],
+            },
+            "evidence": {
+                "quality": latest_quality.get("_artifact_path", ""),
+                "frontier": latest_frontier.get("_artifact_path", ""),
+                "handoff": latest_handoff.get("_artifact_path", ""),
+                "watchdog_decision": watchdog_decision,
+                "deterministic_ready_tasks": deterministic_ready_ids,
+            },
+        },
+        "diagnose": {
+            "required": ["autonomy_artifact", "canonical_clean", "zero_active_noise"],
+            "present": {
+                "autonomy_artifact": bool(latest_autonomy),
+                "canonical_clean": gates["canonical_clean"],
+                "zero_active_noise": gates["zero_active_noise"],
+            },
+            "evidence": {
+                "autonomy": latest_autonomy.get("_artifact_path", ""),
+                "canonical_noise": noise,
+            },
+        },
+        "route_and_repair": {
+            "required": ["deterministic_ready_task_or_accepted_watchdog_decision"],
+            "present": {
+                "deterministic_ready_task_or_accepted_watchdog_decision": bool(deterministic_ready)
+                or watchdog_decision in accepted_watchdog_decisions,
+            },
+            "evidence": {
+                "watchdog_decision": watchdog_decision,
+                "accepted_watchdog_decisions": sorted(accepted_watchdog_decisions),
+                "deterministic_ready_tasks": deterministic_ready_ids,
+            },
+        },
+        "evolve": {
+            "required": ["durable_memory", "eval_cases", "canary_variants", "shadow_reviews"],
+            "present": {
+                "durable_memory": gates["durable_memory_present"],
+                "eval_cases": gates["eval_cases_present"],
+                "canary_variants": gates["evolution_canaries_present"],
+                "shadow_reviews": gates["shadow_review_present"],
+            },
+            "evidence": {
+                "lessons": status.get("lessons", 0),
+                "trajectories": status.get("trajectories", 0),
+                "proposals": status.get("proposals", 0),
+                "eval_cases": status.get("eval_cases", 0),
+                "decisions": decisions,
+                "held_variants": held_variants,
+                "shadow_reviews": shadow_reviews,
+                "last_evolution_generated": evolution_generated,
+            },
+        },
+        "containment": {
+            "required": ["no_active_skill_mutation", "rollback_or_staging_awareness", "no_bad_behavior_rows"],
+            "present": {
+                "no_active_skill_mutation": gates["no_active_skill_mutation"],
+                "rollback_or_staging_awareness": gates["staged_or_rollback_awareness"],
+                "no_bad_behavior_rows": gates["no_bad_behavior_rows"],
+            },
+            "evidence": {
+                "active_skill_mutated": active_skill_mutated,
+                "promotions": promotions,
+                "rollbacks": rollbacks,
+                "rolled_back_promotions": rolled_back,
+                "bad_behavior_rows": [row.get("run_id", "") for row in bad_rows[:8]],
+            },
+        },
+    }
+    for requirement in evidence_requirements.values():
+        present = requirement.get("present") if isinstance(requirement.get("present"), dict) else {}
+        requirement["passed"] = all(bool(value) for value in present.values())
+    gates["evidence_requirements_complete"] = all(
+        bool(requirement.get("passed")) for requirement in evidence_requirements.values()
+    )
     components = {
         "observe": 20
-        if gates["review_artifacts_present"] and gates["watchdog_or_route_present"]
+        if evidence_requirements["observe"]["passed"]
         else 12
         if gates["review_artifacts_present"]
         else 0,
         "diagnose": 20
-        if gates["autonomy_gate_present"] and gates["canonical_clean"] and gates["zero_active_noise"]
+        if evidence_requirements["diagnose"]["passed"]
         else 10
         if gates["canonical_clean"]
         else 0,
         "route_and_repair": 20
-        if deterministic_ready or str(latest_watchdog.get("decision", "")) in {
-            "healthy",
-            "seed-next-candidate",
-            "repair-routing",
-            "autonomy-repair",
-            "frontier-repair",
-            "self-improvement-repair",
-        }
+        if evidence_requirements["route_and_repair"]["passed"]
         else 0,
         "evolve": 20
-        if gates["durable_memory_present"] and gates["eval_cases_present"] and gates["evolution_canaries_present"] and gates["shadow_review_present"]
+        if evidence_requirements["evolve"]["passed"]
         else 12
         if gates["durable_memory_present"] and gates["eval_cases_present"]
         else 0,
         "containment": 20
-        if gates["no_active_skill_mutation"] and gates["staged_or_rollback_awareness"] and gates["no_bad_behavior_rows"]
+        if evidence_requirements["containment"]["passed"]
         else 10
         if gates["no_active_skill_mutation"]
         else 0,
@@ -1358,6 +1443,7 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
             "canonical_clean",
             "zero_active_noise",
             "no_bad_behavior_rows",
+            "evidence_requirements_complete",
         )
         if not gates.get(key)
     ]
@@ -1376,9 +1462,11 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
         "timestamp": int(time.time()),
         "total_score": total,
         "readiness": readiness,
+        "verdict": "certified" if total >= 95 and not hard_gate_failures else "blocked",
         "components": components,
         "gates": gates,
         "hard_gate_failures": hard_gate_failures,
+        "evidence_requirements": evidence_requirements,
         "status": {
             "lessons": status.get("lessons", 0),
             "trajectories": status.get("trajectories", 0),
@@ -1398,8 +1486,8 @@ def self_improvement_alive_report(root: Path, *, recent_rows: int = 160) -> dict
             "autonomy": latest_autonomy.get("_artifact_path", ""),
             "handoff": latest_handoff.get("_artifact_path", ""),
             "burn_in": latest_burn_in.get("_artifact_path", ""),
-            "watchdog_decision": latest_watchdog.get("decision", ""),
-            "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic_ready[:8]],
+            "watchdog_decision": watchdog_decision,
+            "deterministic_ready_tasks": deterministic_ready_ids,
             "bad_behavior_rows": [row.get("run_id", "") for row in bad_rows[:8]],
             "last_evolution_generated": evolution_generated,
             "last_summary": last_summary,

@@ -188,9 +188,12 @@ and contain or roll back anything unsafe.
 The eval is deterministic and artifact-based. It checks durable lessons,
 trajectories, proposals, eval cases, canary variants, shadow reviews, rollback
 records, watchdog/routing evidence, zero active noise, and proof that active
-skills were not mutated directly. `frontier-eval` now includes this score, so
-the system cannot call itself frontier-level unless the self-improvement loop is
-alive enough to replace manual check-and-patch intervention.
+skills were not mutated directly. Each scored component now emits an evidence
+ledger with required artifact paths, counters, and pass/fail bits; if any
+required evidence is missing, certification fails closed. `frontier-eval` now
+includes this score, so the system cannot call itself frontier-level unless the
+self-improvement loop has evidence that it can replace manual check-and-patch
+intervention.
 
 Run once:
 
