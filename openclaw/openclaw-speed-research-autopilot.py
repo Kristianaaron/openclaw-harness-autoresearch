@@ -4301,7 +4301,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--auto-extend-cycles",
+        "--auto-extend",
         action=argparse.BooleanOptionalAction,
+        dest="auto_extend_cycles",
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTO_EXTEND_CYCLES", "1") != "0",
         help="when the cycle tranche ends, keep going until max-hours if useful work remains or progress is healthy",
     )
@@ -4343,6 +4345,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--cycle-extension-size",
+        "--extension-size",
+        dest="cycle_extension_size",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_CYCLE_EXTENSION_SIZE", "0")),
         help="additional cycles to add per auto-extension; 0 reuses the original --cycles tranche size",
