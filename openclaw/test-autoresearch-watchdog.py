@@ -98,6 +98,7 @@ def main() -> int:
         assert report["decision"] == "continue-breakthrough-lane"
         assert report["gates"]["zero_active_noise"] is True
         assert report["decode"]["mean_wall_decode_tps"] == 15.2
+        assert report["noise_interpretation"]["status"] == "clean"
         contract = helper.architecture_contract(root)
         assert contract["sidecar_authority"]["candidate_mode"] == "advisory-only"
         assert "tasks.jsonl" in contract["sidecar_authority"]["may_not_write"]
@@ -200,6 +201,29 @@ def main() -> int:
         assert idle["decision"] == "idle-ready"
         assert idle["gates"]["log_fresh"] is True
         assert idle["gates"]["results_fresh"] is True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        healthy_workspace(root)
+        write_json(root / "autopilot.lock", {"pid": 12345, "session": "alive"})
+        with patch.object(helper, "process_alive", return_value=True):
+            alive = helper.repair_stale_autopilot_lock(root)
+        assert alive["repaired"] is False
+        assert alive["reason"] == "lock owner still alive"
+        assert (root / "autopilot.lock").exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        healthy_workspace(root)
+        write_json(root / "autopilot.lock", {"pid": 999999, "session": "locked"})
+        with (
+            patch.object(helper, "process_alive", return_value=False),
+            patch.object(helper.fcntl, "flock", side_effect=BlockingIOError),
+        ):
+            locked = helper.repair_stale_autopilot_lock(root)
+        assert locked["repaired"] is False
+        assert locked["reason"] == "lock currently owned"
+        assert (root / "autopilot.lock").exists()
 
     print("autoresearch watchdog checks passed")
     return 0

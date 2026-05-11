@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
 import os
 import signal
@@ -92,28 +93,55 @@ def autopilot_lock(root: Path) -> dict[str, Any]:
 def repair_stale_autopilot_lock(root: Path) -> dict[str, Any]:
     """Archive and remove an autopilot lock whose owner process is gone."""
     lock_path = root / "autopilot.lock"
-    payload = read_json(lock_path)
-    pid = int(payload.get("pid", 0) or 0)
-    if not lock_path.exists() or process_alive(pid):
+    if not lock_path.exists():
         return {"repaired": False, "reason": "no stale lock"}
-    timestamp = int(time.time())
-    recovery = {
-        "kind": "stale-autopilot-lock-recovery",
-        "timestamp": timestamp,
-        "repaired": True,
-        "reason": "autopilot lock owner process is not alive",
-        "lock": payload,
-        "lock_path": str(lock_path),
-    }
-    archive = root / "watchdog" / "stale-locks" / f"autopilot-lock-{timestamp}.json"
-    write_json(archive, recovery)
-    append_jsonl(root / "watchdog" / "stale-locks.jsonl", recovery | {"archive": str(archive)})
+
     try:
-        lock_path.unlink()
+        handle = lock_path.open("r+", encoding="utf-8")
     except FileNotFoundError:
-        pass
-    recovery["archive"] = str(archive)
-    return recovery
+        return {"repaired": False, "reason": "no stale lock"}
+    except OSError as error:
+        return {"repaired": False, "reason": f"cannot open lock: {error}"}
+
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"repaired": False, "reason": "lock currently owned"}
+
+        handle.seek(0)
+        try:
+            payload = json.loads(handle.read().strip() or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        pid = int(payload.get("pid", 0) or 0)
+        if process_alive(pid):
+            return {"repaired": False, "reason": "lock owner still alive"}
+
+        timestamp = int(time.time())
+        recovery = {
+            "kind": "stale-autopilot-lock-recovery",
+            "timestamp": timestamp,
+            "repaired": True,
+            "reason": "autopilot lock owner process is not alive",
+            "lock": payload,
+            "lock_path": str(lock_path),
+        }
+        archive = root / "watchdog" / "stale-locks" / f"autopilot-lock-{timestamp}.json"
+        write_json(archive, recovery)
+        append_jsonl(root / "watchdog" / "stale-locks.jsonl", recovery | {"archive": str(archive)})
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        recovery["archive"] = str(archive)
+        return recovery
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
 
 
 def latest_autopilot_log(root: Path) -> dict[str, Any]:
@@ -438,6 +466,9 @@ def watchdog_review(
         "zero_active_noise": all(value == 0 for value in active_noise.values()),
         "no_recent_memory_blocks": direct_noise["memory_block_rows"] == 0,
     }
+    noise_status = "clean" if gates["zero_active_noise"] else "active-noise"
+    if noise_status == "clean" and direct_noise["terminal_synthesis_rows"]:
+        noise_status = "clean-with-routed-history"
     blockers = [name for name, ok in gates.items() if not ok]
     decode_mean = decode.get("mean_wall_decode_tps")
     canonical_state = str(canonical.get("state", "unknown"))
@@ -525,6 +556,18 @@ def watchdog_review(
             "noise": active_noise,
         },
         "direct_recent_noise": direct_noise,
+        "noise_interpretation": {
+            "status": noise_status,
+            "active_noise_rows": sum(active_noise.values()),
+            "raw_recent_terminal_rows": direct_noise["terminal_synthesis_rows"],
+            "meaning": (
+                "active canonical noise is zero; raw terminal rows are historical routed/discard rows"
+                if noise_status == "clean-with-routed-history"
+                else "active canonical noise is zero"
+                if noise_status == "clean"
+                else "active canonical noise requires repair before more research"
+            ),
+        },
         "decode": decode,
     }
 

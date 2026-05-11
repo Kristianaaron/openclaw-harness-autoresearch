@@ -176,21 +176,22 @@ def release_autopilot_lock(handle: object | None) -> None:
     if handle is None:
         return
     try:
-        handle.close()
-    except Exception:
+        handle.seek(0)
+        payload = json.loads(handle.read().strip() or "{}")
+        if int(payload.get("pid", 0) or 0) == os.getpid():
+            try:
+                AUTOPILOT_LOCK.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                log(f"warning: failed to remove autopilot lock marker: {error}")
+    except (OSError, json.JSONDecodeError, AttributeError):
         pass
-    try:
-        payload = json.loads(AUTOPILOT_LOCK.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if int(payload.get("pid", 0) or 0) != os.getpid():
-        return
-    try:
-        AUTOPILOT_LOCK.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        log(f"warning: failed to remove autopilot lock marker: {error}")
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 def results_line_count() -> int:
