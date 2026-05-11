@@ -12,9 +12,12 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import os
 import signal
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +71,37 @@ def latest_json_artifact(root: Path, pattern: str) -> dict[str, Any]:
     payload["_artifact_path"] = str(paths[-1])
     payload["_artifact_mtime"] = paths[-1].stat().st_mtime
     return payload
+
+
+def live_canonical_state(root: Path, *, recent_rows: int, target_tps: float) -> dict[str, Any]:
+    """Recompute canonical state so the watchdog is not held hostage by stale artifacts."""
+    helper_path = Path(__file__).with_name("openclaw-speed-research.py")
+    if not helper_path.exists():
+        helper_path = Path(__file__).with_name("openclaw-speed-research")
+    if not helper_path.exists():
+        return {}
+    script_dir = str(helper_path.parent)
+    inserted = False
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+        inserted = True
+    try:
+        loader = SourceFileLoader("openclaw_speed_research_live", str(helper_path))
+        spec = importlib.util.spec_from_loader("openclaw_speed_research_live", loader)
+        if spec is None or spec.loader is None:
+            return {}
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        canonical = module.canonical_autoresearch_state(root, recent_rows=recent_rows, target_tps=target_tps)
+        return canonical if isinstance(canonical, dict) else {}
+    except Exception:
+        return {}
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(script_dir)
+            except ValueError:
+                pass
 
 
 def process_alive(pid: int) -> bool:
@@ -435,6 +469,9 @@ def watchdog_review(
     handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
     burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
     canonical = frontier.get("canonical_state") if isinstance(frontier.get("canonical_state"), dict) else {}
+    live_canonical = live_canonical_state(root, recent_rows=recent, target_tps=target_tps)
+    if live_canonical:
+        canonical = live_canonical
     noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
     scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
     latest_time = latest_row_time(rows)

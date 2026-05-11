@@ -83,7 +83,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         healthy_workspace(root)
-        with patch.object(helper, "process_alive", return_value=True), patch.object(helper.time, "time", return_value=1778439780):
+        with (
+            patch.object(helper, "process_alive", return_value=True),
+            patch.object(helper, "live_canonical_state", return_value={}),
+            patch.object(helper.time, "time", return_value=1778439780),
+        ):
             report = helper.watchdog_review(
                 root,
                 recent=120,
@@ -115,7 +119,11 @@ def main() -> int:
                 "scorecard": {"overall": 92.8},
             },
         )
-        with patch.object(helper, "process_alive", return_value=True), patch.object(helper.time, "time", return_value=1778439780):
+        with (
+            patch.object(helper, "process_alive", return_value=True),
+            patch.object(helper, "live_canonical_state", return_value={}),
+            patch.object(helper.time, "time", return_value=1778439780),
+        ):
             degraded = helper.watchdog_review(
                 root,
                 recent=120,
@@ -159,7 +167,11 @@ def main() -> int:
                 },
             },
         )
-        with patch.object(helper, "process_alive", return_value=True), patch.object(helper.time, "time", return_value=1778439780):
+        with (
+            patch.object(helper, "process_alive", return_value=True),
+            patch.object(helper, "live_canonical_state", return_value={}),
+            patch.object(helper.time, "time", return_value=1778439780),
+        ):
             blocked = helper.watchdog_review(
                 root,
                 recent=120,
@@ -186,7 +198,10 @@ def main() -> int:
         assert recovery["repaired"] is True
         assert not (root / "autopilot.lock").exists()
         assert Path(recovery["archive"]).exists()
-        with patch.object(helper.time, "time", return_value=1778439780):
+        with (
+            patch.object(helper, "live_canonical_state", return_value={}),
+            patch.object(helper.time, "time", return_value=1778439780),
+        ):
             idle = helper.watchdog_review(
                 root,
                 recent=120,
@@ -201,6 +216,65 @@ def main() -> int:
         assert idle["decision"] == "idle-ready"
         assert idle["gates"]["log_fresh"] is True
         assert idle["gates"]["results_fresh"] is True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        healthy_workspace(root)
+        write_json(
+            root / "benchmarks" / "frontier-system-eval-2.json",
+            {
+                "overall": 9.85,
+                "readiness": "frontier-candidate",
+                "frontier_certified": False,
+                "gaps": [],
+                "canonical_state": {
+                    "state": "blocked_until_external_change",
+                    "clean": True,
+                    "ready_tasks": 0,
+                    "deterministic_ready_tasks": [],
+                    "breakthrough_lanes": [],
+                    "exhausted_lanes": ["frontier-dflash", "mtp-decode"],
+                    "noise": {
+                        "unresolved_blocked_rows": 0,
+                        "terminal_synthesis_rows": 4,
+                        "bridge_zero_rows": 1,
+                        "memory_blocks": 0,
+                    },
+                },
+            },
+        )
+        live_clean = {
+            "state": "breakthrough_lane_active",
+            "clean": True,
+            "ready_tasks": 1,
+            "deterministic_ready_tasks": ["decode-remeasure-after-calibration-block"],
+            "breakthrough_lanes": ["runtime-overhead"],
+            "exhausted_lanes": ["frontier-dflash", "mtp-decode"],
+            "noise": {
+                "unresolved_blocked_rows": 0,
+                "terminal_synthesis_rows": 0,
+                "bridge_zero_rows": 0,
+                "memory_blocks": 0,
+            },
+        }
+        with (
+            patch.object(helper, "process_alive", return_value=True),
+            patch.object(helper, "live_canonical_state", return_value=live_clean),
+            patch.object(helper.time, "time", return_value=1778439780),
+        ):
+            refreshed = helper.watchdog_review(
+                root,
+                recent=120,
+                target_tps=30,
+                min_quality=95,
+                min_scorecard=95,
+                min_frontier=9.5,
+                max_log_stale_seconds=300,
+                max_result_stale_seconds=600,
+            )
+        assert refreshed["gates"]["zero_active_noise"] is True
+        assert refreshed["canonical_state"]["ready_tasks"] == 1
+        assert refreshed["canonical_state"]["noise"]["terminal_synthesis_rows"] == 0
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

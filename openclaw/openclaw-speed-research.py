@@ -1683,13 +1683,20 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
         state = "frontier_healthy"
     else:
         state = "needs_repair"
+    terminal_state_exhausted = not ready and bool(exhausted)
     routed_terminal_synthesis_rows = (
-        terminal_synthesis_rows if deterministic_ids or breakthrough_lanes or repair_ready else []
+        terminal_synthesis_rows
+        if deterministic_ids or breakthrough_lanes or repair_ready or terminal_state_exhausted
+        else []
     )
     unresolved_terminal_synthesis_rows = (
         [] if routed_terminal_synthesis_rows else terminal_synthesis_rows
     )
-    routed_bridge_zero_rows = bridge_zero if deterministic_ids or breakthrough_lanes or repair_ready or routed_blockers else []
+    routed_bridge_zero_rows = (
+        bridge_zero
+        if deterministic_ids or breakthrough_lanes or repair_ready or routed_blockers or terminal_state_exhausted
+        else []
+    )
     unresolved_bridge_zero_rows = [] if routed_bridge_zero_rows else bridge_zero
     noise = {
         "unresolved_blocked_rows": len(unresolved),
