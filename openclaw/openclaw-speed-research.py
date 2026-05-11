@@ -225,6 +225,14 @@ ARCHITECTURAL_PATCH_PREFIXES = (
     "openclaw/openclaw-jang-vlm-launcher.py",
     "openclaw/model-profiles",
 )
+HIGH_RISK_PATCH_PREFIXES = (
+    *ARCHITECTURAL_PATCH_PREFIXES,
+    "openclaw/openclaw-speed-research-autopilot.py",
+    "openclaw/openclaw-autoresearch-watchdog.py",
+    "openclaw/openclaw-mtp-drafter-calibrate.py",
+    "openclaw/openclaw-drafter-fit.py",
+    "openclaw/openclaw-rapid-mlx-launcher.py",
+)
 DENIED_PATCH_FRAGMENTS = (
     ".env",
     "opencode",
@@ -2600,6 +2608,29 @@ def unique_task_id(root: Path, task_id: str) -> str:
     return f"{task_id}-{time.time_ns()}"
 
 
+def crabbox_required_for_target(target: str) -> bool:
+    normalized = normalize_patch_path(target)
+    return any(normalized.startswith(prefix) for prefix in HIGH_RISK_PATCH_PREFIXES)
+
+
+def apply_crabbox_requirement(task: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    checks = [str(item) for item in task.get("guard_checks", [])]
+    for check in ("crabbox_static_ssh_mac", "rollback_rehearsal", "frontier_autonomy_score_100"):
+        if check not in checks:
+            checks.append(check)
+    task["guard_checks"] = checks
+    task["risk_tier"] = "high-risk"
+    task["crabbox_required"] = True
+    task["crabbox_runner"] = "static-ssh-mac"
+    task["promotion_blocked_until_crabbox"] = True
+    task["risk_reason"] = reason
+    task["acceptance"] = (
+        f"{task.get('acceptance', '')} Any source patch produced from this contract must run in Crabbox first "
+        "and can only promote with fresh matching Crabbox evidence, rollback rehearsal, and a Frontier Autonomy Score of 100."
+    ).strip()
+    return task
+
+
 def should_seed_action(root: Path, prefix: str, *, recent_rows: int = 80) -> bool:
     return not active_task_has_prefix(root, prefix) and not recent_result_has_prefix(root, prefix, recent_rows=recent_rows)
 
@@ -4726,7 +4757,7 @@ def source_scout_task(timestamp: int, *, evidence: dict[str, Any]) -> dict[str, 
 
 
 def agent_deliberation_task(timestamp: int, *, slug: str, priority: int, target: str, hypothesis: str, acceptance: str, evidence: dict[str, Any]) -> dict[str, Any]:
-    return {
+    task = {
         "id": f"agent-deliberation-{slug}-{timestamp}",
         "status": "ready",
         "priority": priority,
@@ -4754,6 +4785,9 @@ def agent_deliberation_task(timestamp: int, *, slug: str, priority: int, target:
         "evidence": evidence,
         "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
     }
+    if crabbox_required_for_target(target):
+        apply_crabbox_requirement(task, reason=f"deliberation target is high-risk: {target}")
+    return task
 
 
 def latest_source_scout_artifact(root: Path) -> dict[str, Any]:
@@ -6697,12 +6731,13 @@ def frontier_autonomy_score_report(
     bad_rows = recent_bad_behavior_rows(root, recent_rows=recent_rows)
     classif = classification or {}
     is_architectural = bool(classif.get("architectural"))
+    crabbox_required = bool(classif.get("crabbox_required")) or is_architectural
     patch_tests_ok = (
         (patch_tests is None and not promotion)
         or (bool(patch_tests) and all(bool(test.get("ok")) for test in patch_tests))
     )
     crabbox_ok = (
-        not is_architectural
+        not crabbox_required
         or bool(crabbox_evidence and crabbox_evidence.get("_valid_for_architectural_promotion"))
     )
     hard_gates = {
@@ -6747,6 +6782,7 @@ def frontier_autonomy_score_report(
         "policy": {
             "mode": policy.get("mode"),
             "crabbox_runner": policy.get("crabbox_runner"),
+            "crabbox_required": crabbox_required,
             "thresholds": thresholds,
         },
         "evidence": {
@@ -9482,8 +9518,10 @@ def classify_patch(
             reasons.append(f"path outside task source_files: {path}")
     changed_lines = additions + deletions
     architectural = any(path.startswith(ARCHITECTURAL_PATCH_PREFIXES) for path in files)
+    high_risk = any(path.startswith(HIGH_RISK_PATCH_PREFIXES) for path in files)
     if len(files) > 3 or changed_lines > 220:
         architectural = True
+        high_risk = True
     if architectural and not allow_architectural:
         reasons.append("architectural change requires canary evidence and explicit allow_architectural")
     destructive = bool(reasons) or deletions > additions * 3 + 20
@@ -9491,11 +9529,13 @@ def classify_patch(
         impact = "destructive"
     elif architectural:
         impact = "architectural"
+    elif high_risk:
+        impact = "high-risk"
     elif changed_lines <= 80 and len(files) <= 2:
         impact = "safe"
     else:
         impact = "moderate"
-    auto_promote = impact in {"safe", "moderate"}
+    auto_promote = impact in {"safe", "moderate"} and not high_risk
     return {
         "files": files,
         "additions": additions,
@@ -9503,6 +9543,8 @@ def classify_patch(
         "changed_lines": changed_lines,
         "impact": impact,
         "architectural": architectural,
+        "high_risk": high_risk,
+        "crabbox_required": architectural or high_risk,
         "approval_required": impact == "architectural",
         "auto_promote": auto_promote and not destructive,
         "allowed": not destructive,
@@ -9574,7 +9616,7 @@ def patch_execute(args: argparse.Namespace) -> int:
     crabbox_evidence = load_crabbox_evidence(
         str(getattr(args, "crabbox_evidence_file", "") or ""),
         patch_sha256=patch_hash,
-    ) if classification.get("architectural") else {}
+    ) if classification.get("crabbox_required") else {}
     timestamp = int(time.time())
     task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.task_id or "manual").strip("-") or "manual"
     artifact_id = f"{timestamp}-{task_slug}"
@@ -9646,12 +9688,12 @@ def patch_execute(args: argparse.Namespace) -> int:
                 elif not tests_ok:
                     reason = "canary tests failed"
                     artifact["reason"] = reason
-                elif classification.get("architectural") and not crabbox_evidence.get("_valid_for_architectural_promotion"):
-                    reason = "canary passed; architectural promotion requires valid Crabbox sandbox evidence"
+                elif classification.get("crabbox_required") and not crabbox_evidence.get("_valid_for_architectural_promotion"):
+                    reason = "canary passed; high-risk promotion requires valid Crabbox sandbox evidence"
                     artifact["reason"] = reason
                     artifact["held_for_crabbox"] = True
                     artifact["crabbox_instruction"] = (
-                        "Run the candidate in a static SSH Mac Crabbox sandbox and provide a fresh evidence JSON "
+                        "Run the high-risk candidate in a static SSH Mac Crabbox sandbox and provide a fresh evidence JSON "
                         "with ok=true, runner=static-ssh-mac, matching patch_sha256, focused tests, full_suite.ok, "
                         "rollback_rehearsal_ok, and logs/run_id."
                     )

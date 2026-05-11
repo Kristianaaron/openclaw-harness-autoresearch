@@ -1876,6 +1876,7 @@ def main() -> int:
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
             (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'old'\n", encoding="utf-8")
+            (patch_repo / "openclaw" / "openclaw-mtp-drafter-calibrate.py").write_text("MODE = 'old'\n", encoding="utf-8")
             (patch_repo / "openclaw" / "test-speed-research.py").write_text("print('ok')\n", encoding="utf-8")
             subprocess.run(["git", "init"], cwd=patch_repo, stdout=subprocess.DEVNULL, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=patch_repo, check=True)
@@ -1889,6 +1890,19 @@ def main() -> int:
             patch_file.write_text(diff.stdout, encoding="utf-8")
             subprocess.run(["git", "checkout", "--", "openclaw/sample.py"], cwd=patch_repo, check=True)
             assert helper.classify_patch(diff.stdout, source_files=["openclaw/sample.py"])["impact"] == "safe"
+            high_risk_task = helper.agent_deliberation_task(
+                123456,
+                slug="unit-high-risk",
+                priority=99,
+                target="openclaw/openclaw-jang-vlm-server.py",
+                hypothesis="unit high-risk deliberation path",
+                acceptance="unit acceptance",
+                evidence={},
+            )
+            assert high_risk_task["risk_tier"] == "high-risk"
+            assert high_risk_task["crabbox_required"] is True
+            assert high_risk_task["promotion_blocked_until_crabbox"] is True
+            assert "crabbox_static_ssh_mac" in high_risk_task["guard_checks"]
             secret_diff = (
                 "diff --git a/openclaw/sample.py b/openclaw/sample.py\n"
                 "--- a/openclaw/sample.py\n"
@@ -2004,6 +2018,43 @@ def main() -> int:
             assert arch_allowed["impact"] == "architectural"
             assert arch_allowed["auto_promote"] is False
             assert arch_allowed["approval_required"] is True
+            (patch_repo / "openclaw" / "openclaw-mtp-drafter-calibrate.py").write_text("MODE = 'new'\n", encoding="utf-8")
+            high_risk_patch_file = root / "patches" / "high-risk.patch"
+            high_risk_diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)
+            high_risk_patch_file.write_text(high_risk_diff.stdout, encoding="utf-8")
+            subprocess.run(["git", "checkout", "--", "openclaw/openclaw-mtp-drafter-calibrate.py"], cwd=patch_repo, check=True)
+            high_risk_classification = helper.classify_patch(
+                high_risk_diff.stdout,
+                source_files=["openclaw/openclaw-mtp-drafter-calibrate.py"],
+                allow_architectural=False,
+            )
+            assert high_risk_classification["impact"] == "high-risk"
+            assert high_risk_classification["allowed"] is True
+            assert high_risk_classification["crabbox_required"] is True
+            assert high_risk_classification["auto_promote"] is False
+            assert helper.patch_execute(
+                Namespace(
+                    patch_file=str(high_risk_patch_file),
+                    task_id="high-risk-patch",
+                    hypothesis="high-risk patch",
+                    source_files="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    tests="python3 openclaw/test-speed-research.py",
+                    repo=str(patch_repo),
+                    test_timeout=30.0,
+                    canary_only=False,
+                    keep_canary=False,
+                    allow_architectural=False,
+                    crabbox_evidence_file="",
+                    rollback_rehearsal_ok=False,
+                    architectural_approval_file="",
+                )
+            ) == 0
+            high_risk_artifact = sorted((root / "experiments").glob("patch-executor-*-high-risk-patch.json"))[-1]
+            high_risk_data = json.loads(high_risk_artifact.read_text(encoding="utf-8"))
+            assert high_risk_data["held_for_crabbox"] is True
+            assert high_risk_data["classification"]["impact"] == "high-risk"
+            assert high_risk_data["promoted"] is False
+            assert (patch_repo / "openclaw" / "openclaw-mtp-drafter-calibrate.py").read_text(encoding="utf-8") == "MODE = 'old'\n"
             assert helper.patch_execute(
                 Namespace(
                     patch_file=str(arch_patch_file),

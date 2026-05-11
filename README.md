@@ -103,6 +103,13 @@ active memory/Metal noise exists, it fails closed. If non-memory tool/model nois
 is present, it routes one recovery contract so the noise is handled as evidence
 instead of counted as progress.
 
+High-risk paths discovered by the architect are Crabbox-gated automatically.
+Runtime servers, launchers, model profiles, drafter calibration/training code,
+autopilot, watchdog, and proxy surfaces are tagged `crabbox_required=true`.
+Patches touching those surfaces may pass local canary, but promotion is blocked
+until fresh static-SSH-Mac Crabbox evidence, full-suite evidence, rollback
+rehearsal, and a `frontier-autonomy-score` of `100` are present.
+
 ### Deterministic Lane Contracts
 
 Each research lane declares the work it is allowed to do:
