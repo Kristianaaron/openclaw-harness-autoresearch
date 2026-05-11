@@ -60,10 +60,71 @@ def main() -> int:
             assert (root / "README-openclaw-speed.md").exists()
             assert (root / "implementation-skill.md").exists()
             assert (root / "benchmark-manifest.json").exists()
+            runtime_root = Path(tmp) / "runtime-clean-research" / "speed"
+            helper.ensure_research_state(runtime_root)
+            helper.append_result(
+                runtime_root,
+                run_id="runtime-overhead-map-unit-a",
+                status="keep",
+                target="runtime-overhead-map",
+                hypothesis="unit",
+                commit="unit",
+                notes="contaminated=0",
+            )
+            helper.append_result(
+                runtime_root,
+                run_id="runtime-overhead-map-unit-b",
+                status="keep",
+                target="runtime-overhead-map",
+                hypothesis="unit",
+                commit="unit",
+                notes="contaminated=0",
+            )
+            stale_runtime_task = {
+                "id": "unit-stale-runtime-overhead",
+                "status": "ready",
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "repeated clean runtime maps should retire runtime-overhead churn",
+                "metric": "server_wall_decode_gap",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+            }
+            helper.write_jsonl(runtime_root / "tasks.jsonl", [stale_runtime_task])
+            assert helper.runtime_overhead_repeated_clean(runtime_root, helper.result_rows(runtime_root)) is True
+            assert helper.filter_seedable_tasks(runtime_root, [stale_runtime_task]) == []
+            assert helper.compact_repeated_runtime_overhead_tasks(runtime_root, helper.result_rows(runtime_root)) == 1
+            assert not [
+                task
+                for task in helper.read_jsonl(runtime_root / "tasks.jsonl")
+                if task.get("id") == "unit-stale-runtime-overhead" and task.get("status", "ready") in {"ready", "rework"}
+            ]
+            duplicate_task = {
+                "id": "unit-duplicate-task",
+                "status": "ready",
+                "lane": "runtime-overhead",
+                "task_type": "supervisor",
+                "supervisor_action": "runtime-overhead-map",
+                "target": "openclaw/openclaw-jang-vlm-server.py",
+                "hypothesis": "duplicate active task ids should be compacted before they create false progress",
+                "metric": "server_wall_decode_gap",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+            }
+            assert helper.upsert_tasks(root, [duplicate_task, {**duplicate_task, "priority": 99}]) == 1
+            assert helper.upsert_tasks(root, [{**duplicate_task, "priority": 98}]) == 0
+            active_duplicates = [
+                task
+                for task in helper.read_jsonl(root / "tasks.jsonl")
+                if task.get("id") == "unit-duplicate-task" and task.get("status", "ready") in {"ready", "rework"}
+            ]
+            assert len(active_duplicates) == 1
             assert helper.actionable_blocked_rows(
                 [
                     {"status": "blocked", "target": "autoresearch-quality"},
                     {"status": "blocked", "target": "autoresearch-frontier-eval"},
+                    {"status": "blocked", "target": "autoresearch-stability-burn-in"},
+                    {"status": "blocked", "target": "autoresearch-sota-autonomy-eval"},
                     {
                         "status": "blocked",
                         "target": "janq-drafter-calibration-memory-stage",
@@ -1343,7 +1404,8 @@ def main() -> int:
                 max((root / "benchmarks").glob("quality-review-*.json"), key=lambda path: path.stat().st_mtime_ns).read_text()
             )
             assert clean_review["clean_runtime_overhead_maps"] >= 2
-            assert clean_review["gates"]["runtime_overhead_not_repeated"] is False
+            assert clean_review["gates"]["runtime_overhead_not_repeated"] is True
+            assert clean_review["compacted_runtime_tasks"] >= 1
             assert clean_review["scorecard"]["components"]["novelty"] >= 70
             assert "review-janq-drafter-fit-next" in (root / "tasks.jsonl").read_text(encoding="utf-8")
             with (root / "results.tsv").open("a", encoding="utf-8") as file:
@@ -1790,6 +1852,7 @@ def main() -> int:
             handoff_ready = "\n".join(handoff_after_empty["ready_deterministic_tasks"])
             assert (
                 "handoff-audit-drafter-calibration-canary-" in handoff_ready
+                or "adapter-drafter-calibration-canary-current" in handoff_ready
                 or "frontier-expansion-dflash-candidate-search-" in handoff_ready
                 or "frontier-expansion-janq-adapter-path-" in handoff_ready
                 or "frontier-expansion-mtp-verify-cache-" in handoff_ready
@@ -1872,6 +1935,49 @@ def main() -> int:
                 or deliberation_artifact.get("recovery_task_seeded") == 1
             )
             assert deliberation_artifact["architect"]["contract_complete"] is True
+            with patch.object(
+                helper,
+                "drafter_bottleneck_state",
+                return_value={"state": "adapter_method_implementation_done", "next_step": "seed_adapter_calibration_canary"},
+            ):
+                adapter_canary = helper.drafter_calibration_canary_task(
+                    123457,
+                    task_id="adapter-drafter-calibration-canary-current",
+                    calibration_mode_value=helper.CALIBRATION_ADAPTER_MODE,
+                )
+                with patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[adapter_canary]):
+                    breakout_report, breakout_tasks = helper.frontier_agent_deliberation(root, helper.result_rows(root), 123457)
+            assert breakout_tasks
+            assert breakout_tasks[0]["supervisor_action"] == "drafter-calibration-canary"
+            assert breakout_tasks[0]["calibration_mode"] == helper.CALIBRATION_ADAPTER_MODE
+            assert "canonical JANQ drafter bottleneck" in breakout_report["architect"]["selected_reason"]
+            with patch.object(
+                helper,
+                "recent_calibration_run_hard_blocker",
+                return_value=helper.CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
+            ):
+                assert helper.filter_seedable_tasks(root, [breakout_tasks[0]]) == [breakout_tasks[0]]
+            with tempfile.TemporaryDirectory() as deliberation_tmp:
+                deliberation_root = Path(deliberation_tmp) / "research" / "speed"
+                helper.ensure_research_state(deliberation_root)
+                (deliberation_root / "benchmarks" / "source-scout-unit.json").write_text(
+                    json.dumps({"ok": True, "findings": [{"status": "fetched", "url": "https://github.com/karpathy/autoresearch"}]}),
+                    encoding="utf-8",
+                )
+                with patch.object(
+                    helper,
+                    "drafter_bottleneck_state",
+                    return_value={"state": "no_terminal_quantized_blocker", "next_step": "continue_current_lane_contract"},
+                ):
+                    mtp_report, mtp_tasks = helper.frontier_agent_deliberation(
+                        deliberation_root,
+                        helper.result_rows(deliberation_root),
+                        123458,
+                    )
+            assert mtp_tasks
+            assert mtp_tasks[0]["supervisor_action"] == "mtp-report"
+            assert mtp_tasks[0]["metric"] == "mean_accept"
+            assert mtp_report["architect"]["selected_task_id"].startswith("agent-deliberation-mtp-acceptance-yield-")
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")

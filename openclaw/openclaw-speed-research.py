@@ -1847,6 +1847,8 @@ CERTIFICATION_TARGETS = {
     "autoresearch-frontier-eval",
     "autoresearch-frontier-certification",
     "autoresearch-self-improvement-alive",
+    "autoresearch-stability-burn-in",
+    "autoresearch-sota-autonomy-eval",
     "frontier-autonomy-score",
 }
 
@@ -2524,10 +2526,123 @@ def compact_terminal_calibration_tasks(root: Path) -> int:
     return compacted
 
 
+def compact_direct_calibration_canaries_after_bottleneck(root: Path, *, recent_rows: int = 240) -> int:
+    state = drafter_bottleneck_state(root, recent_rows=recent_rows)
+    if state["state"] == "no_terminal_quantized_blocker":
+        return 0
+    tasks = read_jsonl(root / "tasks.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    compacted = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        action = str(task.get("supervisor_action", ""))
+        task_id = str(task.get("id", ""))
+        if action != "drafter-calibration-canary" and "drafter-calibration-canary" not in task_id:
+            continue
+        if calibration_task_mode(task) == CALIBRATION_ADAPTER_MODE:
+            continue
+        task["status"] = "done"
+        task["completed_at"] = now
+        task["supervisor_summary"] = {
+            "reason": "direct calibration canary compacted after JANQ bottleneck routed to adapter/logit-distillation",
+            "bottleneck_state": state["state"],
+            "next_step": state["next_step"],
+        }
+        compacted += 1
+    if compacted:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": now,
+                "task_id": "direct-calibration-canary-compaction",
+                "finding": "completed stale direct calibration canaries after the JANQ bottleneck selected a changed adapter/logit route",
+                "evidence": {"compacted": compacted, "state": state["state"], "next_step": state["next_step"]},
+                "next": "run_adapter_logit_distillation_route",
+            },
+        )
+    return compacted
+
+
+def runtime_overhead_repeated_clean(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 160,
+) -> bool:
+    if len(recent_clean_runtime_overhead_maps(root, rows, recent_rows=recent_rows)) < 2:
+        return False
+    artifact = measurement_artifact_analysis(root, recent_rows=recent_rows)
+    return not bool(artifact.get("artifact_suspected"))
+
+
+def compact_repeated_runtime_overhead_tasks(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 160,
+) -> int:
+    if not runtime_overhead_repeated_clean(root, rows, recent_rows=recent_rows):
+        return 0
+    tasks = read_jsonl(root / "tasks.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    compacted = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        lane = str(task.get("lane", ""))
+        task_id = str(task.get("id", ""))
+        action = str(task.get("supervisor_action", ""))
+        if "contamination" in task_id:
+            continue
+        if lane != "runtime-overhead" and action != "runtime-overhead-map":
+            continue
+        task["status"] = "done"
+        task["completed_at"] = now
+        task["supervisor_summary"] = {
+            "reason": "runtime-overhead task compacted after repeated clean maps; wait for fresh contamination evidence",
+            "clean_runtime_maps": len(recent_clean_runtime_overhead_maps(root, rows, recent_rows=recent_rows)),
+        }
+        compacted += 1
+    if compacted:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": now,
+                "task_id": "runtime-overhead-clean-map-compaction",
+                "finding": "completed stale runtime-overhead tasks after repeated clean maps ruled out the lane",
+                "evidence": {"compacted": compacted},
+                "next": "route to MTP acceptance yield, adapter/logit drafter fit, or a new candidate path",
+            },
+        )
+    return compacted
+
+
 def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     path = root / "tasks.jsonl"
     existing = read_jsonl(path)
-    existing_by_id = {str(task.get("id", "")): index for index, task in enumerate(existing)}
+    changed = False
+    active_ids: set[str] = set()
+    for task in existing:
+        task_id = str(task.get("id", ""))
+        if not task_id or task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if task_id in active_ids:
+            task["status"] = "done"
+            task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            task["supervisor_summary"] = {"reason": "duplicate active task id compacted by upsert"}
+            changed = True
+        else:
+            active_ids.add(task_id)
+    existing_by_id: dict[str, int] = {}
+    for index, task in enumerate(existing):
+        task_id = str(task.get("id", ""))
+        if not task_id:
+            continue
+        if task_id not in existing_by_id or task.get("status", "ready") in {"ready", "rework"}:
+            existing_by_id[task_id] = index
     active_stage_keys = {
         calibration_memory_stage_key(task)
         for task in existing
@@ -2535,14 +2650,16 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     }
     completed_stages = completed_calibration_memory_stage_keys(root)
     additions = 0
-    changed = False
     for task in tasks:
         task_id = str(task.get("id", ""))
+        if not task_id:
+            continue
         stage_key = calibration_memory_stage_key(task)
         if stage_key and (stage_key in active_stage_keys or stage_key in completed_stages):
             continue
         if task_id not in existing_by_id:
             existing.append(task)
+            existing_by_id[task_id] = len(existing) - 1
             if stage_key:
                 active_stage_keys.add(stage_key)
             additions += 1
@@ -3539,7 +3656,7 @@ def drafter_bottleneck_next_tasks(
             [
                 drafter_calibration_canary_task(
                     timestamp,
-                    task_id="adapter-drafter-calibration-canary-current",
+                    task_id=unique_task_id(root, "adapter-drafter-calibration-canary-current"),
                     priority=99,
                     calibration_mode_value=CALIBRATION_ADAPTER_MODE,
                 )
@@ -3549,6 +3666,8 @@ def drafter_bottleneck_next_tasks(
 
 
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
+    if drafter_bottleneck_state(root, recent_rows=recent_rows)["state"] != "no_terminal_quantized_blocker":
+        return False
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
     return bool(existing_drafter_trace_paths()) and should_seed_action(
@@ -4204,6 +4323,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     ensure_lane_contracts(root)
     exhausted = exhausted_lanes(root)
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
+    runtime_clean_exhausted = runtime_overhead_repeated_clean(root, recent_rows=160)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     active_calibration_stages = {
         calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
@@ -4227,12 +4347,17 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             or "lane-contract-decode-remeasure-dflash-block" in task_id
         ):
             continue
+        if runtime_clean_exhausted and lane == "runtime-overhead" and "contamination" not in task_id:
+            continue
         if has_active_calibration_stage and (
             action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
         ):
             continue
         calibration_blocked_action = action == "drafter-calibration-run" or "drafter-calibration-run" in task_id
-        if calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
+        if (
+            calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS
+            and calibration_task_mode(task) != CALIBRATION_ADAPTER_MODE
+        ):
             calibration_blocked_action = calibration_blocked_action or (
                 action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
             )
@@ -4756,6 +4881,38 @@ def source_scout_task(timestamp: int, *, evidence: dict[str, Any]) -> dict[str, 
     }
 
 
+def mtp_acceptance_yield_task(timestamp: int, *, evidence: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"agent-deliberation-mtp-acceptance-yield-{timestamp}",
+        "status": "ready",
+        "priority": 97,
+        "lane": "frontier-deliberation",
+        "task_type": "supervisor",
+        "supervisor_action": "mtp-report",
+        "target": "openclaw-model-proxy.log",
+        "lines": 320,
+        "hypothesis": (
+            "If drafter training is blocked, the next useful speed move is to measure MTP accepted-token "
+            "yield and rejection evidence instead of repeating raw decode samples."
+        ),
+        "metric": "mean_accept",
+        "guard_checks": [
+            "no_model_turn_required",
+            "one_narrow_tool",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": (
+            "An MTP report artifact records server tok/s, sample count, mean_accept when logs expose it, "
+            "and the next patchable acceptance-yield bottleneck."
+        ),
+        "rollback": "No rollback needed; this task reads logs only and never mutates runtime or source.",
+        "evidence": evidence,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 320",
+    }
+
+
 def agent_deliberation_task(timestamp: int, *, slug: str, priority: int, target: str, hypothesis: str, acceptance: str, evidence: dict[str, Any]) -> dict[str, Any]:
     task = {
         "id": f"agent-deliberation-{slug}-{timestamp}",
@@ -4799,6 +4956,15 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     exhausted = set(exhausted_lanes(root))
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     canonical = canonical_autoresearch_state(root, recent_rows=160)
+    bottleneck_state = drafter_bottleneck_state(root, rows, recent_rows=240)
+    bottleneck_tasks: list[dict[str, Any]] = []
+    if bottleneck_state["state"] != "no_terminal_quantized_blocker":
+        bottleneck_tasks = drafter_bottleneck_next_tasks(
+            root,
+            rows,
+            timestamp,
+            reason="Frontier deliberation selected the canonical JANQ drafter bottleneck route",
+        )
     source_artifact = latest_source_scout_artifact(root)
     decode_mean = latest_decode_mean(root, recent_rows=160)
     measurement = measurement_artifact_analysis(root, recent_rows=160)
@@ -4808,6 +4974,7 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         "active_noise": canonical.get("noise", {}),
         "exhausted_lanes": sorted(exhausted),
         "calibration_blocker": calibration_blocker,
+        "drafter_bottleneck_state": bottleneck_state,
         "decode_mean_tps": decode_mean,
         "measurement_artifact": measurement,
         "source_scout_artifact": source_artifact.get("_artifact_path", ""),
@@ -4856,7 +5023,10 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     }
     selected_task: dict[str, Any] | None = None
     selected_reason = ""
-    if (
+    if bottleneck_tasks:
+        selected_task = bottleneck_tasks[0]
+        selected_reason = f"canonical JANQ drafter bottleneck next_step={bottleneck_state.get('next_step')}"
+    elif (
         not source_artifact
         and not active_task_has_prefix(root, "agent-deliberation-source-scout-")
         and not recent_keep_result_has_prefix(root, "source-scout-", recent_rows=240)
@@ -4866,38 +5036,15 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     elif calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER and not active_task_has_prefix(
         root, "agent-deliberation-adapter-logit-contract-"
     ):
-        selected_task = agent_deliberation_task(
+        selected_task = drafter_adapter_method_contract_task(
             timestamp,
-            slug="adapter-logit-contract",
+            task_id=f"agent-deliberation-adapter-logit-contract-{timestamp}",
             priority=99,
-            target="openclaw/openclaw-mtp-drafter-calibrate.py",
-            hypothesis=(
-                "The next viable JANQ drafter path is a stop-gradient adapter/logit-distillation contract "
-                "that trains only a small fit layer from target-generated traces."
-            ),
-            acceptance=(
-                "A canary-only contract defines the trainable layer, frozen target boundary, trace schema, "
-                "acceptance metric, memory class, rollback, and paired decode promotion gate."
-            ),
-            evidence=evidence,
         )
+        selected_task["evidence"] = evidence
         selected_reason = "quantized-gradient blocker requires a non-gradient-through-target adapter path"
     elif not active_task_has_prefix(root, "agent-deliberation-mtp-acceptance-yield-"):
-        selected_task = agent_deliberation_task(
-            timestamp,
-            slug="mtp-acceptance-yield",
-            priority=97,
-            target="openclaw/openclaw-jang-vlm-server.py",
-            hypothesis=(
-                "If drafter training is blocked, improve accepted-token yield instrumentation so the next "
-                "candidate optimizes mean_accept instead of raw repeated decode samples."
-            ),
-            acceptance=(
-                "A canary-only source test verifies MTP accepted-token yield, rejection reason, and rollback "
-                "metrics are exposed without changing live model behavior."
-            ),
-            evidence=evidence,
-        )
+        selected_task = mtp_acceptance_yield_task(timestamp, evidence=evidence)
         selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
     if selected_task is None:
         selected_task = agent_deliberation_task(
@@ -5191,8 +5338,10 @@ def quality_review(args: argparse.Namespace) -> int:
     compacted_stage_tasks = compact_duplicate_calibration_stage_tasks(root)
     compacted_canary_tasks = compact_stale_calibration_canary_tasks(root)
     compacted_terminal_tasks = compact_terminal_calibration_tasks(root)
+    compacted_direct_canaries = compact_direct_calibration_canaries_after_bottleneck(root)
     rows = result_rows(root)
     recent = rows[-max(1, int(args.recent_rows)) :]
+    compacted_runtime_tasks = compact_repeated_runtime_overhead_tasks(root, rows, recent_rows=int(args.recent_rows))
     raw_blocked = [row for row in recent if row.get("status") == "blocked"]
     blocked = unresolved_actionable_blocked_rows(recent)
     certification_blocked = [row for row in raw_blocked if is_certification_blocked_row(row)]
@@ -5345,6 +5494,11 @@ def quality_review(args: argparse.Namespace) -> int:
         for task in active_tasks
         if str(task.get("lane", "")) not in exhausted
     }
+    active_runtime_tasks = [
+        task
+        for task in active_tasks
+        if str(task.get("lane", "")) == "runtime-overhead" or str(task.get("supervisor_action", "")) == "runtime-overhead-map"
+    ]
     frontier_lanes = {"runtime-overhead", "drafter-alignment", "frontier-dflash", "frontier-expansion"}
     frontier_ready = sorted(active_lanes & frontier_lanes)
     clean_runtime_maps = recent_clean_runtime_overhead_maps(root, recent, recent_rows=int(args.recent_rows))
@@ -5368,7 +5522,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "variance_significant_best": bool(variance.get("significant_best")),
         "no_measurement_artifact": not bool(artifact_check.get("artifact_suspected")),
         "no_contaminated_wall_clock": not contaminated_signals,
-        "runtime_overhead_not_repeated": len(clean_runtime_maps) < 2,
+        "runtime_overhead_not_repeated": len(clean_runtime_maps) < 2 or not active_runtime_tasks,
         "ready_task_contracts_ok": bool(contract.get("ok")),
     }
     quality_score = 100
@@ -5495,7 +5649,8 @@ def quality_review(args: argparse.Namespace) -> int:
         quality_score -= 10
         recommendations.append("variance gate: best decode result has not cleared the observed noise band; keep measuring or change hypothesis.")
     if len(clean_runtime_maps) >= 2:
-        quality_score -= 25
+        if active_runtime_tasks:
+            quality_score -= 25
         recommendations.append(
             "runtime-overhead map has repeatedly reported clean measurements; stop repeating that lane until a fresh contaminated benchmark appears."
         )
@@ -5604,14 +5759,24 @@ def quality_review(args: argparse.Namespace) -> int:
         )
     if not deterministic_ready:
         recommendations.append("no deterministic ready task remained after review; seeded one lane-contract fallback.")
-        seeded_tasks.extend(
-            lane_contract_fallback_tasks(
-                root,
-                rows,
-                int(time.time()),
-                reason="Quality review found no deterministic ready work",
-            )
+        fallback_tasks = lane_contract_fallback_tasks(
+            root,
+            rows,
+            int(time.time()),
+            reason="Quality review found no deterministic ready work",
         )
+        if fallback_tasks:
+            seeded_tasks.extend(fallback_tasks)
+        else:
+            deliberation_report, deliberation_tasks = frontier_agent_deliberation(root, rows, int(time.time()))
+            if deliberation_tasks:
+                recommendations.append(
+                    "lane-contract fallback was exhausted; seeded frontier deliberation with a concrete executable task."
+                )
+                seeded_tasks.extend(deliberation_tasks)
+                deliberation_path = root / "benchmarks" / f"frontier-agent-deliberation-{deliberation_report['timestamp']}.json"
+                deliberation_report["seeded"] = len(deliberation_tasks)
+                deliberation_path.write_text(json.dumps(deliberation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not recommendations:
         recommendations.append("research quality is acceptable; continue current queue.")
     verdict = "healthy"
@@ -5706,6 +5871,8 @@ def quality_review(args: argparse.Namespace) -> int:
         "compacted_stage_tasks": compacted_stage_tasks,
         "compacted_canary_tasks": compacted_canary_tasks,
         "compacted_terminal_tasks": compacted_terminal_tasks,
+        "compacted_direct_canaries": compacted_direct_canaries,
+        "compacted_runtime_tasks": compacted_runtime_tasks,
         "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
         "recommendations": recommendations,
         "seeded_tasks": seeded,
