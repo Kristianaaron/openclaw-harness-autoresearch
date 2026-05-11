@@ -3913,6 +3913,146 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     return True, first_issue
 
 
+def append_autonomous_repair_result(
+    cycle: int,
+    session: str,
+    *,
+    status: str,
+    reason: str,
+    attempts: int,
+    deterministic_ready: int,
+) -> None:
+    append_result(
+        WORKSPACE,
+        run_id=f"autonomous-repair-{cycle}-{int(time.time())}",
+        status=status,
+        target="autoresearch-autonomous-repair",
+        hypothesis="quality or stability drops should be repaired by the supervisor before human review is needed",
+        commit=current_commit(),
+        notes=(
+            f"session={session} attempts={attempts} deterministic_ready={deterministic_ready} "
+            f"reason={clean_tsv(reason)}"
+        ),
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "autonomous-repair-owner",
+            "finding": "supervisor owned a quality/stability repair loop instead of waiting for a human scan",
+            "status": status,
+            "reason": reason,
+            "attempts": attempts,
+            "deterministic_ready": deterministic_ready,
+            "next": "continue the ready deterministic task queue" if status == "keep" else "run the next bounded repair attempt",
+        },
+    )
+
+
+def run_autonomous_repair_loop(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    log_file: Path,
+    *,
+    reason: str,
+) -> tuple[bool, str]:
+    """Own local quality/stability recovery inside the supervisor.
+
+    This is the replacement for the old human-in-the-loop pattern of
+    "ask Codex to scan, explain, and patch."  The loop is deliberately bounded:
+    review current evidence, curate/evolve policy lessons, synthesize exactly
+    one deterministic repair/refocus path, re-review, then either continue with
+    a clean ready task queue or record a bounded blocker.
+    """
+
+    if not getattr(args, "autonomous_repair", True):
+        return False, "autonomous repair disabled"
+    attempts = max(1, int(getattr(args, "autonomous_repair_attempts", 2)))
+    last_issue = reason
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} autonomous repair owner "
+            f"reason={clean_tsv(reason)} =====\n"
+        )
+    for attempt in range(1, attempts + 1):
+        review_ok, review_issue = run_supervisor_quality_review(
+            args,
+            cycle,
+            f"{session}-repair-{attempt}-pre",
+            log_file,
+        )
+        self_ok, self_issue = run_supervisor_self_improvement(
+            args,
+            cycle,
+            f"{session}-repair-{attempt}",
+            log_file,
+            reason=f"autonomous-repair:{reason}",
+        )
+        synth_ok, synth_issue = run_supervisor_synthesis(
+            args,
+            cycle,
+            f"{session}-repair-{attempt}",
+            log_file,
+        )
+        post_ok, post_issue = run_supervisor_quality_review(
+            args,
+            cycle,
+            f"{session}-repair-{attempt}-post",
+            log_file,
+        )
+        certification = frontier_certification_status(args)
+        deterministic = deterministic_ready_tasks()
+        last_issue = (
+            post_issue
+            or synth_issue
+            or self_issue
+            or review_issue
+            or "; ".join(str(item) for item in certification.get("issues", []))
+            or reason
+        )
+        if post_ok and self_ok and certification.get("ok") and deterministic:
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=f"repaired after attempt {attempt}",
+                attempts=attempt,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
+        if synth_issue == "supervisor synthesis terminal no-work" and certification.get("ok") and deterministic:
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=f"terminal synthesis but certified deterministic work exists after attempt {attempt}",
+                attempts=attempt,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
+        if review_ok and post_ok and synth_ok and deterministic:
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=f"deterministic repair/refocus task queued after attempt {attempt}",
+                attempts=attempt,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
+    deterministic = deterministic_ready_tasks()
+    append_autonomous_repair_result(
+        cycle,
+        session,
+        status="blocked",
+        reason=last_issue,
+        attempts=attempts,
+        deterministic_ready=len(deterministic),
+    )
+    return False, last_issue
+
+
 def latest_json_artifact(pattern: str) -> dict[str, object]:
     paths = list(BENCHMARKS.glob(pattern))
     if not paths:
@@ -4220,8 +4360,8 @@ def main() -> int:
     parser.add_argument(
         "--self-evolution",
         action=argparse.BooleanOptionalAction,
-        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_EVOLUTION", "0") == "1",
-        help="run canary-only skill evolution after self-improvement curation; disabled by default",
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_SELF_EVOLUTION", "1") != "0",
+        help="run canary-only skill evolution after self-improvement curation",
     )
     parser.add_argument(
         "--self-evolution-max-variants-per-skill",
@@ -4397,6 +4537,18 @@ def main() -> int:
         default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_CERT_MIN_QUALITY", "90")),
         help="minimum quality-review scorecard required before starting autonomous cycles",
     )
+    parser.add_argument(
+        "--autonomous-repair",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMOUS_REPAIR", "1") != "0",
+        help="own quality/stability repair inside the supervisor instead of pausing for human review",
+    )
+    parser.add_argument(
+        "--autonomous-repair-attempts",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMOUS_REPAIR_ATTEMPTS", "2")),
+        help="bounded repair attempts before recording a blocker",
+    )
     args = parser.parse_args()
     INTERRUPT_CONTEXT.update(
         {
@@ -4452,8 +4604,17 @@ def main() -> int:
     if args.certify_startup:
         certified, certification_issue = run_frontier_startup_certification(args, log_file)
         if not certified:
-            log(f"startup frontier certification failed: {certification_issue}")
-            return 2
+            repair_ok, repair_issue = run_autonomous_repair_loop(
+                args,
+                0,
+                args.session,
+                log_file,
+                reason=f"startup certification failed: {certification_issue}",
+            )
+            if not repair_ok:
+                log(f"startup frontier certification failed after autonomous repair: {repair_issue}")
+                return 2
+            log("startup frontier certification recovered by autonomous repair owner")
     cycle = 0
     while True:
         INTERRUPT_CONTEXT["cycle"] = cycle
@@ -4829,6 +4990,18 @@ def main() -> int:
                 log_file,
             )
             log(f"cycle={cycle} quality_review ok={review_ok} issue={review_issue or 'none'}")
+            if not review_ok or review_issue:
+                repair_ok, repair_issue = run_autonomous_repair_loop(
+                    args,
+                    cycle,
+                    current_session,
+                    log_file,
+                    reason=review_issue or "quality review failed",
+                )
+                log(
+                    f"cycle={cycle} autonomous_repair ok={repair_ok} "
+                    f"issue={repair_issue or 'none'}"
+                )
             external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
             if external_stop:
                 log(f"cycle={cycle} quality_review_external_stop reason={external_status.get('reason')}")
@@ -4872,6 +5045,17 @@ def main() -> int:
             )
             append_supervisor_result(cycle, current_session, "blocked", last_issue)
             log(f"cycle={cycle} recorded supervisor blocked row for issue={last_issue}")
+            repair_ok, repair_issue = run_autonomous_repair_loop(
+                args,
+                cycle,
+                current_session,
+                log_file,
+                reason=last_issue or str(quality["reason"]),
+            )
+            log(
+                f"cycle={cycle} autonomous_repair_after_block ok={repair_ok} "
+                f"issue={repair_issue or 'none'}"
+            )
             if block_task_after_repeated_guard(selected_task, last_issue):
                 log(
                     f"cycle={cycle} blocked implementation task={selected_task.get('id', 'unknown')} "

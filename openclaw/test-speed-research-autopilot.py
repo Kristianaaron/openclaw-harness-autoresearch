@@ -422,12 +422,59 @@ def check_quality_review_repairs_before_scoring(helper) -> None:
         assert names.index("quality-review") < names.index("frontier-eval")
 
 
+def check_autonomous_repair_owner(helper) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_workspace(helper, Path(tmp))
+        helper.ensure_task_queue()
+        args = Namespace(
+            autonomous_repair=True,
+            autonomous_repair_attempts=2,
+            self_improvement=True,
+            self_evolution=True,
+            self_improvement_recent_rows=160,
+            self_improvement_timeout_seconds=5,
+            self_evolution_max_variants_per_skill=2,
+            self_evolution_min_score=90,
+        )
+        with patch.object(
+            helper,
+            "run_supervisor_quality_review",
+            side_effect=[(True, "implementation-handoff-audit exit 2"), (True, "")],
+        ) as review_mock:
+            with patch.object(helper, "run_supervisor_self_improvement", return_value=(True, "")) as improve_mock:
+                with patch.object(helper, "run_supervisor_synthesis", return_value=(True, "")) as synth_mock:
+                    with patch.object(helper, "frontier_certification_status", return_value={"ok": True, "issues": []}):
+                        with patch.object(
+                            helper,
+                            "deterministic_ready_tasks",
+                            return_value=[{"id": "deterministic-repair-task"}],
+                        ):
+                            ok, issue = helper.run_autonomous_repair_loop(
+                                args,
+                                17,
+                                "unit",
+                                helper.WORKSPACE / "autopilot.log",
+                                reason="unit quality drop",
+                            )
+        assert ok is True
+        assert issue == ""
+        assert review_mock.call_count == 2
+        assert improve_mock.call_count == 1
+        assert synth_mock.call_count == 1
+        results = helper.RESULTS.read_text(encoding="utf-8")
+        assert "autoresearch-autonomous-repair" in results
+        assert "deterministic_ready=1" in results
+        findings = helper.FINDINGS.read_text(encoding="utf-8")
+        assert "autonomous-repair-owner" in findings
+
+
 def main() -> int:
     helper = load_helper()
     check_prompt_and_routing_guards(helper)
     check_memory_and_failure_guards(helper)
     check_terminal_bridge_no_work_is_neutral(helper)
     check_quality_review_repairs_before_scoring(helper)
+    check_autonomous_repair_owner(helper)
     with tempfile.TemporaryDirectory() as tmp:
         configure_workspace(helper, Path(tmp))
         helper.ensure_task_queue()
