@@ -994,6 +994,9 @@ def main() -> int:
                             if task["id"] == "drafter-adapter-method-contract-current":
                                 task["status"] = "blocked"
                                 task["blocked_at"] = "2026-05-10T00:00:00+0000"
+                                task["blocked_reason"] = "unit stale blocked reason"
+                                task["completed_at"] = "2026-05-09T00:00:00+0000"
+                                task["supervisor_summary"] = {"notes": "stale"}
                         helper.write_jsonl(revived_root / "tasks.jsonl", revived_tasks)
                         revived_seed = helper.lane_contract_fallback_tasks(
                             revived_root,
@@ -1009,6 +1012,9 @@ def main() -> int:
                             and task.get("status") == "ready"
                             and task.get("revived_at")
                             and "blocked_at" not in task
+                            and "blocked_reason" not in task
+                            and "completed_at" not in task
+                            and "supervisor_summary" not in task
                             for task in helper.read_jsonl(revived_root / "tasks.jsonl")
                         )
                         with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(repair_done_root)}, clear=False):

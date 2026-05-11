@@ -307,6 +307,26 @@ def quantized_trainable_parameter_names(trainable: dict[str, Any]) -> list[str]:
     )
 
 
+def blocks_quantized_drafter_training(args: argparse.Namespace, trainable: dict[str, Any]) -> bool:
+    """Return true when the selected method would differentiate quantized drafter weights."""
+    if getattr(args, "allow_quantized_drafter_training", False):
+        return False
+    if getattr(args, "calibration_mode", "direct-pre-projection") != "direct-pre-projection":
+        return False
+    return bool(quantized_trainable_parameter_names(trainable))
+
+
+class LogitBiasAdapter(nn.Module):
+    """Small canary adapter that trains outside the frozen quantized drafter."""
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.bias = mx.zeros((vocab_size,))
+
+    def __call__(self, logits: Any) -> Any:
+        return logits + self.bias
+
+
 def build_traces(model: Any, processor: Any, prompts: list[str], positions_per_prompt: int) -> list[dict[str, Any]]:
     traces: list[dict[str, Any]] = []
     for prompt in prompts:
@@ -324,11 +344,17 @@ def drafter_logits(drafter: Any, trace: dict[str, Any]) -> Any:
 
 
 def acceptance(drafter: Any, traces: list[dict[str, Any]]) -> float:
+    return acceptance_with_adapter(drafter, None, traces)
+
+
+def acceptance_with_adapter(drafter: Any, adapter: LogitBiasAdapter | None, traces: list[dict[str, Any]]) -> float:
     if not traces:
         return 0.0
     correct = 0
     for trace in traces:
         logits = drafter_logits(drafter, trace)
+        if adapter is not None:
+            logits = adapter(logits)
         pred = mx.argmax(logits, axis=-1)
         mx.eval(pred)
         correct += int(pred.item() == int(trace["label"].item()))
@@ -345,12 +371,14 @@ def train(args: argparse.Namespace) -> int:
     model, processor, drafter = load_target_and_drafter(args.target_path, args.drafter_path)
     require_memory_safe(args, phase="after-load")
 
+    calibration_mode = args.calibration_mode
     drafter.freeze()
-    drafter.pre_projection.unfreeze()
+    if calibration_mode == "direct-pre-projection":
+        drafter.pre_projection.unfreeze()
     trainable = dict(tree_flatten(drafter.trainable_parameters()))
     log("trainable parameters: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in trainable.items()))
     quantized_trainables = quantized_trainable_parameter_names(trainable)
-    if quantized_trainables and not args.allow_quantized_drafter_training:
+    if blocks_quantized_drafter_training(args, trainable):
         raise RuntimeError(
             "calibration quantized drafter gradient blocked: pre_projection exposes quantized "
             "trainable parameters; use a trainable adapter or saved-logit distillation head "
@@ -384,49 +412,65 @@ def train(args: argparse.Namespace) -> int:
     baseline = acceptance(drafter, eval_traces)
     log(f"baseline first-draft acceptance={baseline:.3f}")
 
+    adapter: LogitBiasAdapter | None = None
+    train_target: Any = drafter
+    if calibration_mode == "adapter-logit-distillation":
+        vocab_size = int(getattr(drafter.config, "vocab_size", 0) or model.config.text_config.vocab_size)
+        adapter = LogitBiasAdapter(vocab_size)
+        train_target = adapter
+
+        def loss_fn(adapter_model: LogitBiasAdapter, trace: dict[str, Any]) -> Any:
+            logits = mx.stop_gradient(drafter_logits(drafter, trace))
+            return nn.losses.cross_entropy(adapter_model(logits), trace["label"], reduction="mean")
+
+    else:
+
+        def loss_fn(draft_model: Any, trace: dict[str, Any]) -> Any:
+            logits = drafter_logits(draft_model, trace)
+            return nn.losses.cross_entropy(logits, trace["label"], reduction="mean")
+
     optimizer = optim.Adam(learning_rate=args.learning_rate)
-
-    def loss_fn(draft_model: Any, trace: dict[str, Any]) -> Any:
-        logits = drafter_logits(draft_model, trace)
-        return nn.losses.cross_entropy(logits, trace["label"], reduction="mean")
-
-    loss_and_grad = nn.value_and_grad(drafter, loss_fn)
+    loss_and_grad = nn.value_and_grad(train_target, loss_fn)
     best_acceptance = baseline
-    best_params = drafter.parameters()
+    best_params = train_target.parameters()
     start = time.monotonic()
     for step in range(1, args.steps + 1):
         if step == 1 or step % max(1, args.memory_check_every) == 0:
             require_memory_safe(args, phase=f"train-step-{step}")
         trace = train_traces[(step - 1) % len(train_traces)]
-        loss, grads = loss_and_grad(drafter, trace)
-        optimizer.update(drafter, grads)
-        mx.eval(drafter.parameters(), optimizer.state)
+        loss, grads = loss_and_grad(train_target, trace)
+        optimizer.update(train_target, grads)
+        mx.eval(train_target.parameters(), optimizer.state)
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
-            current = acceptance(drafter, eval_traces)
+            current = acceptance_with_adapter(drafter, adapter, eval_traces)
             log(f"step={step} loss={float(loss.item()):.4f} eval_acceptance={current:.3f}")
             if current >= best_acceptance:
                 best_acceptance = current
-                best_params = drafter.parameters()
-    drafter.update(best_params)
-    mx.eval(drafter.parameters())
+                best_params = train_target.parameters()
+    train_target.update(best_params)
+    mx.eval(train_target.parameters())
 
     copy_metadata(source, output)
-    from mlx_vlm.utils import save_weights
+    if adapter is None:
+        from mlx_vlm.utils import save_weights
 
-    save_weights(output, drafter)
+        save_weights(output, drafter)
+    else:
+        mx.savez(str(output / "openclaw-logit-bias-adapter.npz"), **adapter.parameters())
     metrics = {
         "baseline_first_draft_acceptance": baseline,
         "best_first_draft_acceptance": best_acceptance,
         "target_trace_policy": args.target_trace_policy,
         "target_gradient_policy": "stop-gradient",
-        "training_mode": "trace-distillation",
+        "training_mode": calibration_mode,
         "steps": args.steps,
         "learning_rate": args.learning_rate,
         "train_samples": len(train_traces),
         "eval_samples": len(eval_traces),
         "positions_per_prompt": args.positions_per_prompt,
         "elapsed_seconds": time.monotonic() - start,
-        "trainable": list(trainable.keys()),
+        "trainable": list(tree_flatten(train_target.trainable_parameters()).keys()),
+        "frozen_quantized_trainables": quantized_trainables,
     }
     (output / "openclaw-calibration.json").write_text(json.dumps(metrics, indent=2) + "\n")
     log(f"saved calibrated drafter to {output}")
@@ -557,6 +601,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-check-every", type=int, default=2)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
+    parser.add_argument(
+        "--calibration-mode",
+        choices=["direct-pre-projection", "adapter-logit-distillation"],
+        default="direct-pre-projection",
+        help=(
+            "direct-pre-projection tunes existing drafter projection weights; "
+            "adapter-logit-distillation freezes target/drafter weights and trains only a small logit adapter"
+        ),
+    )
     parser.add_argument("--target-trace-policy", choices=["stop-gradient"], default="stop-gradient")
     parser.add_argument(
         "--allow-quantized-drafter-training",

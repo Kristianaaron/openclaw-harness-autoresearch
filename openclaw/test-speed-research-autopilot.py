@@ -1372,6 +1372,8 @@ def main() -> int:
                 {
                     "id": "focused",
                     "status": "ready",
+                    "blocked_at": "2026-05-10T00:00:00+0000",
+                    "blocked_reason": "stale pre-revive blocker",
                     "task_type": "supervisor",
                     "supervisor_action": "focused-test",
                     "target": "openclaw/test-drafter-fit.py",
@@ -1389,6 +1391,11 @@ def main() -> int:
         assert code == 0
         assert issue == ""
         assert "supervisor-focused-test-10" in helper.RESULTS.read_text(encoding="utf-8")
+        focused_task = helper.read_jsonl(helper.TASKS)[0]
+        assert focused_task["status"] == "done"
+        assert "completed_at" in focused_task
+        assert "blocked_at" not in focused_task
+        assert "blocked_reason" not in focused_task
         gepa_helper = Path(tmp) / "gepa-helper.py"
         gepa_helper.write_text(
             "#!/usr/bin/env python3\n"

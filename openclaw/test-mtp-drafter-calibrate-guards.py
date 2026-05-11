@@ -66,6 +66,20 @@ def main() -> int:
             "pre_projection.biases": object(),
         }
     ) == ["pre_projection.biases", "pre_projection.scales"]
+    quantized = {
+        "pre_projection.weight": object(),
+        "pre_projection.scales": object(),
+        "pre_projection.biases": object(),
+    }
+    direct_args = args(calibration_mode="direct-pre-projection", allow_quantized_drafter_training=False)
+    adapter_args = args(calibration_mode="adapter-logit-distillation", allow_quantized_drafter_training=False)
+    assert helper.blocks_quantized_drafter_training(direct_args, quantized) is True
+    assert helper.blocks_quantized_drafter_training(adapter_args, quantized) is False
+    adapter = helper.LogitBiasAdapter(8)
+    logits = helper.mx.zeros((1, 8))
+    shifted = adapter(logits)
+    helper.mx.eval(shifted)
+    assert tuple(shifted.shape) == (1, 8)
     assert helper.parse_args(
         [
             "--target-path",
@@ -76,8 +90,10 @@ def main() -> int:
             "out",
             "--min-free-mb",
             "16000",
+            "--calibration-mode",
+            "adapter-logit-distillation",
         ]
-    ).min_free_mb == 16000
+    ).calibration_mode == "adapter-logit-distillation"
     with tempfile.TemporaryDirectory() as tmp:
         with patch.object(helper, "memory_snapshot", return_value=low_free):
             code = helper.main_with_args_for_test(

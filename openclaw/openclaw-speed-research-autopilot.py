@@ -2367,6 +2367,11 @@ def complete_supervisor_task(
             continue
         item["status"] = "done" if status == "keep" else "blocked"
         item["completed_at" if status == "keep" else "blocked_at"] = completed_at
+        if status == "keep":
+            item.pop("blocked_at", None)
+            item.pop("blocked_reason", None)
+        else:
+            item.pop("completed_at", None)
         item["completion_commit"] = commit
         item["supervisor_summary"] = summary
         changed = True

@@ -2031,6 +2031,9 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
                     "revived_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 }
                 revived.pop("blocked_at", None)
+                revived.pop("blocked_reason", None)
+                revived.pop("completed_at", None)
+                revived.pop("supervisor_summary", None)
                 existing[index] = revived
                 additions += 1
                 changed = True
@@ -2808,7 +2811,8 @@ def drafter_adapter_method_implementation_task(
         "revive_blocked": True,
         "priority": priority,
         "lane": "implementation-gate",
-        "task_type": "implementation",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": source_files,
         "hypothesis": (
@@ -2831,7 +2835,7 @@ def drafter_adapter_method_implementation_task(
         ),
         "rollback": "Discard adapter artifacts and keep the current official MTP drafter/profile if any gate fails.",
         "contract_path": contract_path,
-        "next_action": "create a minimal source patch that satisfies the drafter adapter method contract, then run patch-execute",
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-mtp-drafter-calibrate-guards.py",
         "created_at": timestamp,
     }
 
@@ -2906,7 +2910,7 @@ def drafter_bottleneck_next_tasks(
             ],
         )
     if step == "seed_adapter_method_implementation":
-        if any_task_has_prefix(root, "implementation-drafter-adapter-method-"):
+        if active_task_has_prefix(root, "implementation-drafter-adapter-method-"):
             return []
         return filter_seedable_tasks(
             root,
