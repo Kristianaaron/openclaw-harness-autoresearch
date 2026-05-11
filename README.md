@@ -82,6 +82,27 @@ candidate path instead of repeating the same synthesis or stopping:
 Every frontier-expansion task is no-model-load, canary-only, scoped to OpenClaw,
 and carries explicit acceptance and rollback gates before any later promotion.
 
+### Frontier Agent Deliberation
+
+When deterministic lane routing cannot find the next useful move, the supervisor
+can run a bounded agent-to-agent deliberation layer. It is intentionally not a
+free-form swarm. It has three fixed roles:
+
+- **Scout** gathers current evidence and can run a timeout-bounded source scout
+  against allowlisted hosts such as GitHub, Reddit, X, Hugging Face, Google AI
+  docs, Rapid-MLX, dFlash, GEPA, Hermes Agent, and Karpathy autoresearch.
+- **Skeptic** rejects repeated exhausted work, duplicate synthesis, DFlash retry
+  loops without a changed candidate, and MTP block sweeps that already settled.
+- **Architect** emits exactly one canary-only deterministic contract with
+  acceptance, rollback, no-model-load, no-live-profile-change, and
+  no-opencode-change gates.
+
+The deliberation layer only writes evidence artifacts and durable tasks. It does
+not mutate source, profiles, model settings, runtime processes, or opencode. If
+active memory/Metal noise exists, it fails closed. If non-memory tool/model noise
+is present, it routes one recovery contract so the noise is handled as evidence
+instead of counted as progress.
+
 ### Deterministic Lane Contracts
 
 Each research lane declares the work it is allowed to do:

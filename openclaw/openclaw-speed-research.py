@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,26 @@ DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
 )
+FRONTIER_SOURCE_URLS = (
+    "https://github.com/karpathy/autoresearch",
+    "https://github.com/stanfordnlp/dspy/blob/main/docs/docs/api/optimizers/GEPA/overview.md",
+    "https://github.com/NousResearch/hermes-agent",
+    "https://github.com/raullenchai/Rapid-MLX",
+    "https://github.com/z-lab/dflash",
+    "https://ai.google.dev/gemma/docs/mtp/mtp",
+    "https://huggingface.co/dealignai/Gemma-4-31B-JANG_4M-CRACK",
+    "https://www.reddit.com/r/LocalLLaMA/search.json?q=Gemma%204%20MTP%20drafter%20decode%20speed&restrict_sr=1&sort=new",
+    "https://x.com/search?q=Gemma%204%20MTP%20drafter%20decode%20speed&src=typed_query",
+)
+SOURCE_SCOUT_ALLOWED_HOSTS = {
+    "ai.google.dev",
+    "github.com",
+    "huggingface.co",
+    "raw.githubusercontent.com",
+    "reddit.com",
+    "www.reddit.com",
+    "x.com",
+}
 FULL_AUTONOMY_TESTS = (
     "python3 -m compileall -q openclaw",
     "python3 openclaw/test-speed-research.py",
@@ -1540,6 +1561,88 @@ def add_source(args: argparse.Namespace) -> int:
     return 0
 
 
+def source_scout(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    topic = args.topic or "frontier-decode-speed"
+    timestamp = int(time.time())
+    urls = list(FRONTIER_SOURCE_URLS)
+    queue = root / "sources" / "queue.md"
+    if queue.exists():
+        for match in re.finditer(r"https?://[^\s)>\"]+", queue.read_text(encoding="utf-8", errors="replace")):
+            url = match.group(0).rstrip(".,")
+            if url not in urls:
+                urls.append(url)
+    findings: list[dict[str, Any]] = []
+    for url in urls[: max(1, int(args.max_sources))]:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower()
+        if host not in SOURCE_SCOUT_ALLOWED_HOSTS:
+            findings.append({"url": url, "status": "skipped", "reason": f"host not allowlisted: {host}"})
+            continue
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "OpenClaw-Autoresearch-SourceScout/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=float(args.timeout)) as response:
+                raw = response.read(60000).decode("utf-8", errors="replace")
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.I | re.S)
+            title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+            text = re.sub(r"<[^>]+>", " ", raw)
+            text = re.sub(r"\s+", " ", text).strip()
+            findings.append(
+                {
+                    "url": url,
+                    "status": "fetched",
+                    "host": host,
+                    "title": title[:180],
+                    "snippet": text[:700],
+                }
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            findings.append({"url": url, "status": "unavailable", "host": host, "reason": str(error)[:240]})
+    fetched = sum(1 for item in findings if item.get("status") == "fetched")
+    report = {
+        "ok": True,
+        "kind": "source-scout",
+        "timestamp": timestamp,
+        "topic": topic,
+        "fetched": fetched,
+        "attempted": len(findings),
+        "allowlisted_hosts": sorted(SOURCE_SCOUT_ALLOWED_HOSTS),
+        "findings": findings,
+        "next": (
+            "feed fetched references into frontier-agent-deliberation"
+            if fetched
+            else "continue with local evidence; source scout failed closed without blocking the loop"
+        ),
+    }
+    path = root / "benchmarks" / f"source-scout-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "source-scout",
+            "finding": "source scout gathered bounded allowlisted references for frontier deliberation",
+            "evidence": {"path": str(path), "fetched": fetched, "attempted": len(findings), "topic": topic},
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"source-scout-{timestamp}",
+        status="keep",
+        target="frontier-source-scout",
+        hypothesis="frontier deliberation should use current allowlisted references without broad local searches or runtime mutation",
+        commit=current_commit(repo_root()),
+        notes=f"topic={topic} fetched={fetched} attempted={len(findings)} path={path}",
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0
+
+
 def model_request(base_url: str, payload: dict[str, Any], timeout: float) -> tuple[float, bytes]:
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -1960,6 +2063,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             fragment in task_id
             for fragment in (
                 "handoff-audit-",
+                "agent-deliberation",
                 "frontier-repair-",
                 "review-drafter-calibration-canary",
                 "review-janq-drafter-fit",
@@ -2483,6 +2587,17 @@ def active_task_has_prefix(root: Path, prefix: str) -> bool:
 
 def any_task_has_prefix(root: Path, prefix: str) -> bool:
     return any(str(task.get("id", "")).startswith(prefix) for task in read_jsonl(root / "tasks.jsonl"))
+
+
+def unique_task_id(root: Path, task_id: str) -> str:
+    existing = {str(task.get("id", "")) for task in read_jsonl(root / "tasks.jsonl")}
+    if task_id not in existing:
+        return task_id
+    for index in range(2, 100):
+        candidate = f"{task_id}-{index}"
+        if candidate not in existing:
+            return candidate
+    return f"{task_id}-{time.time_ns()}"
 
 
 def should_seed_action(root: Path, prefix: str, *, recent_rows: int = 80) -> bool:
@@ -4578,6 +4693,262 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
         if should_seed_action(root, prefix, recent_rows=240):
             return filter_seedable_tasks(root, [task])
     return []
+
+
+def source_scout_task(timestamp: int, *, evidence: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"agent-deliberation-source-scout-{timestamp}",
+        "status": "ready",
+        "priority": 100,
+        "lane": "frontier-deliberation",
+        "task_type": "supervisor",
+        "supervisor_action": "source-scout",
+        "target": "external-speed-references",
+        "topic": "JANQ Gemma4 drafter fit, MTP acceptance, DFlash, Rapid-MLX decode speed",
+        "hypothesis": (
+            "When local lanes are exhausted, a source-scout agent should gather current references before "
+            "the architect creates another implementation path."
+        ),
+        "metric": "source_evidence_count",
+        "guard_checks": [
+            "allowlisted_hosts_only",
+            "timeout_bounded",
+            "no_model_load",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": "A source-scout artifact records fetched/skipped allowlisted references and concrete next-source gaps.",
+        "rollback": "No rollback needed; this task writes an evidence artifact only and never mutates runtime or source.",
+        "evidence": evidence,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic frontier-decode-speed",
+    }
+
+
+def agent_deliberation_task(timestamp: int, *, slug: str, priority: int, target: str, hypothesis: str, acceptance: str, evidence: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": f"agent-deliberation-{slug}-{timestamp}",
+        "status": "ready",
+        "priority": priority,
+        "lane": "frontier-deliberation",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
+        "target": target,
+        "source_files": [
+            "openclaw/openclaw-speed-research.py",
+            "openclaw/openclaw-speed-research-autopilot.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": hypothesis,
+        "metric": "frontier_deliberation_contract",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": acceptance,
+        "rollback": "Discard the contract unless canary tests pass and later paired decode benchmarks beat the live baseline.",
+        "evidence": evidence,
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+    }
+
+
+def latest_source_scout_artifact(root: Path) -> dict[str, Any]:
+    return latest_json_artifact(root, "source-scout-*.json")
+
+
+def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestamp: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Create a bounded scout -> skeptic -> architect deliberation when known lanes are exhausted."""
+    exhausted = set(exhausted_lanes(root))
+    calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    canonical = canonical_autoresearch_state(root, recent_rows=160)
+    source_artifact = latest_source_scout_artifact(root)
+    decode_mean = latest_decode_mean(root, recent_rows=160)
+    measurement = measurement_artifact_analysis(root, recent_rows=160)
+    evidence = {
+        "canonical_state": canonical.get("state", ""),
+        "canonical_clean": canonical.get("clean", False),
+        "active_noise": canonical.get("noise", {}),
+        "exhausted_lanes": sorted(exhausted),
+        "calibration_blocker": calibration_blocker,
+        "decode_mean_tps": decode_mean,
+        "measurement_artifact": measurement,
+        "source_scout_artifact": source_artifact.get("_artifact_path", ""),
+    }
+    scout = {
+        "role": "scout",
+        "mission": "find one new high-upside decode-speed path after local lanes are exhausted",
+        "source_urls": list(FRONTIER_SOURCE_URLS),
+        "queries": [
+            "Gemma 4 MTP drafter speculative decoding acceptance",
+            "DFlash drafter JANQ quantized model compatibility",
+            "Rapid-MLX prefix cache MTP decode speed Apple Silicon",
+            "self improving coding agent evaluator supervisor GEPA",
+        ],
+        "proposals": [
+            "source-scout-refresh",
+            "adapter-logit-distillation-contract",
+            "mtp-acceptance-yield-model",
+        ],
+    }
+    rejected: list[dict[str, str]] = []
+    if "mtp-decode" in exhausted:
+        rejected.append(
+            {
+                "proposal": "repeat-mtp-block-sweep",
+                "reason": "MTP block-size tuning is exhausted; repeat measurements are not new evidence.",
+            }
+        )
+    if "frontier-dflash" in exhausted:
+        rejected.append(
+            {
+                "proposal": "retry-current-dflash-candidate",
+                "reason": "DFlash is exhausted until the draft candidate changes.",
+            }
+        )
+    skeptic = {
+        "role": "skeptic",
+        "hard_rejections": rejected,
+        "required_gates": [
+            "canonical_clean",
+            "zero_active_noise",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "contract_has_acceptance_and_rollback",
+        ],
+    }
+    selected_task: dict[str, Any] | None = None
+    selected_reason = ""
+    if (
+        not source_artifact
+        and not active_task_has_prefix(root, "agent-deliberation-source-scout-")
+        and not recent_keep_result_has_prefix(root, "source-scout-", recent_rows=240)
+    ):
+        selected_task = source_scout_task(timestamp, evidence=evidence)
+        selected_reason = "refresh external references before inventing another implementation contract"
+    elif calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER and not active_task_has_prefix(
+        root, "agent-deliberation-adapter-logit-contract-"
+    ):
+        selected_task = agent_deliberation_task(
+            timestamp,
+            slug="adapter-logit-contract",
+            priority=99,
+            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+            hypothesis=(
+                "The next viable JANQ drafter path is a stop-gradient adapter/logit-distillation contract "
+                "that trains only a small fit layer from target-generated traces."
+            ),
+            acceptance=(
+                "A canary-only contract defines the trainable layer, frozen target boundary, trace schema, "
+                "acceptance metric, memory class, rollback, and paired decode promotion gate."
+            ),
+            evidence=evidence,
+        )
+        selected_reason = "quantized-gradient blocker requires a non-gradient-through-target adapter path"
+    elif not active_task_has_prefix(root, "agent-deliberation-mtp-acceptance-yield-"):
+        selected_task = agent_deliberation_task(
+            timestamp,
+            slug="mtp-acceptance-yield",
+            priority=97,
+            target="openclaw/openclaw-jang-vlm-server.py",
+            hypothesis=(
+                "If drafter training is blocked, improve accepted-token yield instrumentation so the next "
+                "candidate optimizes mean_accept instead of raw repeated decode samples."
+            ),
+            acceptance=(
+                "A canary-only source test verifies MTP accepted-token yield, rejection reason, and rollback "
+                "metrics are exposed without changing live model behavior."
+            ),
+            evidence=evidence,
+        )
+        selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
+    if selected_task is None:
+        selected_task = agent_deliberation_task(
+            timestamp,
+            slug="open-problem-contract",
+            priority=95,
+            target="openclaw/openclaw-speed-research.py",
+            hypothesis=(
+                "All named frontier deliberation paths have prior evidence; create a fresh open-problem "
+                "contract that requires new evidence before any implementation task can run."
+            ),
+            acceptance=(
+                "The contract records exhausted proposals, required new evidence, source-scout requirements, "
+                "and a no-op rollback; it cannot promote code or mutate runtime by itself."
+            ),
+            evidence=evidence,
+        )
+        selected_reason = "all named deliberation paths have been attempted, so create a fresh evidence contract"
+    if selected_task:
+        selected_task["id"] = unique_task_id(root, str(selected_task.get("id", "")))
+    architect = {
+        "role": "architect",
+        "selected_task_id": selected_task.get("id", "") if selected_task else "",
+        "selected_reason": selected_reason,
+        "contract_complete": bool(
+            selected_task
+            and selected_task.get("acceptance")
+            and selected_task.get("rollback")
+            and "no_opencode_changes" in {str(item) for item in selected_task.get("guard_checks", [])}
+        ),
+    }
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    unsafe_noise_clear = int(noise.get("unresolved_blocked_rows", 0) or 0) == 0 and int(noise.get("memory_blocks", 0) or 0) == 0
+    gates = {
+        "canonical_clean_or_repairable_terminal": bool(canonical.get("clean")) or unsafe_noise_clear,
+        "zero_unsafe_noise": unsafe_noise_clear,
+        "task_selected": selected_task is not None,
+        "contract_complete": bool(architect["contract_complete"]),
+    }
+    tasks = [selected_task] if selected_task and all(gates.values()) else []
+    report = {
+        "ok": bool(tasks),
+        "kind": "frontier-agent-deliberation",
+        "timestamp": timestamp,
+        "scout": scout,
+        "skeptic": skeptic,
+        "architect": architect,
+        "gates": gates,
+        "evidence": evidence,
+        "seeded_tasks": [task["id"] for task in tasks],
+        "next": "run selected deterministic task" if tasks else "pause; no safe deliberation contract passed",
+    }
+    return report, tasks
+
+
+def frontier_deliberation(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    report, tasks = frontier_agent_deliberation(root, result_rows(root), timestamp)
+    seeded = upsert_tasks(root, tasks) if tasks else 0
+    report["seeded"] = seeded
+    path = root / "benchmarks" / f"frontier-agent-deliberation-{timestamp}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "frontier-agent-deliberation",
+            "finding": "scout/skeptic/architect deliberation selected one bounded deterministic path",
+            "evidence": report,
+            "next": report["next"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"frontier-agent-deliberation-{timestamp}",
+        status="keep" if seeded else "discard",
+        target="frontier-agent-deliberation",
+        hypothesis="exhausted lanes should trigger bounded agent-to-agent deliberation instead of terminal churn",
+        commit=current_commit(repo_root()),
+        notes=f"seeded={seeded} task_ids={','.join(report['seeded_tasks'])} gates={report['gates']}",
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if seeded or args.allow_empty else 2
 
 
 def research_quality_scorecard(
@@ -7957,12 +8328,21 @@ def synthesize(args: argparse.Namespace) -> int:
     deliberate_tasks: list[dict[str, Any]] = []
     contract_tasks: list[dict[str, Any]] = []
     expansion_tasks: list[dict[str, Any]] = []
+    deliberation_report: dict[str, Any] = {}
+    deliberation_tasks: list[dict[str, Any]] = []
     if seeded == 0:
         deliberate_tasks = filter_seedable_tasks(root, synthesis_deliberate_action_tasks(root, rows, int(time.time())))
         seeded = upsert_tasks(root, deliberate_tasks) if deliberate_tasks else 0
     if seeded == 0:
         expansion_tasks = frontier_expansion_tasks(root, rows, int(time.time()))
         seeded = upsert_tasks(root, expansion_tasks) if expansion_tasks else 0
+    if seeded == 0:
+        deliberation_report, deliberation_tasks = frontier_agent_deliberation(root, rows, int(time.time()))
+        seeded = upsert_tasks(root, deliberation_tasks) if deliberation_tasks else 0
+        if deliberation_report:
+            path = root / "benchmarks" / f"frontier-agent-deliberation-{deliberation_report['timestamp']}.json"
+            deliberation_report["seeded"] = seeded
+            path.write_text(json.dumps(deliberation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if seeded == 0:
         contract_tasks = lane_contract_fallback_tasks(
             root,
@@ -8019,6 +8399,8 @@ def synthesize(args: argparse.Namespace) -> int:
             "deliberate_actions": [task["id"] for task in deliberate_tasks],
             "contract_actions": [task["id"] for task in contract_tasks],
             "frontier_expansion_actions": [task["id"] for task in expansion_tasks],
+            "deliberation_actions": [task["id"] for task in deliberation_tasks],
+            "deliberation_report": deliberation_report,
             "gepa_action": gepa_action,
             "gepa_report": gepa_report,
             "seeded_tasks": seeded,
@@ -8037,6 +8419,7 @@ def synthesize(args: argparse.Namespace) -> int:
             f"deliberate_actions={','.join(task['id'] for task in deliberate_tasks)} "
             f"contract_actions={','.join(task['id'] for task in contract_tasks)} "
             f"frontier_expansion_actions={','.join(task['id'] for task in expansion_tasks)} "
+            f"deliberation_actions={','.join(task['id'] for task in deliberation_tasks)} "
             f"gepa_action={gepa_action} terminal_no_work={terminal_no_work}"
         ),
     )
@@ -8049,6 +8432,7 @@ def synthesize(args: argparse.Namespace) -> int:
                 "deliberate_actions": [task["id"] for task in deliberate_tasks],
                 "contract_actions": [task["id"] for task in contract_tasks],
                 "frontier_expansion_actions": [task["id"] for task in expansion_tasks],
+                "deliberation_actions": [task["id"] for task in deliberation_tasks],
                 "gepa_action": gepa_action,
                 "status": status,
                 "terminal_no_work": terminal_no_work,
@@ -8078,11 +8462,67 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
     seeded_prerequisite = False
     seeded_fallback = False
     seeded_expansion = False
+    seeded_deliberation = False
+    deliberation_attempts: list[dict[str, Any]] = []
     terminal_handoff_exhausted = False
     bridge_zero = recent_empty_bridge_rows(root, rows, recent_rows=120)
     bridge_only_ready = bool(deterministic_ready) and all(is_implementation_bridge_task(task) for task in deterministic_ready)
     canonical = canonical_autoresearch_state(root, recent_rows=120)
     canonical_state = str(canonical.get("state", ""))
+
+    def seed_deliberation_once() -> bool:
+        nonlocal seeded_deliberation, seeded_prerequisite
+        deliberation_report, deliberation_tasks = frontier_agent_deliberation(root, rows, timestamp)
+        seeded_deliberation = bool(upsert_tasks(root, deliberation_tasks))
+        gates = deliberation_report.get("gates", {}) if isinstance(deliberation_report, dict) else {}
+        deliberation_attempts.append(
+            {
+                "ok": bool(deliberation_report.get("ok")) if isinstance(deliberation_report, dict) else False,
+                "seeded": seeded_deliberation,
+                "task_count": len(deliberation_tasks),
+                "gates": gates,
+                "selected_task_id": str(
+                    (deliberation_report.get("architect", {}) if isinstance(deliberation_report, dict) else {}).get(
+                        "selected_task_id", ""
+                    )
+                ),
+            }
+        )
+        evidence = deliberation_report.get("evidence", {}) if isinstance(deliberation_report, dict) else {}
+        active_noise = evidence.get("active_noise", {}) if isinstance(evidence, dict) else {}
+        memory_noise = int(active_noise.get("memory_blocks", 0) or 0) if isinstance(active_noise, dict) else 0
+        can_seed_repair_contract = bool(gates.get("zero_unsafe_noise")) or memory_noise == 0
+        if not seeded_deliberation and can_seed_repair_contract:
+            recovery_task = agent_deliberation_task(
+                timestamp,
+                slug="handoff-recovery-contract",
+                priority=94,
+                target="openclaw/openclaw-speed-research.py",
+                hypothesis=(
+                    "Implementation handoff reached a no-ready-work or repair-needed terminal state after known lanes "
+                    "were exhausted; create one canary-only recovery contract that routes active non-memory noise "
+                    "before any implementation."
+                ),
+                acceptance=(
+                    "A recovery contract records the exhausted lane evidence, source-scout requirement, acceptance gates, "
+                    "active noise classification, and rollback path; it cannot mutate source, model profile, or runtime by itself."
+                ),
+                evidence=evidence,
+            )
+            recovery_task["id"] = unique_task_id(root, str(recovery_task.get("id", "")))
+            seeded_deliberation = bool(upsert_tasks(root, [recovery_task]))
+            deliberation_report["recovery_task_seeded"] = int(seeded_deliberation)
+            deliberation_attempts[-1]["recovery_task_seeded"] = seeded_deliberation
+            deliberation_attempts[-1]["recovery_task_id"] = str(recovery_task.get("id", ""))
+            if seeded_deliberation:
+                deliberation_report["seeded_tasks"] = [str(recovery_task.get("id", ""))]
+        seeded_prerequisite = seeded_prerequisite or seeded_deliberation
+        if deliberation_report:
+            path = root / "benchmarks" / f"frontier-agent-deliberation-{timestamp}.json"
+            deliberation_report["seeded"] = int(seeded_deliberation)
+            path.write_text(json.dumps(deliberation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return seeded_deliberation
+
     if not deterministic_ready or (bridge_only_ready and bridge_zero):
         if bridge_zero:
             prerequisite_tasks = concrete_handoff_prerequisite_tasks(root, rows, timestamp)
@@ -8091,6 +8531,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
                 expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
                 seeded_expansion = bool(upsert_tasks(root, expansion_tasks))
                 seeded_prerequisite = seeded_expansion
+            if not seeded_prerequisite:
+                seed_deliberation_once()
             if not seeded_prerequisite:
                 fallback_tasks = lane_contract_fallback_tasks(
                     root,
@@ -8108,6 +8550,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
                 expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
                 seeded_expansion = bool(upsert_tasks(root, expansion_tasks))
                 seeded_prerequisite = seeded_expansion
+            if not seeded_prerequisite:
+                seed_deliberation_once()
             if not seeded_prerequisite:
                 fallback_tasks = lane_contract_fallback_tasks(
                     root,
@@ -8142,6 +8586,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
                     ],
                 )
             )
+        if not seeded_prerequisite and not seeded_bridge:
+            seed_deliberation_once()
         tasks = read_jsonl(root / "tasks.jsonl")
         ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
         deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
@@ -8207,6 +8653,8 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
         "seeded_prerequisite": seeded_prerequisite,
         "seeded_fallback": seeded_fallback,
         "seeded_expansion": seeded_expansion,
+        "seeded_deliberation": seeded_deliberation,
+        "deliberation_attempts": deliberation_attempts,
         "terminal_handoff_exhausted": terminal_handoff_exhausted,
         "recent_empty_bridges": len(bridge_zero),
         "implementation_candidates": [str(task.get("id", "")) for task in candidates],
@@ -8246,6 +8694,7 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
             f"ready_deterministic={len(deterministic_ready)} seeded_bridge={seeded_bridge} "
             f"seeded_prerequisite={seeded_prerequisite} empty_bridges={len(bridge_zero)} "
             f"seeded_fallback={seeded_fallback} seeded_expansion={seeded_expansion} "
+            f"seeded_deliberation={seeded_deliberation} "
             f"terminal_handoff_exhausted={terminal_handoff_exhausted} "
             f"blockers={len(contract_blockers)}"
         ),
@@ -9685,6 +10134,16 @@ def main() -> int:
     synth = sub.add_parser("synthesize")
     synth.add_argument("--kind", choices=["frontier", "current-stack"], default="frontier")
     synth.set_defaults(func=synthesize)
+
+    source = sub.add_parser("source-scout")
+    source.add_argument("--topic", default="frontier-decode-speed")
+    source.add_argument("--timeout", type=float, default=6.0)
+    source.add_argument("--max-sources", type=int, default=10)
+    source.set_defaults(func=source_scout)
+
+    deliberation = sub.add_parser("frontier-deliberation")
+    deliberation.add_argument("--allow-empty", action="store_true")
+    deliberation.set_defaults(func=frontier_deliberation)
 
     review = sub.add_parser("quality-review")
     review.add_argument("--recent-rows", type=int, default=120)

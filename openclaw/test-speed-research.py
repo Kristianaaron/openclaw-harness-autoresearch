@@ -1828,6 +1828,50 @@ def main() -> int:
             ]
             assert handoff_rows[-1]["status"] == "keep"
             assert "seeded_expansion=True" in handoff_rows[-1]["notes"]
+            completed_handoff_tasks = helper.read_jsonl(root / "tasks.jsonl")
+            for task in completed_handoff_tasks:
+                task["status"] = "done"
+            helper.write_jsonl(root / "tasks.jsonl", completed_handoff_tasks)
+            helper.append_result(
+                root,
+                run_id="supervisor-implementation-bridge-deliberation",
+                status="keep",
+                target="implementation-bridge",
+                hypothesis="unit terminal deliberation",
+                commit="abc123",
+                notes="seeded=0 ready_deterministic=0 terminal_no_work=True issue=supervisor synthesis terminal no-work",
+            )
+            with patch.object(helper, "concrete_handoff_prerequisite_tasks", return_value=[]):
+                with patch.object(helper, "frontier_expansion_tasks", return_value=[]):
+                    with patch.object(helper, "lane_contract_fallback_tasks", return_value=[]):
+                        assert helper.implementation_handoff_audit(Namespace(min_score=90)) == 0
+            deliberation_handoff = json.loads(
+                max(
+                    (root / "benchmarks").glob("implementation-handoff-audit-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert deliberation_handoff["terminal_handoff_exhausted"] is False
+            assert deliberation_handoff["seeded_deliberation"] is True
+            deliberation_tasks = [
+                task for task in helper.read_jsonl(root / "tasks.jsonl") if str(task.get("id", "")).startswith("agent-deliberation-")
+            ]
+            assert deliberation_tasks
+            deliberation_artifact = json.loads(
+                max(
+                    (root / "benchmarks").glob("frontier-agent-deliberation-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert (
+                deliberation_artifact["gates"]["canonical_clean_or_repairable_terminal"] is True
+                or deliberation_artifact.get("recovery_task_seeded") == 1
+            )
+            assert (
+                deliberation_artifact["gates"]["zero_unsafe_noise"] is True
+                or deliberation_artifact.get("recovery_task_seeded") == 1
+            )
+            assert deliberation_artifact["architect"]["contract_complete"] is True
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
