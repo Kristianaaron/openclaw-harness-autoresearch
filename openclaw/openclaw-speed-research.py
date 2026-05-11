@@ -6858,6 +6858,164 @@ def frontier_autonomy_score(args: argparse.Namespace) -> int:
     return 0 if report["ok"] or args.allow_fail else 2
 
 
+def sota_autonomy_eval_report(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    ensure_research_state(root)
+    contracts = ensure_lane_contracts(root)
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
+    quality = latest_json_artifact(root, "quality-review-*.json")
+    alive = self_improvement_alive_report(root, recent_rows=recent_rows)
+    deliberation = latest_json_artifact(root, "frontier-agent-deliberation-*.json")
+    source_scout = latest_json_artifact(root, "source-scout-*.json")
+    burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
+    high_risk_patch = (
+        "diff --git a/openclaw/openclaw-mtp-drafter-calibrate.py b/openclaw/openclaw-mtp-drafter-calibrate.py\n"
+        "--- a/openclaw/openclaw-mtp-drafter-calibrate.py\n"
+        "+++ b/openclaw/openclaw-mtp-drafter-calibrate.py\n"
+        "@@ -1 +1 @@\n"
+        "-MODE = 'old'\n"
+        "+MODE = 'new'\n"
+    )
+    high_risk_classification = classify_patch(
+        high_risk_patch,
+        source_files=["openclaw/openclaw-mtp-drafter-calibrate.py"],
+    )
+    high_risk_task = agent_deliberation_task(
+        int(time.time()),
+        slug="sota-eval-high-risk",
+        priority=1,
+        target="openclaw/openclaw-jang-vlm-server.py",
+        hypothesis="SOTA eval fixture: high-risk agent path must require Crabbox before promotion.",
+        acceptance="SOTA eval fixture only.",
+        evidence={},
+    )
+    program_path = root / "program.md"
+    program_text = program_path.read_text(encoding="utf-8", errors="replace") if program_path.exists() else ""
+    profile_terms = ["Primary metric", "secondary", "Research Method", "Current Priority", "Implementation Gate"]
+    lane_contracts = contracts.get("lanes") if isinstance(contracts.get("lanes"), dict) else {}
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    deliberation_gates = deliberation.get("gates") if isinstance(deliberation.get("gates"), dict) else {}
+    scout_findings = source_scout.get("findings") if isinstance(source_scout.get("findings"), list) else []
+    quality_score = float(quality.get("quality_score") or 0)
+    scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    frontier_overall = float(frontier.get("overall") or 0)
+    alive_score = float(alive.get("total_score") or 0)
+    gates = {
+        "zero_active_noise": all(int(noise.get(key, 0) or 0) == 0 for key in noise),
+        "canonical_clean": bool(canonical.get("clean")),
+        "frontier_eval_available": frontier_overall > 0,
+        "quality_review_available": quality_score > 0,
+        "alive_eval_available": alive_score > 0,
+        "deliberation_artifact_available": bool(deliberation),
+        "deliberation_gated": bool(deliberation_gates)
+        and all(bool(deliberation_gates.get(key)) for key in ("task_selected", "contract_complete")),
+        "source_scout_available": bool(source_scout),
+        "source_scout_allowlisted": bool(source_scout)
+        and all(str(item.get("status")) in {"fetched", "skipped", "unavailable"} for item in scout_findings),
+        "high_risk_classification_requires_crabbox": high_risk_classification.get("impact") == "high-risk"
+        and high_risk_classification.get("crabbox_required") is True
+        and high_risk_classification.get("auto_promote") is False,
+        "agent_high_risk_task_requires_crabbox": high_risk_task.get("crabbox_required") is True
+        and "crabbox_static_ssh_mac" in {str(item) for item in high_risk_task.get("guard_checks", [])},
+        "lane_contracts_present": len(lane_contracts) >= 4,
+        "program_is_goal_modular": sum(1 for term in profile_terms if term in program_text) >= 4,
+        "stability_burn_in_available": bool(burn_in),
+        "burn_in_clean_if_present": not burn_in or bool(burn_in.get("ok")),
+    }
+    components = {
+        "stability_zero_noise": 20 if gates["zero_active_noise"] and gates["canonical_clean"] else 0,
+        "autonomous_problem_solving": 20 if gates["deliberation_artifact_available"] and gates["deliberation_gated"] else 0,
+        "source_retrieval_grounding": 15 if gates["source_scout_available"] and gates["source_scout_allowlisted"] else 0,
+        "sandbox_governance": 20
+        if gates["high_risk_classification_requires_crabbox"] and gates["agent_high_risk_task_requires_crabbox"]
+        else 0,
+        "modularity_topic_portability": 15 if gates["lane_contracts_present"] and gates["program_is_goal_modular"] else 0,
+        "frontier_review_stack": 10
+        if gates["frontier_eval_available"] and gates["quality_review_available"] and gates["alive_eval_available"]
+        else 0,
+    }
+    total_score = int(sum(components.values()))
+    hard_gate_failures = [
+        key
+        for key in (
+            "zero_active_noise",
+            "canonical_clean",
+            "high_risk_classification_requires_crabbox",
+            "agent_high_risk_task_requires_crabbox",
+            "burn_in_clean_if_present",
+        )
+        if not gates[key]
+    ]
+    report = {
+        "ok": total_score >= 95 and not hard_gate_failures,
+        "kind": "sota-autonomy-eval",
+        "timestamp": int(time.time()),
+        "total_score": total_score,
+        "verdict": "sota-autonomous-ready" if total_score >= 95 and not hard_gate_failures else "needs-evidence-or-repair",
+        "components": components,
+        "gates": gates,
+        "hard_gate_failures": hard_gate_failures,
+        "modularity": {
+            "score": components["modularity_topic_portability"],
+            "assessment": (
+                "portable: swap objective, metric, sources, and lane contracts without changing the runtime harness"
+                if components["modularity_topic_portability"] == 15
+                else "needs a clearer objective/profile contract before using this for unrelated topics"
+            ),
+            "lane_contract_count": len(lane_contracts),
+            "program_profile_terms_present": [term for term in profile_terms if term in program_text],
+        },
+        "evidence": {
+            "canonical_state": canonical,
+            "frontier_eval": frontier.get("_artifact_path", ""),
+            "frontier_overall": frontier_overall,
+            "quality_review": quality.get("_artifact_path", ""),
+            "quality_score": quality_score,
+            "quality_scorecard_overall": scorecard.get("overall"),
+            "alive_eval_score": alive_score,
+            "deliberation": deliberation.get("_artifact_path", ""),
+            "source_scout": source_scout.get("_artifact_path", ""),
+            "stability_burn_in": burn_in.get("_artifact_path", ""),
+            "high_risk_classification": high_risk_classification,
+            "high_risk_task": {
+                "risk_tier": high_risk_task.get("risk_tier"),
+                "crabbox_required": high_risk_task.get("crabbox_required"),
+                "guard_checks": high_risk_task.get("guard_checks"),
+            },
+        },
+        "next": (
+            "continue autoresearch"
+            if total_score >= 95 and not hard_gate_failures
+            else "run missing review/source/deliberation evidence, then rerun sota-eval"
+        ),
+    }
+    return report
+
+
+def sota_autonomy_eval(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    report = sota_autonomy_eval_report(root, recent_rows=args.recent_rows)
+    path = root / "benchmarks" / f"sota-autonomy-eval-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"sota-autonomy-eval-{report['timestamp']}",
+        status="keep" if report["ok"] else "blocked",
+        target="autoresearch-sota-autonomy-eval",
+        hypothesis=(
+            "SOTA autonomy eval should prove zero-noise routing, agent deliberation, source grounding, "
+            "Crabbox governance, and topic modularity."
+        ),
+        commit=current_commit(repo_root()),
+        notes=(
+            f"ok={report['ok']} total_score={report['total_score']} verdict={report['verdict']} "
+            f"hard_gate_failures={','.join(report['hard_gate_failures']) or 'none'}"
+        ),
+    )
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if report["ok"] or args.allow_fail else 2
+
+
 def gepa_escalation(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -10247,6 +10405,11 @@ def main() -> int:
     autonomy.add_argument("--rollback-rehearsal-ok", action="store_true")
     autonomy.add_argument("--allow-fail", action="store_true")
     autonomy.set_defaults(func=frontier_autonomy_score)
+
+    sota = sub.add_parser("sota-eval")
+    sota.add_argument("--recent-rows", type=int, default=160)
+    sota.add_argument("--allow-fail", action="store_true")
+    sota.set_defaults(func=sota_autonomy_eval)
 
     stable_mark = sub.add_parser("stable-build-mark")
     stable_mark.add_argument("--repo", default="")

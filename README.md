@@ -315,6 +315,7 @@ Live no-model review checks:
 ~/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30
 ~/.openclaw/bin/openclaw-speed-research implementation-handoff-audit --min-score 90
 ~/.openclaw/bin/openclaw-speed-research frontier-eval --recent-rows 120 --min-score 9 --allow-fail
+~/.openclaw/bin/openclaw-speed-research sota-eval --recent-rows 160 --allow-fail
 ```
 
 The frontier eval tracks:
@@ -325,6 +326,12 @@ The frontier eval tracks:
 - implementation handoff;
 - self-improvement;
 - modularity.
+
+The SOTA eval is stricter about autonomous behavior. It separately scores
+zero-noise stability, Scout/Skeptic/Architect problem solving, allowlisted source
+retrieval, Crabbox governance for high-risk paths, topic portability, and the
+review stack. It is the best single check for whether the system can keep moving
+without human/Codex intervention while still failing closed on unsafe changes.
 
 ## Repository Layout
 

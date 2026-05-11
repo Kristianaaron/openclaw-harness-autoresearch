@@ -1903,6 +1903,11 @@ def main() -> int:
             assert high_risk_task["crabbox_required"] is True
             assert high_risk_task["promotion_blocked_until_crabbox"] is True
             assert "crabbox_static_ssh_mac" in high_risk_task["guard_checks"]
+            sota_report = helper.sota_autonomy_eval_report(root)
+            assert sota_report["components"]["sandbox_governance"] == 20
+            assert sota_report["gates"]["high_risk_classification_requires_crabbox"] is True
+            assert sota_report["gates"]["agent_high_risk_task_requires_crabbox"] is True
+            assert sota_report["modularity"]["lane_contract_count"] >= 4
             secret_diff = (
                 "diff --git a/openclaw/sample.py b/openclaw/sample.py\n"
                 "--- a/openclaw/sample.py\n"

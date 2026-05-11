@@ -134,6 +134,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "runtime-overhead",
             "frontier-dflash",
             "frontier-expansion",
+            "frontier-deliberation",
             "implementation-gate",
             "policy-optimization",
             "causal-repair",
@@ -159,6 +160,8 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "trace_distillation_repair_gate",
             "adapter_method_contract",
             "autoresearch_quality_delta",
+            "source_evidence_count",
+            "frontier_deliberation_contract",
         ],
     },
     "implementation_contract": {
