@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import hashlib
 import json
 import os
 import re
@@ -80,6 +81,34 @@ DEFAULT_PATCH_TESTS = (
     "python3 openclaw/test-speed-research.py",
     "python3 openclaw/test-speed-research-autopilot.py",
 )
+FULL_AUTONOMY_TESTS = (
+    "python3 -m compileall -q openclaw",
+    "python3 openclaw/test-speed-research.py",
+    "python3 openclaw/test-speed-research-autopilot.py",
+    "python3 openclaw/test-autoresearch-watchdog.py",
+    "python3 openclaw/test-self-improvement.py",
+    "python3 openclaw/test-drafter-fit.py",
+    "python3 openclaw/test-mtp-drafter-calibrate-guards.py",
+    "python3 openclaw/test-rapid-launcher-guards.py",
+    "python3 openclaw/test-jang-vlm-server-guards.py",
+    "python3 openclaw/test-vmlx-proxy-guards.py",
+)
+DEFAULT_AUTONOMY_POLICY: dict[str, Any] = {
+    "version": 1,
+    "mode": "sandbox-auto-promote",
+    "crabbox_runner": "static-ssh-mac",
+    "thresholds": {
+        "total": 100,
+        "quality_score": 99,
+        "scorecard_overall": 99,
+        "frontier_overall": 9.8,
+        "handoff_score": 100,
+    },
+    "forbidden_domains": ["opencode", "model-change", "secrets", "private-config", "live-profile-mutation"],
+    "architectural_requires_crabbox": True,
+    "full_suite_tests": list(FULL_AUTONOMY_TESTS),
+    "stable_build_registry": "stable-builds.jsonl",
+}
 DEFAULT_LANE_CONTRACTS: dict[str, Any] = {
     "version": 1,
     "lanes": {
@@ -297,6 +326,30 @@ def latest_json_artifact(root: Path, pattern: str) -> dict[str, Any]:
         return {}
     loaded["_artifact_path"] = str(latest)
     return loaded
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def load_autonomy_policy(root: Path) -> dict[str, Any]:
+    path = root / "autonomy-policy.json"
+    if not path.exists():
+        write_if_missing(path, json.dumps(DEFAULT_AUTONOMY_POLICY, indent=2, sort_keys=True) + "\n")
+        return dict(DEFAULT_AUTONOMY_POLICY)
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_AUTONOMY_POLICY)
+    if not isinstance(loaded, dict):
+        return dict(DEFAULT_AUTONOMY_POLICY)
+    merged = dict(DEFAULT_AUTONOMY_POLICY)
+    merged.update(loaded)
+    thresholds = dict(DEFAULT_AUTONOMY_POLICY["thresholds"])
+    if isinstance(loaded.get("thresholds"), dict):
+        thresholds.update(loaded["thresholds"])
+    merged["thresholds"] = thresholds
+    return merged
 
 
 def ensure_lane_contracts(root: Path) -> dict[str, Any]:
@@ -5777,6 +5830,310 @@ def stability_burn_in(args: argparse.Namespace) -> int:
     return 0 if report["ok"] or args.allow_fail else 2
 
 
+def recent_bad_behavior_rows(root: Path, *, recent_rows: int = 120) -> list[dict[str, Any]]:
+    markers = (
+        "malformed tool",
+        "malformed hidden/tool",
+        "tool-call loop",
+        "runaway tool",
+        "reasoning leak",
+        "repeated reasoning",
+        "repeated thought",
+        "stream timeout",
+        "sse read timed out",
+        "python crash",
+        "metal crash",
+        "metal error",
+        "memory crash",
+        "memory pressure",
+    )
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    checkpoint_index = next(
+        (
+            index
+            for index in range(len(rows) - 1, -1, -1)
+            if str(rows[index].get("run_id", "")).startswith("frontier-system-eval-")
+        ),
+        -1,
+    )
+    if checkpoint_index >= 0:
+        rows = rows[checkpoint_index + 1 :]
+    bad: list[dict[str, Any]] = []
+    for row in rows:
+        notes = str(row.get("notes", "")).lower()
+        target = str(row.get("target", "")).lower()
+        if any(marker in notes or marker in target for marker in markers):
+            bad.append(row)
+    return bad
+
+
+def latest_stable_build(root: Path) -> dict[str, Any]:
+    builds = read_jsonl(root / "stable-builds.jsonl")
+    for row in reversed(builds):
+        if row.get("status") == "stable":
+            return row
+    return {}
+
+
+def stable_build_mark(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    repo = Path(args.repo or repo_root()).expanduser()
+    score = latest_json_artifact(root, "frontier-autonomy-score-*.json")
+    if float(score.get("total_score") or 0) != 100.0 or score.get("decision") not in {"promote", "continue"}:
+        result = {
+            "ok": False,
+            "reason": "stable build mark requires latest frontier autonomy score to be 100",
+            "frontier_autonomy_score": score.get("total_score"),
+            "decision": score.get("decision", ""),
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 2
+    payload = {
+        "timestamp": int(time.time()),
+        "status": "stable",
+        "commit": current_commit(repo),
+        "repo": str(repo),
+        "reason": args.reason or "manual stable-build mark after certified autonomy score",
+        "score_artifact": score.get("_artifact_path", ""),
+        "frontier_autonomy_score": score.get("total_score"),
+        "quality_score": (score.get("evidence") or {}).get("quality", {}).get("quality_score")
+        if isinstance(score.get("evidence"), dict)
+        else None,
+        "canonical_clean": (score.get("hard_gates") or {}).get("canonical_clean")
+        if isinstance(score.get("hard_gates"), dict)
+        else None,
+    }
+    append_jsonl(root / "stable-builds.jsonl", payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def stable_build_rollback(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    repo = Path(args.repo or repo_root()).expanduser()
+    stable = latest_stable_build(root)
+    if not stable.get("commit"):
+        result = {"ok": False, "reason": "no stable build recorded"}
+        print(json.dumps(result, indent=2))
+        return 2
+    event = {
+        "timestamp": int(time.time()),
+        "kind": "stable-build-rollback",
+        "repo": str(repo),
+        "target_commit": stable["commit"],
+        "reason": args.reason or "frontier autonomy rollback requested",
+        "dry_run": bool(args.dry_run),
+        "ok": False,
+    }
+    if args.dry_run:
+        event["ok"] = True
+        event["action"] = "dry-run only"
+    else:
+        dirty = git_dirty_files(repo)
+        event["dirty_files_before"] = dirty[:20]
+        if dirty and not args.force:
+            event["reason"] = "repo dirty; rollback requires --force"
+        else:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "reset", "--hard", str(stable["commit"])],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=60,
+                check=False,
+            )
+            event["ok"] = result.returncode == 0
+            event["output_tail"] = result.stdout[-2000:]
+    append_jsonl(root / "rollback-events.jsonl", event)
+    print(json.dumps(event, indent=2, sort_keys=True))
+    return 0 if event["ok"] else 2
+
+
+def load_crabbox_evidence(path: str, *, patch_sha256: str, max_age_seconds: int = 6 * 60 * 60) -> dict[str, Any]:
+    if not path:
+        return {"ok": False, "reason": "missing crabbox evidence"}
+    evidence_path = Path(path).expanduser()
+    try:
+        loaded = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {"ok": False, "reason": f"unreadable crabbox evidence: {error}", "path": str(evidence_path)}
+    if not isinstance(loaded, dict):
+        return {"ok": False, "reason": "crabbox evidence is not an object", "path": str(evidence_path)}
+    age = max(0, int(time.time() - evidence_path.stat().st_mtime))
+    tests = loaded.get("tests") if isinstance(loaded.get("tests"), list) else []
+    full_suite = loaded.get("full_suite") if isinstance(loaded.get("full_suite"), dict) else {}
+    checks = {
+        "evidence_ok": loaded.get("ok") is True,
+        "fresh": age <= max_age_seconds,
+        "runner_static_ssh_mac": str(loaded.get("runner", "")).lower() in {"static-ssh-mac", "ssh-mac", "mac-ssh"},
+        "patch_hash_matches": str(loaded.get("patch_sha256", "")) == patch_sha256,
+        "focused_tests_ok": bool(tests) and all(bool(item.get("ok")) for item in tests if isinstance(item, dict)),
+        "full_suite_ok": bool(full_suite.get("ok")),
+        "rollback_rehearsal_ok": bool(loaded.get("rollback_rehearsal_ok")),
+        "logs_present": bool(loaded.get("logs") or loaded.get("run_id")),
+    }
+    failed = [key for key, value in checks.items() if not value]
+    loaded["_artifact_path"] = str(evidence_path)
+    loaded["_age_seconds"] = age
+    loaded["_checks"] = checks
+    loaded["_failed_checks"] = failed
+    loaded["_valid_for_architectural_promotion"] = not failed
+    return loaded
+
+
+def frontier_autonomy_score_report(
+    root: Path,
+    *,
+    recent_rows: int = 120,
+    promotion: bool = False,
+    classification: dict[str, Any] | None = None,
+    patch_tests: list[dict[str, Any]] | None = None,
+    crabbox_evidence: dict[str, Any] | None = None,
+    rollback_rehearsal_ok: bool = False,
+) -> dict[str, Any]:
+    ensure_research_state(root)
+    policy = load_autonomy_policy(root)
+    thresholds = policy.get("thresholds") if isinstance(policy.get("thresholds"), dict) else {}
+    quality = latest_json_artifact(root, "quality-review-*.json")
+    frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
+    handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
+    burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    quality_score = float(quality.get("quality_score") or 0)
+    scorecard_overall = float(scorecard.get("overall") or 0)
+    frontier_overall = float(frontier.get("overall") or 0)
+    handoff_score = float(handoff.get("score") or 0)
+    bad_rows = recent_bad_behavior_rows(root, recent_rows=recent_rows)
+    classif = classification or {}
+    is_architectural = bool(classif.get("architectural"))
+    patch_tests_ok = (
+        (patch_tests is None and not promotion)
+        or (bool(patch_tests) and all(bool(test.get("ok")) for test in patch_tests))
+    )
+    crabbox_ok = (
+        not is_architectural
+        or bool(crabbox_evidence and crabbox_evidence.get("_valid_for_architectural_promotion"))
+    )
+    hard_gates = {
+        "quality_score_at_least_99": quality_score >= float(thresholds.get("quality_score", 99)),
+        "scorecard_at_least_99": scorecard_overall >= float(thresholds.get("scorecard_overall", 99)),
+        "frontier_at_least_9_8": frontier_overall >= float(thresholds.get("frontier_overall", 9.8)),
+        "handoff_is_100": handoff_score >= float(thresholds.get("handoff_score", 100)),
+        "stability_burn_in_pass": bool(burn_in.get("ok")),
+        "canonical_clean": bool(canonical.get("clean")),
+        "zero_active_noise": all(int(noise.get(key, 0) or 0) == 0 for key in noise),
+        "no_bad_behavior_rows": not bad_rows,
+        "patch_classification_allowed": not classif or bool(classif.get("allowed")),
+        "patch_tests_complete": patch_tests_ok,
+        "rollback_rehearsal_pass": (not promotion) or rollback_rehearsal_ok,
+        "crabbox_evidence_complete": crabbox_ok,
+    }
+    if classif:
+        touched = "\n".join(str(path) for path in classif.get("files", []))
+        hard_gates["no_forbidden_domains"] = not any(fragment in touched.lower() for fragment in DENIED_PATCH_FRAGMENTS)
+    components = {
+        "stability": 30 if all(hard_gates[key] for key in ("stability_burn_in_pass", "canonical_clean", "zero_active_noise", "no_bad_behavior_rows")) else 0,
+        "research_quality": 20 if hard_gates["quality_score_at_least_99"] and hard_gates["scorecard_at_least_99"] else 0,
+        "implementation_safety": 20 if hard_gates["patch_classification_allowed"] and hard_gates["patch_tests_complete"] and hard_gates.get("no_forbidden_domains", True) else 0,
+        "frontier_harness_health": 15 if hard_gates["frontier_at_least_9_8"] and hard_gates["handoff_is_100"] else 0,
+        "speed_progress": 15 if latest_decode_mean(root, recent_rows=recent_rows) is not None or not promotion else 0,
+    }
+    hard_gate_failures = [key for key, ok in hard_gates.items() if not ok]
+    total_score = 100 if not hard_gate_failures and sum(components.values()) >= 85 else min(99, sum(components.values()))
+    decision = "promote" if promotion and total_score == 100 else "continue" if total_score >= 99 and not promotion else "repair"
+    if hard_gate_failures:
+        decision = "block-promotion" if promotion else "repair"
+    report = {
+        "ok": total_score == 100 and not hard_gate_failures,
+        "kind": "frontier-autonomy-score",
+        "timestamp": int(time.time()),
+        "total_score": total_score,
+        "decision": decision,
+        "promotion": promotion,
+        "components": components,
+        "hard_gates": hard_gates,
+        "hard_gate_failures": hard_gate_failures,
+        "policy": {
+            "mode": policy.get("mode"),
+            "crabbox_runner": policy.get("crabbox_runner"),
+            "thresholds": thresholds,
+        },
+        "evidence": {
+            "quality": {
+                "artifact": quality.get("_artifact_path", ""),
+                "quality_score": quality_score,
+                "scorecard_overall": scorecard_overall,
+                "verdict": quality.get("verdict", ""),
+            },
+            "frontier": {
+                "artifact": frontier.get("_artifact_path", ""),
+                "overall": frontier_overall,
+                "readiness": frontier.get("readiness", ""),
+                "certified": bool(frontier.get("frontier_certified")),
+            },
+            "handoff": {
+                "artifact": handoff.get("_artifact_path", ""),
+                "score": handoff_score,
+                "ok": bool(handoff.get("ok")),
+            },
+            "stability_burn_in": {
+                "artifact": burn_in.get("_artifact_path", ""),
+                "ok": bool(burn_in.get("ok")),
+            },
+            "canonical_state": {
+                "state": canonical.get("state"),
+                "clean": canonical.get("clean"),
+                "noise": noise,
+            },
+            "bad_behavior_rows": [row.get("run_id", "") for row in bad_rows[:8]],
+            "classification": classif,
+            "crabbox": crabbox_evidence or {},
+        },
+        "next": (
+            "promote candidate and mark stable build"
+            if decision == "promote"
+            else "repair failed hard gates before mutation"
+            if hard_gate_failures
+            else "continue autonomous research"
+        ),
+    }
+    return report
+
+
+def write_frontier_autonomy_score(root: Path, report: dict[str, Any]) -> Path:
+    path = root / "benchmarks" / f"frontier-autonomy-score-{report['timestamp']}.json"
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_result(
+        root,
+        run_id=f"frontier-autonomy-score-{report['timestamp']}",
+        status="keep" if report["ok"] else "blocked",
+        target="frontier-autonomy-score",
+        hypothesis="autonomous actions require zero-noise frontier stability gates before promotion",
+        commit=current_commit(repo_root()),
+        notes=(
+            f"score={report['total_score']} decision={report['decision']} "
+            f"failures={','.join(report['hard_gate_failures'])} path={path}"
+        ),
+    )
+    return path
+
+
+def frontier_autonomy_score(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    report = frontier_autonomy_score_report(
+        root,
+        recent_rows=args.recent_rows,
+        promotion=args.promotion,
+        rollback_rehearsal_ok=args.rollback_rehearsal_ok,
+    )
+    path = write_frontier_autonomy_score(root, report)
+    print(json.dumps({"path": str(path), **report}, indent=2, sort_keys=True))
+    return 0 if report["ok"] or args.allow_fail else 2
+
+
 def gepa_escalation(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -8439,6 +8796,7 @@ def patch_execute(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 2
     patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+    patch_hash = text_sha256(patch_text)
     source_files = [item.strip() for item in args.source_files.split(",") if item.strip()]
     classification = classify_patch(
         patch_text,
@@ -8447,6 +8805,10 @@ def patch_execute(args: argparse.Namespace) -> int:
     )
     approval_file = str(getattr(args, "architectural_approval_file", "") or "")
     approval_granted = architectural_approval_granted(args.task_id or "manual", approval_file)
+    crabbox_evidence = load_crabbox_evidence(
+        str(getattr(args, "crabbox_evidence_file", "") or ""),
+        patch_sha256=patch_hash,
+    ) if classification.get("architectural") else {}
     timestamp = int(time.time())
     task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.task_id or "manual").strip("-") or "manual"
     artifact_id = f"{timestamp}-{task_slug}"
@@ -8458,12 +8820,15 @@ def patch_execute(args: argparse.Namespace) -> int:
         "kind": "patch-executor",
         "timestamp": timestamp,
         "patch_file": str(patch_path),
+        "patch_sha256": patch_hash,
         "repo": str(repo),
         "canary": str(canary),
         "classification": classification,
+        "crabbox_evidence": crabbox_evidence,
         "architectural_approval_file": approval_file,
         "approval_required": bool(classification.get("approval_required")),
         "approval_granted": approval_granted,
+        "rollback_rehearsal_ok": bool(getattr(args, "rollback_rehearsal_ok", False)),
         "promoted": False,
         "tests": [],
     }
@@ -8508,23 +8873,21 @@ def patch_execute(args: argparse.Namespace) -> int:
                 tests = [item.strip() for item in args.tests.split(";") if item.strip()] or list(DEFAULT_PATCH_TESTS)
                 artifact["tests"] = [run_test_command(command, cwd=canary, timeout=args.test_timeout) for command in tests]
                 tests_ok = all(item.get("ok") for item in artifact["tests"])
-                can_promote = bool(classification["auto_promote"]) or (
-                    bool(classification.get("approval_required")) and approval_granted
-                )
+                can_promote = bool(classification["auto_promote"]) or bool(classification.get("architectural"))
                 if apply.returncode != 0:
                     reason = "patch apply failed in canary"
                     artifact["reason"] = reason
                 elif not tests_ok:
                     reason = "canary tests failed"
                     artifact["reason"] = reason
-                elif classification.get("approval_required") and not approval_granted:
-                    reason = "canary passed; architectural promotion requires explicit approval file"
+                elif classification.get("architectural") and not crabbox_evidence.get("_valid_for_architectural_promotion"):
+                    reason = "canary passed; architectural promotion requires valid Crabbox sandbox evidence"
                     artifact["reason"] = reason
-                    artifact["held_for_approval"] = True
-                    artifact["approval_instruction"] = (
-                        "After reviewing the canary artifact and confirming the change is safe, "
-                        f"write APPROVE_ARCHITECTURAL_PATCH={args.task_id or 'manual'} to the approval file "
-                        "and rerun patch-execute with --allow-architectural."
+                    artifact["held_for_crabbox"] = True
+                    artifact["crabbox_instruction"] = (
+                        "Run the candidate in a static SSH Mac Crabbox sandbox and provide a fresh evidence JSON "
+                        "with ok=true, runner=static-ssh-mac, matching patch_sha256, focused tests, full_suite.ok, "
+                        "rollback_rehearsal_ok, and logs/run_id."
                     )
                     status = "blocked"
                     return_code = 0
@@ -8542,6 +8905,23 @@ def patch_execute(args: argparse.Namespace) -> int:
                         status = "blocked"
                         return_code = 2
                     else:
+                        autonomy = frontier_autonomy_score_report(
+                            root,
+                            promotion=True,
+                            classification=classification,
+                            patch_tests=artifact["tests"],
+                            crabbox_evidence=crabbox_evidence,
+                            rollback_rehearsal_ok=bool(getattr(args, "rollback_rehearsal_ok", False)),
+                        )
+                        autonomy_path = write_frontier_autonomy_score(root, autonomy)
+                        artifact["frontier_autonomy_score"] = {**autonomy, "path": str(autonomy_path)}
+                        if not autonomy["ok"]:
+                            reason = "frontier autonomy score blocked promotion"
+                            artifact["reason"] = reason
+                            artifact["quarantined"] = True
+                            status = "blocked"
+                            return_code = 2
+                            raise StopIteration
                         main_check = subprocess.run(
                             ["git", "-C", str(repo), "apply", "--check", str(patch_path)],
                             text=True,
@@ -8567,9 +8947,23 @@ def patch_execute(args: argparse.Namespace) -> int:
                             artifact["promoted"] = main_apply.returncode == 0
                             status = "keep" if artifact["promoted"] else "blocked"
                             reason = "" if artifact["promoted"] else "main repo apply failed"
+                            if artifact["promoted"]:
+                                stable = {
+                                    "timestamp": int(time.time()),
+                                    "status": "stable",
+                                    "commit": current_commit(repo),
+                                    "repo": str(repo),
+                                    "reason": f"patch-executor promoted {args.task_id or 'manual'} after frontier autonomy score",
+                                    "patch_sha256": patch_hash,
+                                    "frontier_autonomy_score": autonomy["total_score"],
+                                    "score_artifact": str(autonomy_path),
+                                }
+                                append_jsonl(root / "stable-builds.jsonl", stable)
                             if reason:
                                 artifact["reason"] = reason
                             return_code = 0 if artifact["promoted"] else 2
+    except StopIteration:
+        pass
     except subprocess.CalledProcessError as error:
         reason = f"git canary setup failed: {error.stderr[-500:] if error.stderr else error}"
         artifact["reason"] = reason
@@ -9024,6 +9418,25 @@ def main() -> int:
     burn_in.add_argument("--allow-fail", action="store_true")
     burn_in.set_defaults(func=stability_burn_in)
 
+    autonomy = sub.add_parser("frontier-autonomy-score")
+    autonomy.add_argument("--recent-rows", type=int, default=120)
+    autonomy.add_argument("--promotion", action="store_true")
+    autonomy.add_argument("--rollback-rehearsal-ok", action="store_true")
+    autonomy.add_argument("--allow-fail", action="store_true")
+    autonomy.set_defaults(func=frontier_autonomy_score)
+
+    stable_mark = sub.add_parser("stable-build-mark")
+    stable_mark.add_argument("--repo", default="")
+    stable_mark.add_argument("--reason", default="")
+    stable_mark.set_defaults(func=stable_build_mark)
+
+    stable_rollback = sub.add_parser("stable-build-rollback")
+    stable_rollback.add_argument("--repo", default="")
+    stable_rollback.add_argument("--reason", default="")
+    stable_rollback.add_argument("--dry-run", action="store_true")
+    stable_rollback.add_argument("--force", action="store_true")
+    stable_rollback.set_defaults(func=stable_build_rollback)
+
     rank = sub.add_parser("hypothesis-rank")
     rank.add_argument("--limit", type=int, default=12)
     rank.set_defaults(func=hypothesis_rank)
@@ -9169,6 +9582,8 @@ def main() -> int:
     patch.add_argument("--canary-only", action="store_true")
     patch.add_argument("--keep-canary", action="store_true")
     patch.add_argument("--allow-architectural", action="store_true")
+    patch.add_argument("--crabbox-evidence-file", default="")
+    patch.add_argument("--rollback-rehearsal-ok", action="store_true")
     patch.add_argument(
         "--architectural-approval-file",
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ARCHITECTURAL_APPROVAL_FILE", ""),

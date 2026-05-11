@@ -339,6 +339,7 @@ def architecture_contract(root: Path) -> dict[str, Any]:
             "results.tsv",
             "benchmarks/quality-review-*.json",
             "benchmarks/frontier-system-eval-*.json",
+            "benchmarks/frontier-autonomy-score-*.json",
             "benchmarks/implementation-handoff-audit-*.json",
             "benchmarks/stability-burn-in-*.json",
             "autopilot.lock",
@@ -466,6 +467,7 @@ def watchdog_review(
     log = latest_autopilot_log(root)
     quality = latest_json_artifact(root, "quality-review-*.json")
     frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
+    autonomy = latest_json_artifact(root, "frontier-autonomy-score-*.json")
     handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
     burn_in = latest_json_artifact(root, "stability-burn-in-*.json")
     canonical = frontier.get("canonical_state") if isinstance(frontier.get("canonical_state"), dict) else {}
@@ -487,6 +489,7 @@ def watchdog_review(
     quality_score = parse_float(quality.get("quality_score"))
     scorecard_overall = parse_float(scorecard.get("overall"))
     frontier_overall = parse_float(frontier.get("overall"))
+    autonomy_total = parse_float(autonomy.get("total_score"))
     handoff_score = parse_float(handoff.get("score"))
     lock_exists = bool(lock.get("exists"))
     lock_active = bool(lock.get("active"))
@@ -500,6 +503,7 @@ def watchdog_review(
         "scorecard_high": scorecard_overall is not None and scorecard_overall >= min_scorecard,
         "handoff_high": handoff_score is not None and handoff_score >= 95,
         "frontier_high": frontier_overall is not None and frontier_overall >= min_frontier,
+        "autonomy_score_high": autonomy_total is None or autonomy_total >= 99,
         "zero_active_noise": all(value == 0 for value in active_noise.values()),
         "no_recent_memory_blocks": direct_noise["memory_block_rows"] == 0,
     }
@@ -530,6 +534,11 @@ def watchdog_review(
         severity = "degraded"
         next_command = "~/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30"
         reason = "quality/noise gate failed; route one deterministic repair before more research"
+    elif "autonomy_score_high" in blockers:
+        decision = "autonomy-repair"
+        severity = "degraded"
+        next_command = "~/.openclaw/bin/openclaw-speed-research frontier-autonomy-score --allow-fail"
+        reason = "frontier autonomy score fell below the safe-action floor"
     elif frontier_overall is not None and frontier_overall < min_frontier:
         decision = "frontier-repair"
         severity = "degraded"
@@ -573,6 +582,12 @@ def watchdog_review(
             "readiness": frontier.get("readiness", ""),
             "certified": bool(frontier.get("frontier_certified")),
             "gaps": frontier.get("gaps", []),
+        },
+        "frontier_autonomy": {
+            "artifact": autonomy.get("_artifact_path", ""),
+            "total_score": autonomy_total,
+            "decision": autonomy.get("decision", ""),
+            "hard_gate_failures": autonomy.get("hard_gate_failures", []),
         },
         "handoff": {
             "artifact": handoff.get("_artifact_path", ""),

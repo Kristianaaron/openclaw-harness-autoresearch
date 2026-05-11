@@ -2828,6 +2828,11 @@ def run_supervisor_patch_execute_task(
         cmd.append("--canary-only")
     if task.get("allow_architectural", False):
         cmd.append("--allow-architectural")
+    crabbox_evidence_file = str(task.get("crabbox_evidence_file") or task.get("crabbox_evidence") or "")
+    if crabbox_evidence_file:
+        cmd.extend(["--crabbox-evidence-file", crabbox_evidence_file])
+    if task.get("rollback_rehearsal_ok", False):
+        cmd.append("--rollback-rehearsal-ok")
     approval_file = str(task.get("architectural_approval_file") or args.architectural_approval_file or "")
     if approval_file:
         cmd.extend(["--architectural-approval-file", approval_file])
@@ -3872,6 +3877,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     commands.append([args.research_helper_bin, "evaluator-integrity"])
     commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "frontier-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
+    commands.append([args.research_helper_bin, "frontier-autonomy-score", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
     commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
     commands.append(
@@ -4078,6 +4084,7 @@ def active_exhausted_lanes() -> set[str]:
 
 def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]:
     frontier = latest_json_artifact("frontier-system-eval-*.json")
+    autonomy = latest_json_artifact("frontier-autonomy-score-*.json")
     handoff = latest_json_artifact("implementation-handoff-audit-*.json")
     quality = latest_json_artifact("quality-review-*.json")
     replay = replay_checks(WORKSPACE)
@@ -4102,6 +4109,7 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         and not task_runs_without_model(task)
     ]
     frontier_score = float(frontier.get("overall") or 0.0)
+    autonomy_score = float(autonomy.get("total_score") or 0.0) if autonomy else 0.0
     handoff_score = int(handoff.get("score") or 0)
     quality_scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
     quality_values = [
@@ -4116,6 +4124,8 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         issues.append("replay guards failed")
     if frontier_score < float(args.frontier_certification_min_score):
         issues.append(f"frontier score {frontier_score}<min {args.frontier_certification_min_score}")
+    if autonomy and autonomy_score < 99.0:
+        issues.append(f"frontier autonomy score {autonomy_score}<min 99.0")
     if handoff_score < int(args.frontier_certification_min_handoff):
         issues.append(f"handoff score {handoff_score}<min {args.frontier_certification_min_handoff}")
     if quality_score < float(args.frontier_certification_min_quality):
@@ -4137,6 +4147,7 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         "ok": not issues,
         "issues": issues,
         "frontier_score": frontier_score,
+        "frontier_autonomy_score": autonomy_score if autonomy else None,
         "handoff_score": handoff_score,
         "quality_score": quality_score,
         "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic[:8]],
@@ -4145,6 +4156,7 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         "recent_empty_bridges": len(empty_bridges),
         "exhausted_lanes": sorted(exhausted),
         "frontier": frontier,
+        "frontier_autonomy": autonomy,
         "handoff": handoff,
         "quality": quality,
     }

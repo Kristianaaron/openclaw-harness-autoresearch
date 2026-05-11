@@ -182,6 +182,10 @@ def main() -> int:
             assert all(burn["gates"].values())
             assert burn["gates"]["no_model_bound_implementation_ready"] is True
             assert burn["gates"]["ready_tasks_guarded"] is True
+            (root / "benchmarks" / "stability-burn-in-999.json").write_text(
+                json.dumps(burn),
+                encoding="utf-8",
+            )
             assert helper.environment_snapshot_command(
                 Namespace(label="unit", repo="/Users/kristian/Documents/openclaw-harness-autoresearch", allow_fail=False)
             ) == 0
@@ -1890,6 +1894,53 @@ def main() -> int:
             assert dirty_data["reason"] == "main repo has uncommitted changes; refusing autonomous promotion"
             assert (patch_repo / "openclaw" / "sample.py").read_text(encoding="utf-8") == "VALUE = 1\n"
             (patch_repo / "openclaw" / "dirty.py").unlink()
+            (root / "benchmarks" / "quality-review-1000.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "quality-review",
+                        "verdict": "healthy",
+                        "quality_score": 100,
+                        "scorecard": {
+                            "overall": 99.7,
+                            "interpretation": "high_quality_exhaustion_or_prerequisite_route",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "benchmarks" / "frontier-system-eval-1000.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "frontier-system-eval",
+                        "overall": 10.0,
+                        "readiness": "frontier",
+                        "frontier_certified": True,
+                        "gaps": [],
+                        "canonical_state": {
+                            "clean": True,
+                            "noise": {
+                                "unresolved_blocked_rows": 0,
+                                "terminal_synthesis_rows": 0,
+                                "bridge_zero_rows": 0,
+                                "memory_blocks": 0,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            helper.append_result(
+                root,
+                run_id="frontier-system-eval-1000",
+                status="keep",
+                target="autoresearch-frontier-eval",
+                hypothesis="unit clean checkpoint",
+                commit="unit",
+                notes="overall=10.0 readiness=frontier",
+            )
+            autonomy = helper.frontier_autonomy_score_report(root, promotion=False)
+            assert autonomy["total_score"] == 100, autonomy
+            assert autonomy["hard_gate_failures"] == []
             (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'new'\n", encoding="utf-8")
             arch_patch_file = root / "patches" / "architectural.patch"
             arch_diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)
@@ -1921,16 +1972,31 @@ def main() -> int:
                     canary_only=False,
                     keep_canary=False,
                     allow_architectural=True,
+                    crabbox_evidence_file="",
+                    rollback_rehearsal_ok=False,
                     architectural_approval_file="",
                 )
             ) == 0
             arch_artifact = sorted((root / "experiments").glob("patch-executor-*-arch-patch.json"))[-1]
             arch_data = json.loads(arch_artifact.read_text(encoding="utf-8"))
-            assert arch_data["held_for_approval"] is True
+            assert arch_data["held_for_crabbox"] is True
             assert arch_data["promoted"] is False
             assert (patch_repo / "openclaw" / "openclaw-model-proxy.py").read_text(encoding="utf-8") == "MODE = 'old'\n"
-            approval_file = root / "architectural-approval.txt"
-            approval_file.write_text("APPROVE_ARCHITECTURAL_PATCH=arch-patch\n", encoding="utf-8")
+            crabbox_evidence = root / "crabbox-evidence.json"
+            crabbox_evidence.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "runner": "static-ssh-mac",
+                        "patch_sha256": helper.text_sha256(arch_diff.stdout),
+                        "tests": [{"command": "python3 openclaw/test-speed-research.py", "ok": True}],
+                        "full_suite": {"ok": True},
+                        "rollback_rehearsal_ok": True,
+                        "run_id": "run_unit_crabbox",
+                    }
+                ),
+                encoding="utf-8",
+            )
             assert helper.patch_execute(
                 Namespace(
                     patch_file=str(arch_patch_file),
@@ -1943,10 +2009,15 @@ def main() -> int:
                     canary_only=False,
                     keep_canary=False,
                     allow_architectural=True,
-                    architectural_approval_file=str(approval_file),
+                    crabbox_evidence_file=str(crabbox_evidence),
+                    rollback_rehearsal_ok=True,
+                    architectural_approval_file="",
                 )
             ) == 0
             assert (patch_repo / "openclaw" / "openclaw-model-proxy.py").read_text(encoding="utf-8") == "MODE = 'new'\n"
+            stable_builds = helper.read_jsonl(root / "stable-builds.jsonl")
+            assert stable_builds
+            assert stable_builds[-1]["frontier_autonomy_score"] == 100
             bad_patch = "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-A=1\n+A=2\n"
             bad_patch_file = root / "patches" / "bad.patch"
             bad_patch_file.write_text(bad_patch, encoding="utf-8")

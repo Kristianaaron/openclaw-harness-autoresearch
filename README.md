@@ -153,6 +153,31 @@ but `autopilot.lock` still points at that dead PID, the watchdog archives the
 lock under `watchdog/stale-locks/`, removes the stale marker, and reports an
 idle-ready state instead of leaving the next run blocked by old state.
 
+### Frontier Autonomy Score
+
+`frontier-autonomy-score` is the hard promotion authority for self-applied
+changes. It combines quality review, frontier eval, handoff audit, stability
+burn-in, canonical noise, bad-behavior rows, patch classification, canary
+evidence, rollback rehearsal, and Crabbox sandbox evidence into one deterministic
+decision.
+
+Promotion fails closed unless every hard gate passes:
+
+- quality score and scorecard are at least `99`;
+- frontier eval is at least `9.8`;
+- handoff audit is `100`;
+- stability burn-in passes;
+- active canonical noise is `0`;
+- memory, Metal, Python, tool-loop, malformed-output, and reasoning-leak signals
+  are absent in the active window;
+- rollback rehearsal is present for promotion;
+- architectural patches include fresh static-SSH-Mac Crabbox evidence.
+
+Safe/moderate patches may auto-promote only at score `100`. Architectural
+patches must pass Crabbox first, then local canary, then the same score gate.
+Passing promotions append to `stable-builds.jsonl`; failed or incomplete
+candidates are blocked/quarantined instead of mutating the live runtime.
+
 Run once:
 
 ```bash
@@ -230,6 +255,7 @@ That runtime workspace is intentionally not committed to this repo.
 Common checks:
 
 ```bash
+python3 openclaw/test-autonomy-policy.py
 python3 openclaw/test-speed-research.py
 python3 openclaw/test-speed-research-autopilot.py
 python3 openclaw/test-self-improvement.py
