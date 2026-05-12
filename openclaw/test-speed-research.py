@@ -716,6 +716,46 @@ def main() -> int:
                         assert len(contract_fallback) == 1
                         assert contract_fallback[0]["benchmark_mode"] == "decode-sample"
                         assert "calibration-memory-after-load" in contract_fallback[0]["hypothesis"]
+                        adapter_block_root = Path(tmp) / "adapter-memory-block-root"
+                        helper.ensure_research_state(adapter_block_root)
+                        helper.write_jsonl(
+                            adapter_block_root / "tasks.jsonl",
+                            [
+                                helper.drafter_calibration_memory_stage_task(
+                                    123458,
+                                    stage="micro-step",
+                                    task_id="adapter-memory-blocked-stage",
+                                    bounded_command=["python3", "calibrate.py"],
+                                    calibration_mode_value=helper.CALIBRATION_ADAPTER_MODE,
+                                )
+                            ],
+                        )
+                        blocked_stage_tasks = helper.read_jsonl(adapter_block_root / "tasks.jsonl")
+                        blocked_stage_tasks[0]["status"] = "blocked"
+                        blocked_stage_tasks[0]["supervisor_summary"] = {
+                            "reason": "calibration-memory-gate:after-load",
+                            "memory_gate_issue": "calibration-memory-gate:after-load",
+                            "output_tail": "calibration memory gate blocked: after-load: compressor=9000MB>=8192MB",
+                        }
+                        helper.write_jsonl(adapter_block_root / "tasks.jsonl", blocked_stage_tasks)
+                        assert (
+                            helper.latest_calibration_stage_issue(
+                                adapter_block_root,
+                                calibration_mode_filter=helper.CALIBRATION_ADAPTER_MODE,
+                            )
+                            == "calibration-memory-after-load"
+                        )
+                        bottleneck = helper.drafter_bottleneck_state(adapter_block_root)
+                        assert bottleneck["state"] == "adapter_calibration_memory_blocked"
+                        assert bottleneck["next_step"] == "seed_adapter_calibration_memory_report"
+                        report_tasks = helper.drafter_bottleneck_next_tasks(
+                            adapter_block_root,
+                            helper.result_rows(adapter_block_root),
+                            123459,
+                            reason="unit adapter memory blocker",
+                        )
+                        assert len(report_tasks) == 1
+                        assert report_tasks[0]["supervisor_action"] == "calibration-memory-report"
                         gradient_blocked_root = Path(tmp) / "calibration-gradient-block-root"
                         helper.ensure_research_state(gradient_blocked_root)
                         helper.append_result(
@@ -785,6 +825,25 @@ def main() -> int:
                             helper.recent_calibration_run_hard_blocker(literal_blocked_root)
                             == "calibration-quantized-gradient-unsupported"
                         )
+                        adapter_memory_rows = [
+                            {
+                                "run_id": "drafter-calibration-memory-stage-micro-step-unit",
+                                "status": "blocked",
+                                "target": "janq-drafter-calibration-memory-stage",
+                                "notes": (
+                                    "stage=micro-step decision=blocked failures=probe_exit:2 "
+                                    "calibration_mode=adapter-logit-distillation blocker="
+                                ),
+                            },
+                            {
+                                "run_id": "supervisor-drafter-calibration-memory-stage-unit",
+                                "status": "blocked",
+                                "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+                                "notes": "stage=micro-step reason=calibration-memory-gate:after-load",
+                            },
+                        ]
+                        assert all(helper.is_known_calibration_memory_blocked_row(row) for row in adapter_memory_rows)
+                        assert helper.actionable_blocked_rows(adapter_memory_rows) == []
                         helper.append_result(
                             literal_blocked_root,
                             run_id="drafter-calibration-memory-stage-micro-step-literal-repeat",
@@ -827,6 +886,62 @@ def main() -> int:
                         )
                         assert not helper.should_seed_drafter_calibration_canary(gradient_blocked_root)
                         assert not helper.should_seed_drafter_calibration_run(gradient_blocked_root)
+                        stage_mode_root = Path(tmp) / "stage-mode-root"
+                        helper.ensure_research_state(stage_mode_root)
+                        for index, stage_name in enumerate(helper.CALIBRATION_MEMORY_STAGES):
+                            helper.append_result(
+                                stage_mode_root,
+                                run_id=f"drafter-calibration-memory-stage-{stage_name}-{index}",
+                                status="keep",
+                                target="janq-drafter-calibration-memory-stage",
+                                hypothesis="unit direct stage",
+                                commit="abc123",
+                                notes=(
+                                    f"stage={stage_name} decision=advance "
+                                    f"calibration_mode={helper.CALIBRATION_DIRECT_MODE}"
+                                ),
+                            )
+                        assert helper.first_seedable_calibration_memory_stage(stage_mode_root) == ""
+                        assert (
+                            helper.first_seedable_calibration_memory_stage(
+                                stage_mode_root,
+                                calibration_mode_filter=helper.CALIBRATION_ADAPTER_MODE,
+                            )
+                            == "metadata"
+                        )
+                        certified_scorecard = helper.research_quality_scorecard(
+                            blocked_rows=0,
+                            missing_required_blocks=["2", "3", "4"],
+                            sweep_rows=3,
+                            min_sweeps=3,
+                            repeated_block2=True,
+                            repeated_keep_current=True,
+                            plateau_below_target=False,
+                            exhaustion_candidate=False,
+                            frontier_ready=[],
+                            seeded_tasks=[],
+                            ready_tasks=[
+                                {
+                                    "id": "agent-deliberation-handoff-recovery-contract-unit",
+                                    "acceptance": "guarded",
+                                    "rollback": "discard",
+                                    "guard_checks": ["tests_pass"],
+                                }
+                            ],
+                            contaminated_rows=0,
+                            clean_runtime_maps=0,
+                            variance={},
+                            artifact_check={"artifact_suspected": False},
+                            contract_ok=True,
+                            dflash_suppressed=True,
+                            repeated_dflash_synthesis=0,
+                            duplicate_stage_tasks=0,
+                            best_mean=None,
+                            target_tps=30.0,
+                            server_decode_values=[],
+                            canonical_state="prerequisite_needed",
+                        )
+                        assert certified_scorecard["overall"] >= 99.0
                         assert helper.actionable_blocked_rows(helper.result_rows(gradient_blocked_root)) == []
                         assert helper.filter_seedable_tasks(
                             gradient_blocked_root,
@@ -2110,6 +2225,50 @@ def main() -> int:
             autonomy = helper.frontier_autonomy_score_report(root, promotion=False)
             assert autonomy["total_score"] == 100, autonomy
             assert autonomy["hard_gate_failures"] == []
+            council_report = helper.review_council_report(root, recent_rows=120, target_tps=30.0, seed_next=True)
+            assert council_report["roles"]["prober"]["questions"]
+            assert council_report["roles"]["consultant"]["next_leverage"]
+            assert council_report["roles"]["skeptic"]["falsification_gates"]["zero_active_noise"] is True
+            assert council_report["roles"]["gatekeeper"]["promotion_allowed"] is False
+            assert council_report["scorecard"]["overall"] < 95, council_report["scorecard"]
+            assert "safety_gates_clear" in council_report["scorecard"]["hard_gate_failures"]
+            clean_council = dict(council_report)
+            clean_council["gates"] = {
+                key: True
+                for key in (
+                    "quality_artifact_present",
+                    "frontier_artifact_present",
+                    "handoff_artifact_present",
+                    "autonomy_artifact_present",
+                    "canonical_clean",
+                    "zero_active_noise",
+                    "no_bad_behavior_rows",
+                    "task_contract_clean",
+                    "handoff_clean",
+                    "autonomy_clean",
+                    "measurement_clean",
+                )
+            }
+            clean_score = helper.score_review_council_artifact(clean_council)
+            assert clean_score["overall"] >= 95, clean_score
+            assert clean_score["hard_gate_failures"] == [], clean_score
+            assert council_report["roles"]["strategist"]["decision"] in {
+                "continue",
+                "seed-frontier-deliberation",
+                "observe",
+                "repair",
+            }
+            assert helper.review_council(Namespace(recent_rows=120, target_tps=30.0, seed_next=True, allow_fail=True)) == 0
+            council_paths = list((root / "benchmarks").glob("review-council-*.json"))
+            assert council_paths
+            assert "autoresearch-review-council" in (root / "results.tsv").read_text(encoding="utf-8")
+            alive_after_council = helper.self_improvement_alive_report(root, recent_rows=120)
+            assert alive_after_council["gates"]["review_council_quality"] is True
+            bad_council = dict(council_report)
+            bad_council["roles"] = {}
+            bad_score = helper.score_review_council_artifact(bad_council)
+            assert bad_score["overall"] < 95
+            assert bad_score["hard_gate_failures"]
             (patch_repo / "openclaw" / "openclaw-model-proxy.py").write_text("MODE = 'new'\n", encoding="utf-8")
             arch_patch_file = root / "patches" / "architectural.patch"
             arch_diff = subprocess.run(["git", "diff"], cwd=patch_repo, text=True, stdout=subprocess.PIPE, check=True)

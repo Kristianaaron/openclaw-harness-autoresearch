@@ -2049,6 +2049,194 @@ def main() -> int:
         assert "implementation-bridge-cycle-021" in actual_tasks
         assert "autoresearch-external-refocus" in helper.RESULTS.read_text(encoding="utf-8")
         assert "autoresearch-external-change-required" not in helper.RESULTS.read_text(encoding="utf-8")
+        low_signal_workspace = Path(tmp) / "low-signal-loop"
+        configure_workspace(helper, low_signal_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        for index in range(4):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-low-signal-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another MTP report",
+                commit="abc123",
+                notes="seeded_tasks=1 deliberation_actions=agent-deliberation-mtp-acceptance-yield",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"mtp-report-low-signal-{index}",
+                status="keep",
+                target="mtp-acceptance-report",
+                hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence",
+                commit="abc123",
+                notes="samples=5 mtp_samples=3 mean_server_tok_s=3.5 mean_accept=0.87 path=/tmp/report.json",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "agent-deliberation-mtp-acceptance-yield-loop",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "lane": "frontier-deliberation",
+                    "next_action": "openclaw-speed-research mtp-report --lines 320",
+                }
+            ],
+        )
+        low_signal_args = Namespace(
+            low_signal_window_rows=20,
+            low_signal_min_mtp_reports=4,
+            low_signal_min_synthesis_rows=4,
+        )
+        low_signal_status = helper.recent_low_signal_mtp_loop_status(low_signal_args)
+        assert low_signal_status["loop"]
+        repair = helper.repair_low_signal_mtp_loop(22, "low-signal", low_signal_status)
+        assert repair["blocked_tasks"] == 1
+        assert repair["seeded_tasks"] == 3
+        low_signal_tasks = helper.read_jsonl(helper.TASKS)
+        assert any(task["status"] == "blocked" for task in low_signal_tasks if "mtp-acceptance-yield-loop" in task["id"])
+        assert any(task.get("supervisor_action") == "source-scout" for task in low_signal_tasks)
+        assert any(task.get("supervisor_action") == "runtime-overhead-map" for task in low_signal_tasks)
+        deliberation_tasks = [task for task in low_signal_tasks if task.get("supervisor_action") == "frontier-deliberation"]
+        assert len(deliberation_tasks) == 1
+        assert helper.task_runs_without_model(deliberation_tasks[0])
+        deliberation_helper = Path(tmp) / "frontier-deliberation-helper.py"
+        deliberation_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'ok': True, 'seeded': 1, 'seeded_tasks': ['next-safe-task']}))\n",
+            encoding="utf-8",
+        )
+        deliberation_helper.chmod(0o700)
+        code, issue = helper.run_supervisor_frontier_deliberation_task(
+            Namespace(research_helper_bin=str(deliberation_helper)),
+            23,
+            "low-signal",
+            deliberation_tasks[0],
+            helper.WORKSPACE / "autopilot.log",
+        )
+        assert code == 0
+        assert issue == ""
+        assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
+
+        watchdog_workspace = Path(tmp) / "low-signal-watchdog"
+        configure_workspace(helper, watchdog_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        for index in range(4):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-watchdog-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another MTP report",
+                commit="abc123",
+                notes="seeded_tasks=1 deliberation_actions=agent-deliberation-mtp-acceptance-yield",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"mtp-report-watchdog-{index}",
+                status="keep",
+                target="mtp-acceptance-report",
+                hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence",
+                commit="abc123",
+                notes="samples=5 mtp_samples=3 mean_server_tok_s=3.5 mean_accept=0.87 path=/tmp/report.json",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "agent-deliberation-mtp-acceptance-yield-watchdog",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "lane": "frontier-deliberation",
+                    "next_action": "openclaw-speed-research mtp-report --lines 320",
+                }
+            ],
+        )
+        watchdog_args = Namespace(
+            low_signal_window_rows=20,
+            low_signal_min_mtp_reports=4,
+            low_signal_min_synthesis_rows=4,
+        )
+        with (
+            patch.object(helper, "run_supervisor_quality_review", return_value=(True, "")) as quality_mock,
+            patch.object(helper, "run_supervisor_self_improvement", return_value=(True, "")) as self_mock,
+            patch.object(helper, "frontier_certification_status", return_value={"ok": True}),
+            patch.object(helper, "run_autonomous_repair_loop", return_value=(False, "should-not-run")) as repair_mock,
+        ):
+            ok, issue = helper.run_periodic_autonomy_watchdog(
+                watchdog_args,
+                31,
+                "watchdog-success",
+                helper.WORKSPACE / "autopilot.log",
+                reason="unit low signal",
+            )
+        assert ok
+        assert issue == ""
+        assert quality_mock.call_count == 2
+        assert self_mock.call_count == 1
+        assert repair_mock.call_count == 0
+        assert "autoresearch-autonomous-repair" in helper.RESULTS.read_text(encoding="utf-8")
+
+        watchdog_failure_workspace = Path(tmp) / "low-signal-watchdog-failure"
+        configure_workspace(helper, watchdog_failure_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        for index in range(4):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-watchdog-failure-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another MTP report",
+                commit="abc123",
+                notes="seeded_tasks=1 deliberation_actions=agent-deliberation-mtp-acceptance-yield",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"mtp-report-watchdog-failure-{index}",
+                status="keep",
+                target="mtp-acceptance-report",
+                hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence",
+                commit="abc123",
+                notes="samples=5 mtp_samples=3 mean_server_tok_s=3.5 mean_accept=0.87 path=/tmp/report.json",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "agent-deliberation-mtp-acceptance-yield-watchdog-failure",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "lane": "frontier-deliberation",
+                    "next_action": "openclaw-speed-research mtp-report --lines 320",
+                }
+            ],
+        )
+        with (
+            patch.object(helper, "run_supervisor_quality_review", return_value=(False, "review failed")),
+            patch.object(helper, "run_supervisor_self_improvement", return_value=(False, "self-improvement failed")),
+            patch.object(helper, "frontier_certification_status", return_value={"ok": False, "issues": ["not certified"]}),
+            patch.object(helper, "run_autonomous_repair_loop", return_value=(True, "")) as repair_mock,
+        ):
+            ok, issue = helper.run_periodic_autonomy_watchdog(
+                watchdog_args,
+                32,
+                "watchdog-failure",
+                helper.WORKSPACE / "autopilot.log",
+                reason="unit low signal",
+            )
+        assert ok
+        assert issue == ""
+        assert repair_mock.call_count == 1
     return 0
 
 

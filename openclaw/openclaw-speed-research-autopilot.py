@@ -648,6 +648,19 @@ TERMINAL_EXTERNAL_ACTIONS = {
 }
 TERMINAL_EXTERNAL_LANES = {"exhaustion-report", "implementation-gate", "runtime-overhead"}
 CORE_SPEED_LANES = {"drafter-calibration-memory", "frontier-dflash", "mtp-decode"}
+LOW_SIGNAL_LOOP_TARGETS = {
+    "mtp-acceptance-report",
+    "synthesis",
+    "synthesis-terminal",
+}
+LOW_SIGNAL_ESCAPE_TARGETS = {
+    "decode-sample",
+    "frontier-source-scout",
+    "frontier-agent-deliberation",
+    "runtime-overhead-map",
+    "autoresearch-implementation-handoff",
+    "patch-execute",
+}
 
 
 def task_is_terminal_external(task: dict[str, object], *, recent_empty_bridge_count: int) -> bool:
@@ -766,6 +779,182 @@ def external_change_required_status(args: argparse.Namespace) -> dict[str, objec
         "terminal_evidence": terminal_count,
         "next": canonical.get("next") or "add a new drafter candidate, trace source, or approved implementation direction",
     }
+
+
+def recent_low_signal_mtp_loop_status(args: argparse.Namespace) -> dict[str, object]:
+    """Detect stable but unproductive synthesis -> MTP-report churn.
+
+    This is intentionally deterministic: repeated log-summary tasks can be
+    useful once, but after a few unchanged cycles they stop being evidence and
+    should route to a new benchmark, source scout, or patchable hypothesis.
+    """
+    rows = all_result_rows(WORKSPACE)[-max(12, int(getattr(args, "low_signal_window_rows", 40))) :]
+    mtp_rows = [
+        row
+        for row in rows
+        if row.get("target") == "mtp-acceptance-report" or row.get("run_id", "").startswith("mtp-report-")
+    ]
+    synthesis_rows = [
+        row
+        for row in rows
+        if row.get("target") in {"synthesis", "synthesis-terminal"} or row.get("run_id", "").startswith("synthesis-")
+    ]
+    escape_rows = [
+        row
+        for row in rows
+        if row.get("target") in LOW_SIGNAL_ESCAPE_TARGETS
+        or row.get("run_id", "").startswith(("source-scout-", "frontier-agent-deliberation-", "runtime-overhead-map-"))
+        or row.get("target") == "decode-sample"
+    ]
+    min_mtp = int(getattr(args, "low_signal_min_mtp_reports", 4))
+    min_synthesis = int(getattr(args, "low_signal_min_synthesis_rows", 4))
+    repeated_notes = len({re.sub(r"path=[^ ]+", "path=<artifact>", row.get("notes", "")) for row in mtp_rows[-min_mtp:]})
+    loop = len(mtp_rows) >= min_mtp and len(synthesis_rows) >= min_synthesis and not escape_rows
+    if not loop and len(mtp_rows) >= min_mtp + 2 and repeated_notes <= 2:
+        loop = True
+    return {
+        "loop": loop,
+        "mtp_reports": len(mtp_rows),
+        "synthesis_rows": len(synthesis_rows),
+        "escape_rows": len(escape_rows),
+        "repeated_note_shapes": repeated_notes,
+        "latest_mtp_run": mtp_rows[-1].get("run_id", "") if mtp_rows else "",
+        "reason": (
+            "repeated synthesis/MTP-report loop without new candidate evidence"
+            if loop
+            else "no low-signal MTP loop detected"
+        ),
+    }
+
+
+def block_ready_low_signal_mtp_tasks(reason: str) -> int:
+    tasks = read_jsonl(TASKS)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        action = str(task.get("supervisor_action", ""))
+        task_id = str(task.get("id", ""))
+        if action != "mtp-report" and "mtp-acceptance-yield" not in task_id:
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = f"low-signal loop suppressed: {reason}"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "low_signal_mtp_loop_suppressed",
+            "next": "route to source-scout, frontier-deliberation, runtime-overhead, or paired decode benchmark",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+    return blocked
+
+
+def low_signal_frontier_deliberation_task(cycle: int, status: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": f"low-signal-frontier-deliberation-cycle-{cycle:03d}",
+        "status": "ready",
+        "priority": 99,
+        "lane": "frontier-deliberation",
+        "task_type": "supervisor",
+        "supervisor_action": "frontier-deliberation",
+        "target": "tasks.jsonl/results.tsv",
+        "hypothesis": (
+            "A repeated synthesis/MTP-report loop means the supervisor must select a new bounded path "
+            "instead of collecting another equivalent log summary."
+        ),
+        "metric": "frontier_deliberation_contract",
+        "guard_checks": ["no_model_load", "no_opencode_changes", "no_live_profile_change", "rollback_path"],
+        "acceptance": "A frontier-agent-deliberation artifact selects one safe deterministic next task or records a closed blocker.",
+        "rollback": "No source rollback needed; this only writes deliberation/task artifacts.",
+        "evidence": status,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research frontier-deliberation --allow-empty",
+    }
+
+
+def low_signal_source_scout_task(cycle: int, status: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": f"low-signal-source-scout-cycle-{cycle:03d}",
+        "status": "ready",
+        "priority": 100,
+        "lane": "frontier-deliberation",
+        "task_type": "supervisor",
+        "supervisor_action": "source-scout",
+        "target": "external-speed-references",
+        "topic": "JANQ Gemma4 MTP acceptance, drafter fit, Rapid-MLX decode speed, DFlash compatibility",
+        "hypothesis": "A low-signal local loop should refresh bounded external evidence before creating another candidate.",
+        "metric": "source_evidence_count",
+        "guard_checks": ["allowlisted_hosts_only", "timeout_bounded", "no_model_load", "no_opencode_changes"],
+        "acceptance": "A source-scout artifact records fetched/skipped references and concrete next-source gaps.",
+        "rollback": "No rollback needed; this is read-only evidence collection.",
+        "evidence": status,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic frontier-decode-speed",
+    }
+
+
+def low_signal_runtime_map_task(cycle: int, status: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": f"low-signal-runtime-map-cycle-{cycle:03d}",
+        "status": "ready",
+        "priority": 98,
+        "lane": "runtime-overhead",
+        "task_type": "supervisor",
+        "supervisor_action": "runtime-overhead-map",
+        "target": "openclaw/openclaw-model-proxy.py",
+        "hypothesis": "Repeated MTP summaries must be converted into a source/runtime boundary map before more reports run.",
+        "metric": "server_wall_decode_gap",
+        "guard_checks": ["no_model_load", "no_opencode_changes", "no_live_profile_change"],
+        "acceptance": "A runtime-overhead map identifies a patchable boundary or records that this lane is clean.",
+        "rollback": "No runtime rollback needed; this is a read-only supervisor artifact.",
+        "evidence": status,
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research runtime-overhead-map",
+    }
+
+
+def enqueue_low_signal_repair_tasks(cycle: int, status: dict[str, object]) -> int:
+    existing = read_jsonl(TASKS)
+    existing_ids = {str(task.get("id", "")) for task in existing}
+    candidates = [
+        low_signal_source_scout_task(cycle, status),
+        low_signal_runtime_map_task(cycle, status),
+        low_signal_frontier_deliberation_task(cycle, status),
+    ]
+    additions = [task for task in candidates if str(task["id"]) not in existing_ids]
+    if additions:
+        write_jsonl(TASKS, existing + additions)
+    return len(additions)
+
+
+def repair_low_signal_mtp_loop(cycle: int, session: str, status: dict[str, object]) -> dict[str, object]:
+    blocked = block_ready_low_signal_mtp_tasks(str(status.get("reason", "")))
+    seeded = enqueue_low_signal_repair_tasks(cycle, status)
+    append_result(
+        WORKSPACE,
+        run_id=f"low-signal-loop-repair-{cycle}-{int(time.time())}",
+        status="keep" if seeded or blocked else "blocked",
+        target="autoresearch-low-signal-repair",
+        hypothesis="the autonomous supervisor should break repeated synthesis/MTP-report loops without human intervention",
+        commit=current_commit(),
+        notes=(
+            f"session={session} blocked_mtp_tasks={blocked} seeded_tasks={seeded} "
+            f"status={clean_tsv(json.dumps(status, sort_keys=True))}"
+        ),
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "autonomous-low-signal-loop-repair",
+            "finding": "supervisor detected repeated MTP-report churn and routed to new bounded evidence paths",
+            "blocked_mtp_tasks": blocked,
+            "seeded_tasks": seeded,
+            "evidence": status,
+            "next": "run source-scout/runtime-map/frontier-deliberation before another MTP report",
+        },
+    )
+    return {"blocked_tasks": blocked, "seeded_tasks": seeded}
 
 
 def append_external_change_required(cycle: int, session: str, status: dict[str, object]) -> None:
@@ -1188,6 +1377,15 @@ def is_supervisor_source_scout_task(task: dict[str, object] | None) -> bool:
     )
 
 
+def is_supervisor_frontier_deliberation_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "frontier-deliberation"
+        or "openclaw-speed-research frontier-deliberation" in str(task.get("next_action", ""))
+    )
+
+
 def requires_profile_variant_runner(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -1228,6 +1426,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_runtime_overhead_map_task,
             is_supervisor_calibration_memory_report_task,
             is_supervisor_source_scout_task,
+            is_supervisor_frontier_deliberation_task,
             requires_profile_variant_runner,
             is_supervisor_benchmark_task,
         )
@@ -3785,6 +3984,50 @@ def run_supervisor_source_scout_task(
     return 0, ""
 
 
+def run_supervisor_frontier_deliberation_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "frontier-deliberation", "--allow-empty"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor frontier deliberation "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=90,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR FRONTIER DELIBERATION TIMEOUT\n")
+            complete_supervisor_task(
+                task,
+                status="blocked",
+                summary={"reason": "supervisor frontier deliberation timeout"},
+                commit=current_commit(),
+            )
+            return 124, "supervisor frontier deliberation timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    if result.returncode != 0 or parsed.get("ok") is False:
+        reason = str(parsed.get("next") or parsed.get("reason") or f"supervisor frontier deliberation exit {result.returncode}")
+        complete_supervisor_task(task, status="blocked", summary={"reason": reason, "result": parsed}, commit=current_commit())
+        return result.returncode or 2, reason
+    complete_supervisor_task(task, status="keep", summary=parsed, commit=current_commit())
+    return 0, ""
+
+
 def should_run_deterministic_fallback(issue: str, quality: dict[str, object]) -> bool:
     text = f"{issue} {quality.get('reason', '')}"
     if is_gateway_issue(text) and "recovered" not in text.lower():
@@ -3933,6 +4176,7 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
     commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "frontier-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
     commands.append([args.research_helper_bin, "frontier-autonomy-score", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
+    commands.append([args.research_helper_bin, "review-council", "--recent-rows", str(args.review_recent_rows), "--seed-next", "--allow-fail"])
     commands.append([args.research_helper_bin, "alive-eval", "--recent-rows", str(args.review_recent_rows), "--allow-fail"])
     commands.append([args.research_helper_bin, "implementation-handoff-audit", "--min-score", "90"])
     commands.append([args.research_helper_bin, "gepa-policy-promote", "--min-candidates", "3"])
@@ -4116,6 +4360,92 @@ def run_autonomous_repair_loop(
         deterministic_ready=len(deterministic),
     )
     return False, last_issue
+
+
+def run_periodic_autonomy_watchdog(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    log_file: Path,
+    *,
+    reason: str,
+) -> tuple[bool, str]:
+    """Hourly supervisor check that owns repair instead of waiting for chat.
+
+    The watchdog is deliberately evidence-first: run certification, detect
+    low-signal loops, queue deterministic repair work, then re-certify.  Source
+    patches still flow through patch-execute/Crabbox gates; this function only
+    decides whether the loop should keep researching, repair, or route to the
+    next safe action.
+    """
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(f"\n===== cycle {cycle} session {session} autonomy watchdog reason={clean_tsv(reason)} =====\n")
+    review_ok, review_issue = run_supervisor_quality_review(args, cycle, f"{session}-watchdog-review", log_file)
+    low_signal = recent_low_signal_mtp_loop_status(args)
+    if low_signal.get("loop"):
+        repair = repair_low_signal_mtp_loop(cycle, session, low_signal)
+        self_ok, self_issue = run_supervisor_self_improvement(
+            args,
+            cycle,
+            f"{session}-watchdog-low-signal",
+            log_file,
+            reason=f"low-signal-loop:{low_signal.get('reason')}",
+        )
+        post_ok, post_issue = run_supervisor_quality_review(
+            args,
+            cycle,
+            f"{session}-watchdog-post-low-signal",
+            log_file,
+        )
+        certification = frontier_certification_status(args)
+        deterministic = deterministic_ready_tasks()
+        if self_ok and post_ok and (certification.get("ok") or deterministic):
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=f"low-signal loop repaired: {repair}",
+                attempts=1,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
+        repair_reason = (
+            f"low-signal repair incomplete: self_improvement={self_ok}:{self_issue or 'ok'} "
+            f"post_review={post_ok}:{post_issue or 'ok'} "
+            f"certification={certification.get('ok')} deterministic_ready={len(deterministic)}"
+        )
+        return run_autonomous_repair_loop(
+            args,
+            cycle,
+            session,
+            log_file,
+            reason=repair_reason,
+        )
+    certification = frontier_certification_status(args)
+    if review_ok and certification.get("ok"):
+        append_result(
+            WORKSPACE,
+            run_id=f"autonomy-watchdog-{cycle}-{int(time.time())}",
+            status="keep",
+            target="autoresearch-autonomy-watchdog",
+            hypothesis="periodic supervisor checks should certify health and route repair without human intervention",
+            commit=current_commit(),
+            notes=(
+                f"session={session} reason={clean_tsv(reason)} frontier={certification.get('frontier_score')} "
+                f"quality={certification.get('quality_score')} deterministic={len(certification.get('deterministic_ready_tasks', []))}"
+            ),
+        )
+        return True, ""
+    repair_ok, repair_issue = run_autonomous_repair_loop(
+        args,
+        cycle,
+        session,
+        log_file,
+        reason=review_issue or "; ".join(str(item) for item in certification.get("issues", [])) or reason,
+    )
+    if repair_ok:
+        return True, ""
+    return False, repair_issue or review_issue or "autonomy watchdog repair failed"
 
 
 def latest_json_artifact(pattern: str) -> dict[str, object]:
@@ -4626,6 +4956,39 @@ def main() -> int:
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMOUS_REPAIR_ATTEMPTS", "2")),
         help="bounded repair attempts before recording a blocker",
     )
+    parser.add_argument(
+        "--autonomy-watchdog-interval-seconds",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_WATCHDOG_INTERVAL", "3600")),
+        help="wall-clock interval for autonomous health/quality/repair ownership checks",
+    )
+    parser.add_argument(
+        "--low-signal-guard",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_GUARD", "1") != "0",
+        help="detect and repair repeated synthesis/MTP-report loops before they waste overnight cycles",
+    )
+    parser.add_argument(
+        "--low-signal-check-interval-cycles",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_CHECK_INTERVAL", "12")),
+        help="cycle interval for low-signal loop detection in addition to the wall-clock watchdog",
+    )
+    parser.add_argument(
+        "--low-signal-window-rows",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_WINDOW_ROWS", "40")),
+    )
+    parser.add_argument(
+        "--low-signal-min-mtp-reports",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_MTP", "4")),
+    )
+    parser.add_argument(
+        "--low-signal-min-synthesis-rows",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_SYNTHESIS", "4")),
+    )
     args = parser.parse_args()
     INTERRUPT_CONTEXT.update(
         {
@@ -4656,6 +5019,8 @@ def main() -> int:
     progress_cycles = 0
     blocked_cycles = 0
     crash_cooldown_until = 0.0
+    last_autonomy_watchdog_at = time.monotonic()
+    last_low_signal_repair_cycle = 0
     cycle_limit = args.cycles
     extension_size = args.cycle_extension_size if args.cycle_extension_size > 0 else max(1, args.cycles)
     log(
@@ -4754,6 +5119,48 @@ def main() -> int:
                 f"ready={','.join(str(item) for item in external_status.get('ready_tasks', [])) or 'none'}"
             )
             break
+        if (
+            args.autonomy_watchdog_interval_seconds > 0
+            and time.monotonic() - last_autonomy_watchdog_at >= args.autonomy_watchdog_interval_seconds
+        ):
+            watchdog_ok, watchdog_issue = run_periodic_autonomy_watchdog(
+                args,
+                cycle,
+                current_session,
+                log_file,
+                reason="wall-clock interval",
+            )
+            last_autonomy_watchdog_at = time.monotonic()
+            log(f"cycle={cycle} autonomy_watchdog ok={watchdog_ok} issue={watchdog_issue or 'none'}")
+            if watchdog_ok:
+                time.sleep(args.sleep_seconds)
+                continue
+        if (
+            args.low_signal_guard
+            and args.low_signal_check_interval_cycles > 0
+            and cycle - last_low_signal_repair_cycle >= args.low_signal_check_interval_cycles
+        ):
+            low_signal = recent_low_signal_mtp_loop_status(args)
+            if low_signal.get("loop"):
+                watchdog_ok, watchdog_issue = run_periodic_autonomy_watchdog(
+                    args,
+                    cycle,
+                    current_session,
+                    log_file,
+                    reason="low-signal guard",
+                )
+                last_low_signal_repair_cycle = cycle
+                log(
+                    f"cycle={cycle} low_signal_watchdog ok={watchdog_ok} "
+                    f"issue={watchdog_issue or 'none'}"
+                )
+                if not watchdog_ok:
+                    pause_reason = f"low-signal watchdog could not repair cleanly: {watchdog_issue or 'unknown issue'}"
+                    append_quality_pause(cycle, current_session, pause_reason)
+                    log(f"cycle={cycle} quality_pause reason={pause_reason}")
+                    break
+                time.sleep(args.sleep_seconds)
+                continue
         memory_ok, memory_issue = wait_for_memory(args)
         if not memory_ok:
             stalled_cycles += 1
@@ -4958,6 +5365,8 @@ def main() -> int:
             code, issue = run_supervisor_calibration_memory_report_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_source_scout_task(selected_task):
             code, issue = run_supervisor_source_scout_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_frontier_deliberation_task(selected_task):
+            code, issue = run_supervisor_frontier_deliberation_task(args, cycle, current_session, selected_task, log_file)
         elif requires_profile_variant_runner(selected_task):
             code, issue = run_supervisor_profile_variant_guard(cycle, current_session, selected_task, log_file)
         elif is_supervisor_benchmark_task(selected_task):
