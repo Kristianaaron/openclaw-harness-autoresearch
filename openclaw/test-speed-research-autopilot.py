@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import time
 import tempfile
 from argparse import Namespace
 from pathlib import Path
@@ -2202,6 +2203,74 @@ def main() -> int:
             last_issue="",
         )
         assert "low-signal-decode-remeasure-loop" not in post_repair_trigger["triggers"], post_repair_trigger
+
+        trigger_workspace = Path(tmp) / "autonomy-trigger-cadence"
+        configure_workspace(helper, trigger_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="frontier-review-memory-lane",
+            status="keep",
+            target="autoresearch-frontier",
+            hypothesis="frontier review mentions drafter-calibration-memory without a crash",
+            commit="abc123",
+            notes="ready=2 exhausted=drafter-calibration-memory,frontier-dflash",
+        )
+        benign_args = Namespace(
+            low_signal_window_rows=20,
+            low_signal_min_mtp_reports=4,
+            low_signal_min_synthesis_rows=4,
+            low_signal_min_decode_remeasures=3,
+            autonomy_trigger_recent_rows=20,
+            autonomy_trigger_min_score=95,
+            autonomy_trigger_hard_score=80,
+            autonomy_trigger_controller=True,
+            autonomy_trigger_interval_cycles=1,
+            autonomy_trigger_review_interval_seconds=1800,
+        )
+        benign_anomalies = helper.recent_trigger_anomalies(benign_args)
+        assert benign_anomalies["hard_rows"] == 0, benign_anomalies
+
+        trigger_log = helper.WORKSPACE / "autopilot.log"
+        calls = []
+        original_watchdog = helper.run_periodic_autonomy_watchdog
+
+        def fake_watchdog(*_args, **_kwargs):
+            calls.append((_args, _kwargs))
+            return True, ""
+
+        helper.run_periodic_autonomy_watchdog = fake_watchdog
+        try:
+            ok, issue, handled = helper.run_autonomy_trigger_controller(
+                benign_args,
+                30,
+                "trigger-cadence",
+                trigger_log,
+                stalled_cycles=0,
+                blocked_cycles=0,
+                progress_cycles=1,
+                last_issue="",
+                last_trigger_at=time.monotonic(),
+            )
+            assert (ok, issue, handled) == (True, "", False)
+            assert calls == []
+            ok, issue, handled = helper.run_autonomy_trigger_controller(
+                benign_args,
+                31,
+                "trigger-cadence",
+                trigger_log,
+                stalled_cycles=0,
+                blocked_cycles=0,
+                progress_cycles=1,
+                last_issue="",
+                last_trigger_at=time.monotonic() - 1801,
+            )
+            assert (ok, issue, handled) == (True, "", True)
+            assert len(calls) == 1
+        finally:
+            helper.run_periodic_autonomy_watchdog = original_watchdog
 
         watchdog_workspace = Path(tmp) / "low-signal-watchdog"
         configure_workspace(helper, watchdog_workspace)

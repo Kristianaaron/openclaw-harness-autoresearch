@@ -114,6 +114,37 @@ MEMORY_OR_CRASH_TERMS = (
     "sigsegv",
     "crash",
 )
+ACTIVE_MEMORY_OR_CRASH_ROW_TERMS = (
+    "memory gate",
+    "memory pressure",
+    "compressor_mb",
+    "swap_used_mb",
+    "metal",
+    "fatal process exit",
+    "sigabrt",
+    "sigkill",
+    "sigsegv",
+    "crash",
+)
+ACTIVE_BAD_BEHAVIOR_ROW_TERMS = (
+    "tool result cap",
+    "tool result synthesis grace",
+    "malformed hidden/tool output",
+    "malformed tool",
+    "no durable artifact",
+    "stream timeout",
+    "reasoning leak",
+    "tool-call loop",
+)
+NEGATED_HARD_SIGNAL_PHRASES = (
+    "no crash",
+    "without crash",
+    "without a crash",
+    "not a crash",
+    "no memory pressure",
+    "no memory block",
+    "no metal crash",
+)
 INTERRUPT_CONTEXT: dict[str, object] = {
     "args": None,
     "child_process": None,
@@ -4753,12 +4784,23 @@ def latest_artifact_score(pattern: str, *keys: str) -> float:
 
 def recent_trigger_anomalies(args: argparse.Namespace) -> dict[str, object]:
     rows = all_result_rows(WORKSPACE)[-max(10, int(getattr(args, "autonomy_trigger_recent_rows", 40))) :]
-    bad_terms = tuple(term.lower() for term in MEMORY_OR_CRASH_TERMS + MALFORMED_OR_TOOL_ISSUES)
+    hard_terms = tuple(term.lower() for term in ACTIVE_MEMORY_OR_CRASH_ROW_TERMS + ACTIVE_BAD_BEHAVIOR_ROW_TERMS)
     blocked = [row for row in rows if row.get("status") == "blocked"]
+
+    def has_active_hard_signal(row: dict[str, str]) -> bool:
+        text = (row.get("notes", "") + " " + row.get("hypothesis", "")).lower()
+        for term in hard_terms:
+            if term not in text:
+                continue
+            if any(negated in text for negated in NEGATED_HARD_SIGNAL_PHRASES):
+                continue
+            return True
+        return False
+
     hard = [
         row
         for row in rows
-        if any(term in (row.get("notes", "") + " " + row.get("hypothesis", "")).lower() for term in bad_terms)
+        if has_active_hard_signal(row)
     ]
     terminal = [
         row
@@ -4871,6 +4913,7 @@ def autonomy_trigger_status(
             "alive": alive_score,
             "council": council_score,
         },
+        "primary_goal": "increase normal OpenClaw TUI decode_tps while preserving stability",
         "counters": {
             "stalled_cycles": stalled_cycles,
             "blocked_cycles": blocked_cycles,
@@ -4906,6 +4949,7 @@ def run_autonomy_trigger_controller(
     blocked_cycles: int,
     progress_cycles: int,
     last_issue: str,
+    last_trigger_at: float,
 ) -> tuple[bool, str, bool]:
     """Run the tiered autonomy controller.
 
@@ -4927,6 +4971,16 @@ def run_autonomy_trigger_controller(
         last_issue=last_issue,
     )
     if status["action"] == "continue":
+        return True, "", False
+    triggers = [str(item) for item in status.get("triggers", [])]
+    immediate = any(
+        trigger.startswith("hard-memory-or-crash")
+        or trigger in {"low-signal-mtp-loop", "low-signal-decode-remeasure-loop"}
+        for trigger in triggers
+    )
+    review_interval = float(getattr(args, "autonomy_trigger_review_interval_seconds", 1800.0))
+    review_due = review_interval <= 0 or time.monotonic() - last_trigger_at >= review_interval
+    if not immediate and not review_due:
         return True, "", False
     append_autonomy_trigger_result(cycle, session, status)
     with log_file.open("a", encoding="utf-8") as file:
@@ -5366,6 +5420,12 @@ def main() -> int:
         help="cycle interval for the cheap trigger controller",
     )
     parser.add_argument(
+        "--autonomy-trigger-review-interval-seconds",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_REVIEW_INTERVAL", "1800")),
+        help="minimum wall-clock interval between non-critical review/repair escalations from the cheap trigger controller",
+    )
+    parser.add_argument(
         "--autonomy-trigger-min-score",
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_MIN_SCORE", "95")),
@@ -5447,6 +5507,7 @@ def main() -> int:
     blocked_cycles = 0
     crash_cooldown_until = 0.0
     last_autonomy_watchdog_at = time.monotonic()
+    last_autonomy_trigger_at = time.monotonic()
     last_low_signal_repair_cycle = 0
     cycle_limit = args.cycles
     extension_size = args.cycle_extension_size if args.cycle_extension_size > 0 else max(1, args.cycles)
@@ -5571,8 +5632,10 @@ def main() -> int:
             blocked_cycles=blocked_cycles,
             progress_cycles=progress_cycles,
             last_issue=last_issue,
+            last_trigger_at=last_autonomy_trigger_at,
         )
         if trigger_handled:
+            last_autonomy_trigger_at = time.monotonic()
             log(
                 f"cycle={cycle} autonomy_trigger_controller ok={trigger_ok} "
                 f"issue={trigger_issue or 'none'}"
