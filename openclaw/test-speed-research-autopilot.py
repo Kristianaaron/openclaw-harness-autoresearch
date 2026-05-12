@@ -2166,9 +2166,22 @@ def main() -> int:
             low_signal_min_mtp_reports=4,
             low_signal_min_synthesis_rows=4,
             low_signal_min_decode_remeasures=3,
+            autonomy_trigger_recent_rows=20,
+            autonomy_trigger_min_score=95,
+            autonomy_trigger_hard_score=80,
         )
         remeasure_status = helper.recent_low_signal_decode_remeasure_status(remeasure_args)
         assert remeasure_status["loop"], remeasure_status
+        trigger_status = helper.autonomy_trigger_status(
+            remeasure_args,
+            cycle=24,
+            stalled_cycles=0,
+            blocked_cycles=0,
+            progress_cycles=6,
+            last_issue="",
+        )
+        assert trigger_status["action"] in {"review", "repair"}, trigger_status
+        assert "low-signal-decode-remeasure-loop" in trigger_status["triggers"], trigger_status
         remeasure_repair = helper.repair_low_signal_decode_remeasure_loop(24, "low-signal-remeasure", remeasure_status)
         assert remeasure_repair["blocked_tasks"] == 1
         assert remeasure_repair["seeded_tasks"] == 3
@@ -2180,6 +2193,15 @@ def main() -> int:
         )
         assert any(task.get("supervisor_action") == "frontier-deliberation" for task in remeasure_tasks)
         assert "autoresearch-low-signal-repair" in helper.RESULTS.read_text(encoding="utf-8")
+        post_repair_trigger = helper.autonomy_trigger_status(
+            remeasure_args,
+            cycle=25,
+            stalled_cycles=0,
+            blocked_cycles=0,
+            progress_cycles=7,
+            last_issue="",
+        )
+        assert "low-signal-decode-remeasure-loop" not in post_repair_trigger["triggers"], post_repair_trigger
 
         watchdog_workspace = Path(tmp) / "low-signal-watchdog"
         configure_workspace(helper, watchdog_workspace)

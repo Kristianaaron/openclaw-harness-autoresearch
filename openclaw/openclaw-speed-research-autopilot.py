@@ -672,6 +672,7 @@ LOW_SIGNAL_REMEASURE_ESCAPE_TARGETS = {
     "runtime-overhead-map",
     "calibration-memory-report",
     "autoresearch-implementation-handoff",
+    "autoresearch-low-signal-repair",
     "patch-execute",
 }
 
@@ -887,8 +888,17 @@ def recent_low_signal_decode_remeasure_status(args: argparse.Namespace) -> dict[
         if task.get("status", "ready") in {"ready", "rework"}
         and str(task.get("id", "")).startswith(LOW_SIGNAL_DECODE_REMEASURE_PREFIXES)
     ]
+    ready_escape_tasks = [
+        str(task.get("id", ""))
+        for task in read_jsonl(TASKS)
+        if task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("supervisor_action", ""))
+        in {"source-scout", "runtime-overhead-map", "frontier-deliberation"}
+    ]
     if not loop and len(remeasure_synthesis) >= min_remeasure + 1 and recent_ready_remeasure:
         loop = True
+    if loop and ready_escape_tasks and not recent_ready_remeasure:
+        loop = False
     return {
         "loop": loop,
         "decode_remeasure_synthesis": len(remeasure_synthesis),
@@ -896,6 +906,7 @@ def recent_low_signal_decode_remeasure_status(args: argparse.Namespace) -> dict[
         "escape_rows": len(escape_rows),
         "rows_since_latest_escape": len(post_escape_rows),
         "ready_remeasure_tasks": recent_ready_remeasure[:8],
+        "ready_escape_tasks": ready_escape_tasks[:8],
         "latest_decode_run": clean_decode_rows[-1].get("run_id", "") if clean_decode_rows else "",
         "reason": (
             "repeated clean decode remeasure loop without drafter-fit/runtime/source escape"
@@ -4726,6 +4737,214 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
     }
 
 
+def latest_artifact_score(pattern: str, *keys: str) -> float:
+    artifact = latest_json_artifact(pattern)
+    for key in keys:
+        value: object = artifact
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
+        if isinstance(value, int | float):
+            return float(value)
+    return 0.0
+
+
+def recent_trigger_anomalies(args: argparse.Namespace) -> dict[str, object]:
+    rows = all_result_rows(WORKSPACE)[-max(10, int(getattr(args, "autonomy_trigger_recent_rows", 40))) :]
+    bad_terms = tuple(term.lower() for term in MEMORY_OR_CRASH_TERMS + MALFORMED_OR_TOOL_ISSUES)
+    blocked = [row for row in rows if row.get("status") == "blocked"]
+    hard = [
+        row
+        for row in rows
+        if any(term in (row.get("notes", "") + " " + row.get("hypothesis", "")).lower() for term in bad_terms)
+    ]
+    terminal = [
+        row
+        for row in rows
+        if row.get("target") in {"synthesis-terminal", "autoresearch-quality-pause"}
+        or "terminal_no_work=True" in row.get("notes", "")
+    ]
+    return {
+        "blocked_rows": len(blocked),
+        "hard_rows": len(hard),
+        "terminal_rows": len(terminal),
+        "latest_hard_run": hard[-1].get("run_id", "") if hard else "",
+        "latest_blocked_run": blocked[-1].get("run_id", "") if blocked else "",
+    }
+
+
+def autonomy_trigger_status(
+    args: argparse.Namespace,
+    *,
+    cycle: int,
+    stalled_cycles: int,
+    blocked_cycles: int,
+    progress_cycles: int,
+    last_issue: str,
+) -> dict[str, object]:
+    """Cheap every-cycle controller score.
+
+    This is the fast tier of the autonomy system. It reads counters and latest
+    artifacts only; it does not run model turns, quality review, or tests. When
+    the score drops or a hard trigger fires, the caller escalates to the medium
+    watchdog/review tier.
+    """
+    low_signal = recent_low_signal_mtp_loop_status(args)
+    remeasure_loop = recent_low_signal_decode_remeasure_status(args)
+    ready = ready_work_summary()
+    deterministic = deterministic_ready_tasks()
+    anomalies = recent_trigger_anomalies(args)
+    quality_score = max(
+        latest_artifact_score("quality-review-*.json", "quality_score"),
+        latest_artifact_score("quality-review-*.json", "scorecard.overall"),
+    )
+    autonomy_score = latest_artifact_score("frontier-autonomy-score-*.json", "total_score")
+    alive_score = latest_artifact_score("self-improvement-alive-eval-*.json", "total_score")
+    council_score = latest_artifact_score("review-council-*.json", "scorecard.overall")
+    frontier_score = latest_artifact_score("frontier-system-eval-*.json", "overall") * 10.0
+    last_issue_lower = last_issue.lower()
+    hard_memory_or_crash = any(term in last_issue_lower for term in MEMORY_OR_CRASH_TERMS)
+    hard_bad_behavior = int(anomalies["hard_rows"] or 0) > 0
+    has_low_signal = bool(low_signal.get("loop") or remeasure_loop.get("loop"))
+    no_ready_work = int(ready["ready_tasks"] or 0) == 0
+    no_deterministic_route = not deterministic
+
+    components = {
+        "stability": 25 if not hard_memory_or_crash and not hard_bad_behavior and stalled_cycles == 0 else 0,
+        "quality": 20 if quality_score >= 99.0 else 12 if quality_score >= 90.0 else 0,
+        "autonomy": 20 if autonomy_score >= 99.0 and alive_score >= 95.0 and council_score >= 95.0 else 10,
+        "progress": 20 if not has_low_signal and not (no_ready_work and progress_cycles > 0) else 0,
+        "routing": 15 if not no_deterministic_route or not no_ready_work else 5,
+    }
+    score = int(sum(components.values()))
+    triggers: list[str] = []
+    if hard_memory_or_crash:
+        triggers.append("hard-memory-or-crash-signal")
+    if hard_bad_behavior:
+        triggers.append("hard-bad-behavior-row")
+    if low_signal.get("loop"):
+        triggers.append("low-signal-mtp-loop")
+    if remeasure_loop.get("loop"):
+        triggers.append("low-signal-decode-remeasure-loop")
+    if quality_score and quality_score < 99.0:
+        triggers.append(f"quality-below-99:{quality_score}")
+    if autonomy_score and autonomy_score < 99.0:
+        triggers.append(f"autonomy-below-99:{autonomy_score}")
+    if alive_score and alive_score < 95.0:
+        triggers.append(f"alive-below-95:{alive_score}")
+    if council_score and council_score < 95.0:
+        triggers.append(f"council-below-95:{council_score}")
+    if no_ready_work and progress_cycles > 0:
+        triggers.append("no-ready-work-after-progress")
+    if no_deterministic_route and int(ready["ready_tasks"] or 0) > 0:
+        triggers.append("ready-work-has-no-deterministic-route")
+
+    min_score = int(getattr(args, "autonomy_trigger_min_score", 95))
+    hard_score = int(getattr(args, "autonomy_trigger_hard_score", 80))
+    if any(trigger.startswith("hard-") for trigger in triggers):
+        action = "repair"
+    elif score < hard_score:
+        action = "repair"
+    elif triggers or score < min_score:
+        action = "review"
+    else:
+        action = "continue"
+    return {
+        "ok": action == "continue",
+        "kind": "autonomy-trigger-status",
+        "cycle": cycle,
+        "score": score,
+        "action": action,
+        "components": components,
+        "triggers": triggers,
+        "ready": ready,
+        "deterministic_ready": [str(task.get("id", "")) for task in deterministic[:8]],
+        "low_signal": low_signal,
+        "decode_remeasure": remeasure_loop,
+        "anomalies": anomalies,
+        "scores": {
+            "quality": quality_score,
+            "frontier": frontier_score,
+            "autonomy": autonomy_score,
+            "alive": alive_score,
+            "council": council_score,
+        },
+        "counters": {
+            "stalled_cycles": stalled_cycles,
+            "blocked_cycles": blocked_cycles,
+            "progress_cycles": progress_cycles,
+        },
+        "last_issue": last_issue,
+    }
+
+
+def append_autonomy_trigger_result(cycle: int, session: str, status: dict[str, object]) -> None:
+    append_result(
+        WORKSPACE,
+        run_id=f"autonomy-trigger-{cycle}-{int(time.time())}",
+        status="keep" if status.get("action") in {"review", "repair"} else "discard",
+        target="autoresearch-autonomy-trigger",
+        hypothesis="tiered trigger scoring should call review/repair only when autonomous behavior falls below standard",
+        commit=current_commit(),
+        notes=(
+            f"session={session} score={status.get('score')} action={status.get('action')} "
+            f"triggers={','.join(str(item) for item in status.get('triggers', [])) or 'none'} "
+            f"ready={status.get('ready')}"
+        ),
+    )
+
+
+def run_autonomy_trigger_controller(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    log_file: Path,
+    *,
+    stalled_cycles: int,
+    blocked_cycles: int,
+    progress_cycles: int,
+    last_issue: str,
+) -> tuple[bool, str, bool]:
+    """Run the tiered autonomy controller.
+
+    Returns (ok, issue, handled). handled=True means the caller should skip the
+    normal cycle body because review/repair already acted.
+    """
+    if not getattr(args, "autonomy_trigger_controller", True):
+        return True, "", False
+    if int(getattr(args, "autonomy_trigger_interval_cycles", 1)) > 1:
+        interval = int(getattr(args, "autonomy_trigger_interval_cycles", 1))
+        if cycle % interval != 0:
+            return True, "", False
+    status = autonomy_trigger_status(
+        args,
+        cycle=cycle,
+        stalled_cycles=stalled_cycles,
+        blocked_cycles=blocked_cycles,
+        progress_cycles=progress_cycles,
+        last_issue=last_issue,
+    )
+    if status["action"] == "continue":
+        return True, "", False
+    append_autonomy_trigger_result(cycle, session, status)
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} autonomy trigger "
+            f"score={status['score']} action={status['action']} "
+            f"triggers={','.join(str(item) for item in status['triggers']) or 'none'} =====\n"
+        )
+    ok, issue = run_periodic_autonomy_watchdog(
+        args,
+        cycle,
+        session,
+        log_file,
+        reason=f"trigger-controller:{status['action']}:{','.join(str(item) for item in status['triggers'])}",
+    )
+    return ok, issue, True
+
+
 def run_frontier_startup_certification(args: argparse.Namespace, log_file: Path) -> tuple[bool, str]:
     model_bound_impl_blocked = block_model_bound_implementation_tasks(args)
     stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
@@ -5135,6 +5354,36 @@ def main() -> int:
         help="wall-clock interval for autonomous health/quality/repair ownership checks",
     )
     parser.add_argument(
+        "--autonomy-trigger-controller",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_CONTROLLER", "1") != "0",
+        help="run cheap every-cycle trigger scoring and escalate to review/repair only when standards drop",
+    )
+    parser.add_argument(
+        "--autonomy-trigger-interval-cycles",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_INTERVAL", "1")),
+        help="cycle interval for the cheap trigger controller",
+    )
+    parser.add_argument(
+        "--autonomy-trigger-min-score",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_MIN_SCORE", "95")),
+        help="trigger medium review below this cheap controller score",
+    )
+    parser.add_argument(
+        "--autonomy-trigger-hard-score",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_HARD_SCORE", "80")),
+        help="trigger repair below this cheap controller score",
+    )
+    parser.add_argument(
+        "--autonomy-trigger-recent-rows",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_AUTONOMY_TRIGGER_RECENT_ROWS", "40")),
+        help="recent result rows inspected by cheap trigger scoring",
+    )
+    parser.add_argument(
         "--low-signal-guard",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_GUARD", "1") != "0",
@@ -5313,6 +5562,28 @@ def main() -> int:
             if watchdog_ok:
                 time.sleep(args.sleep_seconds)
                 continue
+        trigger_ok, trigger_issue, trigger_handled = run_autonomy_trigger_controller(
+            args,
+            cycle,
+            current_session,
+            log_file,
+            stalled_cycles=stalled_cycles,
+            blocked_cycles=blocked_cycles,
+            progress_cycles=progress_cycles,
+            last_issue=last_issue,
+        )
+        if trigger_handled:
+            log(
+                f"cycle={cycle} autonomy_trigger_controller ok={trigger_ok} "
+                f"issue={trigger_issue or 'none'}"
+            )
+            if not trigger_ok:
+                pause_reason = f"autonomy trigger controller could not repair cleanly: {trigger_issue or 'unknown issue'}"
+                append_quality_pause(cycle, current_session, pause_reason)
+                log(f"cycle={cycle} quality_pause reason={pause_reason}")
+                break
+            time.sleep(args.sleep_seconds)
+            continue
         if (
             args.low_signal_guard
             and args.low_signal_check_interval_cycles > 0
