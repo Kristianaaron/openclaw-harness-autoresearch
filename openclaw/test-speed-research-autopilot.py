@@ -2122,6 +2122,65 @@ def main() -> int:
         assert issue == ""
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
 
+        remeasure_workspace = Path(tmp) / "low-signal-decode-remeasure"
+        configure_workspace(helper, remeasure_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        for index in range(3):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-remeasure-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another decode remeasure",
+                commit="abc123",
+                notes="ideas=5 seeded_tasks=1 contract_actions=lane-contract-decode-remeasure-ready-work-gap-123",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"benchmark-remeasure-{index}",
+                status="keep",
+                target="decode-sample",
+                hypothesis="bounded OpenClaw decode-sample probe",
+                commit="abc123",
+                decode_tps="15.1",
+                wall_s="6.3",
+                notes="completion_tokens=96 measurement_quality=clean server_tok_s=15.2",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "lane-contract-decode-remeasure-ready-work-gap-loop",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "lane": "runtime-overhead",
+                    "benchmark_mode": "decode-sample",
+                    "next_action": "openclaw-speed-research benchmark --mode decode-sample",
+                }
+            ],
+        )
+        remeasure_args = Namespace(
+            low_signal_window_rows=20,
+            low_signal_min_mtp_reports=4,
+            low_signal_min_synthesis_rows=4,
+            low_signal_min_decode_remeasures=3,
+        )
+        remeasure_status = helper.recent_low_signal_decode_remeasure_status(remeasure_args)
+        assert remeasure_status["loop"], remeasure_status
+        remeasure_repair = helper.repair_low_signal_decode_remeasure_loop(24, "low-signal-remeasure", remeasure_status)
+        assert remeasure_repair["blocked_tasks"] == 1
+        assert remeasure_repair["seeded_tasks"] == 3
+        remeasure_tasks = helper.read_jsonl(helper.TASKS)
+        assert any(
+            task["status"] == "blocked"
+            for task in remeasure_tasks
+            if task["id"] == "lane-contract-decode-remeasure-ready-work-gap-loop"
+        )
+        assert any(task.get("supervisor_action") == "frontier-deliberation" for task in remeasure_tasks)
+        assert "autoresearch-low-signal-repair" in helper.RESULTS.read_text(encoding="utf-8")
+
         watchdog_workspace = Path(tmp) / "low-signal-watchdog"
         configure_workspace(helper, watchdog_workspace)
         helper.WORKSPACE.mkdir(parents=True, exist_ok=True)

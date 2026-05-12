@@ -653,11 +653,24 @@ LOW_SIGNAL_LOOP_TARGETS = {
     "synthesis",
     "synthesis-terminal",
 }
+LOW_SIGNAL_DECODE_REMEASURE_PREFIXES = (
+    "lane-contract-decode-remeasure-ready-work-gap-",
+    "lane-contract-decode-remeasure-calibration-block-",
+    "handoff-audit-decode-remeasure-after-calibration-block-",
+)
 LOW_SIGNAL_ESCAPE_TARGETS = {
     "decode-sample",
     "frontier-source-scout",
     "frontier-agent-deliberation",
     "runtime-overhead-map",
+    "autoresearch-implementation-handoff",
+    "patch-execute",
+}
+LOW_SIGNAL_REMEASURE_ESCAPE_TARGETS = {
+    "frontier-source-scout",
+    "frontier-agent-deliberation",
+    "runtime-overhead-map",
+    "calibration-memory-report",
     "autoresearch-implementation-handoff",
     "patch-execute",
 }
@@ -827,6 +840,71 @@ def recent_low_signal_mtp_loop_status(args: argparse.Namespace) -> dict[str, obj
     }
 
 
+def recent_low_signal_decode_remeasure_status(args: argparse.Namespace) -> dict[str, object]:
+    """Detect clean-but-unproductive decode remeasure churn.
+
+    A valid decode sample is evidence. Repeated synthesis -> decode benchmark
+    with no escape task is not strategy. This catches the exact pattern where
+    the loop keeps proving ~15 tok/s instead of routing to drafter-fit,
+    source-scout, runtime-map, or a patchable contract.
+    """
+    rows = all_result_rows(WORKSPACE)[-max(12, int(getattr(args, "low_signal_window_rows", 40))) :]
+    def is_remeasure_synthesis(row: dict[str, str]) -> bool:
+        return row.get("target") in {"synthesis", "synthesis-terminal"} and any(
+            prefix in row.get("notes", "") for prefix in LOW_SIGNAL_DECODE_REMEASURE_PREFIXES
+        )
+
+    def is_clean_decode(row: dict[str, str]) -> bool:
+        return (
+            row.get("status") == "keep"
+            and row.get("target") == "decode-sample"
+            and "measurement_quality=clean" in row.get("notes", "")
+        )
+
+    def is_escape(row: dict[str, str]) -> bool:
+        return row.get("target") in LOW_SIGNAL_REMEASURE_ESCAPE_TARGETS or row.get("run_id", "").startswith(
+            (
+                "source-scout-",
+                "frontier-agent-deliberation-",
+                "runtime-overhead-map-",
+                "calibration-memory-report-",
+                "implementation-handoff-audit-",
+                "patch-executor-",
+            )
+        )
+
+    escape_indexes = [index for index, row in enumerate(rows) if is_escape(row)]
+    latest_escape_index = escape_indexes[-1] if escape_indexes else -1
+    post_escape_rows = rows[latest_escape_index + 1 :]
+    remeasure_synthesis = [row for row in post_escape_rows if is_remeasure_synthesis(row)]
+    clean_decode_rows = [row for row in post_escape_rows if is_clean_decode(row)]
+    escape_rows = [row for row in rows if is_escape(row)]
+    min_remeasure = int(getattr(args, "low_signal_min_decode_remeasures", 3))
+    loop = len(remeasure_synthesis) >= min_remeasure and len(clean_decode_rows) >= min_remeasure and not escape_rows
+    recent_ready_remeasure = [
+        str(task.get("id", ""))
+        for task in read_jsonl(TASKS)
+        if task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("id", "")).startswith(LOW_SIGNAL_DECODE_REMEASURE_PREFIXES)
+    ]
+    if not loop and len(remeasure_synthesis) >= min_remeasure + 1 and recent_ready_remeasure:
+        loop = True
+    return {
+        "loop": loop,
+        "decode_remeasure_synthesis": len(remeasure_synthesis),
+        "clean_decode_rows": len(clean_decode_rows),
+        "escape_rows": len(escape_rows),
+        "rows_since_latest_escape": len(post_escape_rows),
+        "ready_remeasure_tasks": recent_ready_remeasure[:8],
+        "latest_decode_run": clean_decode_rows[-1].get("run_id", "") if clean_decode_rows else "",
+        "reason": (
+            "repeated clean decode remeasure loop without drafter-fit/runtime/source escape"
+            if loop
+            else "no low-signal decode remeasure loop detected"
+        ),
+    }
+
+
 def block_ready_low_signal_mtp_tasks(reason: str) -> int:
     tasks = read_jsonl(TASKS)
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -845,6 +923,30 @@ def block_ready_low_signal_mtp_tasks(reason: str) -> int:
             **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
             "reason": "low_signal_mtp_loop_suppressed",
             "next": "route to source-scout, frontier-deliberation, runtime-overhead, or paired decode benchmark",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+    return blocked
+
+
+def block_ready_low_signal_decode_remeasure_tasks(reason: str) -> int:
+    tasks = read_jsonl(TASKS)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        task_id = str(task.get("id", ""))
+        if not task_id.startswith(LOW_SIGNAL_DECODE_REMEASURE_PREFIXES):
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = f"low-signal decode remeasure loop suppressed: {reason}"
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "low_signal_decode_remeasure_loop_suppressed",
+            "next": "route to source-scout, frontier-deliberation, runtime-overhead, or drafter-fit contract",
         }
         blocked += 1
     if blocked:
@@ -952,6 +1054,36 @@ def repair_low_signal_mtp_loop(cycle: int, session: str, status: dict[str, objec
             "seeded_tasks": seeded,
             "evidence": status,
             "next": "run source-scout/runtime-map/frontier-deliberation before another MTP report",
+        },
+    )
+    return {"blocked_tasks": blocked, "seeded_tasks": seeded}
+
+
+def repair_low_signal_decode_remeasure_loop(cycle: int, session: str, status: dict[str, object]) -> dict[str, object]:
+    blocked = block_ready_low_signal_decode_remeasure_tasks(str(status.get("reason", "")))
+    seeded = enqueue_low_signal_repair_tasks(cycle, status)
+    append_result(
+        WORKSPACE,
+        run_id=f"low-signal-decode-remeasure-repair-{cycle}-{int(time.time())}",
+        status="keep" if seeded or blocked else "blocked",
+        target="autoresearch-low-signal-repair",
+        hypothesis="the autonomous supervisor should break repeated clean decode remeasure loops without human intervention",
+        commit=current_commit(),
+        notes=(
+            f"session={session} blocked_remeasure_tasks={blocked} seeded_tasks={seeded} "
+            f"status={clean_tsv(json.dumps(status, sort_keys=True))}"
+        ),
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "autonomous-low-signal-decode-remeasure-repair",
+            "finding": "supervisor detected repeated clean decode remeasure churn and routed to bounded escape paths",
+            "blocked_remeasure_tasks": blocked,
+            "seeded_tasks": seeded,
+            "evidence": status,
+            "next": "run source-scout/runtime-map/frontier-deliberation before another generic decode remeasure",
         },
     )
     return {"blocked_tasks": blocked, "seeded_tasks": seeded}
@@ -4421,6 +4553,46 @@ def run_periodic_autonomy_watchdog(
             log_file,
             reason=repair_reason,
         )
+    remeasure_loop = recent_low_signal_decode_remeasure_status(args)
+    if remeasure_loop.get("loop"):
+        repair = repair_low_signal_decode_remeasure_loop(cycle, session, remeasure_loop)
+        self_ok, self_issue = run_supervisor_self_improvement(
+            args,
+            cycle,
+            f"{session}-watchdog-remeasure-loop",
+            log_file,
+            reason=f"low-signal-decode-remeasure-loop:{remeasure_loop.get('reason')}",
+        )
+        post_ok, post_issue = run_supervisor_quality_review(
+            args,
+            cycle,
+            f"{session}-watchdog-post-remeasure-loop",
+            log_file,
+        )
+        certification = frontier_certification_status(args)
+        deterministic = deterministic_ready_tasks()
+        if self_ok and post_ok and (certification.get("ok") or deterministic):
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=f"low-signal decode remeasure loop repaired: {repair}",
+                attempts=1,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
+        repair_reason = (
+            f"low-signal decode remeasure repair incomplete: self_improvement={self_ok}:{self_issue or 'ok'} "
+            f"post_review={post_ok}:{post_issue or 'ok'} "
+            f"certification={certification.get('ok')} deterministic_ready={len(deterministic)}"
+        )
+        return run_autonomous_repair_loop(
+            args,
+            cycle,
+            session,
+            log_file,
+            reason=repair_reason,
+        )
     certification = frontier_certification_status(args)
     if review_ok and certification.get("ok"):
         append_result(
@@ -4989,6 +5161,12 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_SYNTHESIS", "4")),
     )
+    parser.add_argument(
+        "--low-signal-min-decode-remeasures",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_DECODE_REMEASURES", "3")),
+        help="clean decode remeasure/synthesis pairs before the supervisor pivots to an escape path",
+    )
     args = parser.parse_args()
     INTERRUPT_CONTEXT.update(
         {
@@ -5141,13 +5319,17 @@ def main() -> int:
             and cycle - last_low_signal_repair_cycle >= args.low_signal_check_interval_cycles
         ):
             low_signal = recent_low_signal_mtp_loop_status(args)
-            if low_signal.get("loop"):
+            remeasure_loop = recent_low_signal_decode_remeasure_status(args)
+            if low_signal.get("loop") or remeasure_loop.get("loop"):
+                loop_reason = "low-signal guard"
+                if remeasure_loop.get("loop"):
+                    loop_reason = "low-signal decode remeasure guard"
                 watchdog_ok, watchdog_issue = run_periodic_autonomy_watchdog(
                     args,
                     cycle,
                     current_session,
                     log_file,
-                    reason="low-signal guard",
+                    reason=loop_reason,
                 )
                 last_low_signal_repair_cycle = cycle
                 log(
