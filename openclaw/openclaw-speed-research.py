@@ -1975,6 +1975,10 @@ def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         and not is_certification_blocked_row(row)
         and not is_known_terminal_calibration_blocked_row(row)
         and not is_known_calibration_memory_blocked_row(row)
+        and not (
+            row.get("target") == "calibration-memory-report"
+            and "blocker=none" in row.get("notes", "")
+        )
     ]
 
 
@@ -1989,6 +1993,8 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
     blocked = actionable_blocked_rows(rows)
     latest_clean_handoff_index = -1
     latest_clean_review_index = -1
+    latest_clean_frontier_index = -1
+    latest_clean_council_index = -1
     for index, row in enumerate(rows):
         if row.get("target") != "autoresearch-implementation-handoff":
             continue
@@ -2013,8 +2019,35 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             score = 0.0
         if score >= 90 and fields.get("verdict") in {"healthy", "converged-below-target", "exhaustion-candidate"}:
             latest_clean_review_index = index
+    for index, row in enumerate(rows):
+        if row.get("status") != "keep":
+            continue
+        target = row.get("target", "")
+        fields = parse_note_fields(row.get("notes", ""))
+        if target == "autoresearch-frontier-eval":
+            try:
+                overall = float(fields.get("overall", "0") or 0)
+            except ValueError:
+                overall = 0.0
+            if overall >= 9.8 and fields.get("readiness") == "frontier":
+                latest_clean_frontier_index = index
+        elif target == "frontier-autonomy-score":
+            try:
+                score = float(fields.get("score", "0") or 0)
+            except ValueError:
+                score = 0.0
+            if score >= 99 and fields.get("decision") == "continue":
+                latest_clean_frontier_index = index
+        elif target == "autoresearch-review-council":
+            if fields.get("ok") in {"True", "true"} and fields.get("decision") == "continue":
+                latest_clean_council_index = index
 
-    latest_clean_checkpoint_index = max(latest_clean_handoff_index, latest_clean_review_index)
+    latest_clean_checkpoint_index = max(
+        latest_clean_handoff_index,
+        latest_clean_review_index,
+        latest_clean_frontier_index,
+        latest_clean_council_index,
+    )
     if latest_clean_checkpoint_index < 0:
         return blocked
 
@@ -2057,6 +2090,9 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             continue
         if index < latest_clean_checkpoint_index and (
             row.get("target") == "autoresearch-implementation-handoff"
+            or row.get("target") == "autoresearch-review-council"
+            or row.get("target") == "frontier-autonomy-score"
+            or row.get("target") == "autoresearch-self-improvement-alive"
             or row.get("run_id", "").startswith("supervisor-implementation-bridge-")
         ):
             continue
@@ -7916,7 +7952,7 @@ def calibration_memory_report(args: argparse.Namespace) -> int:
     append_result(
         root,
         run_id=f"calibration-memory-report-{report['timestamp']}",
-        status="keep" if blocker else "blocked",
+        status="blocked" if blocker else "keep",
         target="calibration-memory-report",
         hypothesis="Calibration plateau should become a no-model root-cause report instead of repeated decode remeasurements.",
         commit=current_commit(repo),
@@ -7927,7 +7963,7 @@ def calibration_memory_report(args: argparse.Namespace) -> int:
         ),
     )
     print(json.dumps({"path": str(path), **report}, indent=2))
-    return 0 if blocker else 2
+    return 2 if blocker else 0
 
 
 def drafter_trace_gate(args: argparse.Namespace) -> int:

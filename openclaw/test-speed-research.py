@@ -756,6 +756,52 @@ def main() -> int:
                         )
                         assert len(report_tasks) == 1
                         assert report_tasks[0]["supervisor_action"] == "calibration-memory-report"
+                        clean_report_root = Path(tmp) / "calibration-memory-report-clean-root"
+                        helper.ensure_research_state(clean_report_root)
+                        with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(clean_report_root)}, clear=False):
+                            assert helper.calibration_memory_report(Namespace()) == 0
+                        clean_report_rows = helper.result_rows(clean_report_root)
+                        assert clean_report_rows[-1]["target"] == "calibration-memory-report"
+                        assert clean_report_rows[-1]["status"] == "keep"
+                        assert "blocker=none" in clean_report_rows[-1]["notes"]
+                        assert helper.actionable_blocked_rows(clean_report_rows) == []
+                        helper.append_result(
+                            clean_report_root,
+                            run_id="old-calibration-memory-report-none",
+                            status="blocked",
+                            target="calibration-memory-report",
+                            hypothesis="old inverted no-blocker report",
+                            commit="abc123",
+                            notes="blocker=none hit_count=177 plateau=false best_clean_decode_tps=",
+                        )
+                        helper.append_result(
+                            clean_report_root,
+                            run_id="old-review-council-repair",
+                            status="blocked",
+                            target="autoresearch-review-council",
+                            hypothesis="old repair council row",
+                            commit="abc123",
+                            notes="decision=repair ok=False seeded_tasks=0",
+                        )
+                        helper.append_result(
+                            clean_report_root,
+                            run_id="frontier-system-eval-clean",
+                            status="keep",
+                            target="autoresearch-frontier-eval",
+                            hypothesis="clean frontier checkpoint",
+                            commit="abc123",
+                            notes="overall=10.0 readiness=frontier",
+                        )
+                        helper.append_result(
+                            clean_report_root,
+                            run_id="review-council-clean",
+                            status="keep",
+                            target="autoresearch-review-council",
+                            hypothesis="clean council checkpoint",
+                            commit="abc123",
+                            notes="decision=continue ok=True seeded_tasks=0",
+                        )
+                        assert helper.unresolved_actionable_blocked_rows(helper.result_rows(clean_report_root)) == []
                         gradient_blocked_root = Path(tmp) / "calibration-gradient-block-root"
                         helper.ensure_research_state(gradient_blocked_root)
                         helper.append_result(
