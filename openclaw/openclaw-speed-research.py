@@ -9739,15 +9739,24 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
         )
     path = root / "experiments" / f"drafter-adapter-method-contract-{timestamp}.json"
     path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if contract["ok"]:
+    should_seed_implementation = contract["ok"] or (
+        terminal_routed
+        and not active_task_has_prefix(root, "implementation-drafter-adapter-method-")
+        and not recent_keep_result_has_prefix(root, "implementation-drafter-adapter-method-", recent_rows=120)
+    )
+    contract["seed_implementation"] = should_seed_implementation
+    if should_seed_implementation:
         implementation_task = drafter_adapter_method_implementation_task(
             timestamp,
+            task_id=unique_task_id(root, f"implementation-drafter-adapter-method-{timestamp}"),
             contract_path=str(path),
         )
         implementation_task["hypothesis"] = contract["implementation_target"]
         implementation_task["acceptance"] = "; ".join(contract["acceptance"])
         implementation_task["rollback"] = contract["rollback"]
-        upsert_tasks(root, [implementation_task])
+        contract["seeded_implementation_tasks"] = upsert_tasks(root, [implementation_task])
+    else:
+        contract["seeded_implementation_tasks"] = 0
     append_jsonl(
         root / "experiments.jsonl",
         {

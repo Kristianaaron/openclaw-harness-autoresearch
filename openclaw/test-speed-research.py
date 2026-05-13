@@ -762,6 +762,13 @@ def main() -> int:
                         assert adapter_contract_rows[-1]["target"] == "janq-drafter-adapter-method"
                         assert adapter_contract_rows[-1]["status"] == "keep"
                         assert "terminal_routed=True" in adapter_contract_rows[-1]["notes"]
+                        adapter_contract_tasks = helper.read_jsonl(adapter_block_root / "tasks.jsonl")
+                        assert any(
+                            str(task.get("id", "")).startswith("implementation-drafter-adapter-method-")
+                            and task.get("status") == "ready"
+                            and task.get("contract_path")
+                            for task in adapter_contract_tasks
+                        )
                         legacy_adapter_blocker = [
                             {
                                 "timestamp": "2026-05-10T00:00:00+0000",
