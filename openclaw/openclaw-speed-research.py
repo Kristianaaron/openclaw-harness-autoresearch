@@ -1946,6 +1946,25 @@ def is_known_calibration_memory_blocked_row(row: dict[str, str]) -> bool:
     )
 
 
+def is_known_adapter_method_blocked_row(row: dict[str, str]) -> bool:
+    if row.get("status") != "blocked":
+        return False
+    if row.get("target") != "janq-drafter-adapter-method":
+        return False
+    notes = row.get("notes", "")
+    fields = parse_note_fields(notes)
+    return (
+        row.get("run_id", "").startswith("drafter-adapter-method-contract-")
+        and fields.get("ok") in {"False", "false"}
+        and fields.get("state")
+        in {
+            "adapter_calibration_memory_blocked",
+            "adapter_calibration_blocked",
+            "adapter_calibration_attempted",
+        }
+    )
+
+
 def is_memory_safety_blocked_row(row: dict[str, str]) -> bool:
     if row.get("status") != "blocked":
         return False
@@ -1975,6 +1994,7 @@ def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         and not is_certification_blocked_row(row)
         and not is_known_terminal_calibration_blocked_row(row)
         and not is_known_calibration_memory_blocked_row(row)
+        and not is_known_adapter_method_blocked_row(row)
         and not (
             row.get("target") == "calibration-memory-report"
             and "blocker=none" in row.get("notes", "")
@@ -9668,6 +9688,11 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
         "openclaw/test-mtp-drafter-calibrate-guards.py",
         "openclaw/test-speed-research.py",
     ]
+    terminal_routed = state["state"] in {
+        "adapter_calibration_memory_blocked",
+        "adapter_calibration_blocked",
+        "adapter_calibration_attempted",
+    }
     contract = {
         "ok": state["state"] in {
             "adapter_method_required",
@@ -9704,6 +9729,14 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
         ],
         "rollback": "discard adapter output and keep the current official MTP drafter/profile if any gate fails",
     }
+    contract["terminal_routed"] = terminal_routed
+    contract["status"] = "keep" if contract["ok"] or terminal_routed else "blocked"
+    if terminal_routed and not contract["ok"]:
+        contract["next"] = (
+            "terminal adapter calibration blocker is already known; route to source-scout/frontier "
+            "deliberation or a changed adapter/logit-distillation implementation contract instead of "
+            "recording active quality debt"
+        )
     path = root / "experiments" / f"drafter-adapter-method-contract-{timestamp}.json"
     path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if contract["ok"]:
@@ -9720,7 +9753,7 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
         {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "task_id": "drafter-adapter-method-contract",
-            "status": "keep" if contract["ok"] else "blocked",
+            "status": contract["status"],
             "path": str(path),
             "state": state["state"],
         },
@@ -9728,14 +9761,14 @@ def drafter_adapter_method_contract(args: argparse.Namespace) -> int:
     append_result(
         root,
         run_id=f"drafter-adapter-method-contract-{timestamp}",
-        status="keep" if contract["ok"] else "blocked",
+        status=contract["status"],
         target="janq-drafter-adapter-method",
         hypothesis="the supervisor should convert repeated quantized-gradient failures into a constrained adapter/logit implementation contract",
         commit=current_commit(Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_REPO", "/Users/kristian/Documents/openclaw-harness-autoresearch"))),
-        notes=f"state={state['state']} ok={contract['ok']} path={path}",
+        notes=f"state={state['state']} ok={contract['ok']} terminal_routed={terminal_routed} path={path}",
     )
     print(json.dumps({"path": str(path), **contract}, indent=2, sort_keys=True))
-    return 0 if contract["ok"] else 2
+    return 0 if contract["status"] == "keep" else 2
 
 
 def environment_snapshot_command(args: argparse.Namespace) -> int:

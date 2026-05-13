@@ -756,6 +756,23 @@ def main() -> int:
                         )
                         assert len(report_tasks) == 1
                         assert report_tasks[0]["supervisor_action"] == "calibration-memory-report"
+                        with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(adapter_block_root)}, clear=False):
+                            assert helper.drafter_adapter_method_contract(Namespace(recent_rows=240)) == 0
+                        adapter_contract_rows = helper.result_rows(adapter_block_root)
+                        assert adapter_contract_rows[-1]["target"] == "janq-drafter-adapter-method"
+                        assert adapter_contract_rows[-1]["status"] == "keep"
+                        assert "terminal_routed=True" in adapter_contract_rows[-1]["notes"]
+                        legacy_adapter_blocker = [
+                            {
+                                "timestamp": "2026-05-10T00:00:00+0000",
+                                "run_id": "drafter-adapter-method-contract-unit",
+                                "status": "blocked",
+                                "target": "janq-drafter-adapter-method",
+                                "hypothesis": "old adapter contract blocker",
+                                "notes": "state=adapter_calibration_memory_blocked ok=False path=/tmp/contract.json",
+                            }
+                        ]
+                        assert helper.actionable_blocked_rows(legacy_adapter_blocker) == []
                         clean_report_root = Path(tmp) / "calibration-memory-report-clean-root"
                         helper.ensure_research_state(clean_report_root)
                         with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(clean_report_root)}, clear=False):
