@@ -22,6 +22,8 @@ RESULTS_HEADER = (
     "timestamp\trun_id\tstatus\ttarget\thypothesis\tttft_s\tprefill_tps\tdecode_tps\t"
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
+CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
+ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 BENCHMARK_MANIFEST_VERSION = 1
 RESEARCH_PROFILE_VERSION = 2
 EVALUATOR_POLICY_VERSION = 1
@@ -2056,6 +2058,68 @@ def rank_tasks(root: Path, *, limit: int = 12) -> list[dict[str, Any]]:
     return sorted(ranked, key=lambda item: (float(item["score"]), str(item["task_id"])), reverse=True)[:limit]
 
 
+def adapter_logit_loop_evidence(root: Path, *, recent_rows: int = 240) -> dict[str, Any]:
+    window = all_result_rows(root)[-max(1, recent_rows) :]
+    blocker_reports = 0
+    adapter_contracts = 0
+    adapter_focused_tests = 0
+    for row in window:
+        run_id = row.get("run_id", "")
+        target = row.get("target", "")
+        notes = row.get("notes", "")
+        hypothesis = row.get("hypothesis", "").lower()
+        if (
+            row.get("status") == "blocked"
+            and target == "calibration-memory-report"
+            and CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in notes
+        ):
+            blocker_reports += 1
+        if run_id.startswith("drafter-adapter-method-contract-") and target == "janq-drafter-adapter-method":
+            adapter_contracts += 1
+        if run_id.startswith("supervisor-focused-test-") and (
+            "adapter/logit" in hypothesis
+            or "adapter-logit" in hypothesis
+            or "logit-distillation" in hypothesis
+        ):
+            adapter_focused_tests += 1
+    saturated = (
+        blocker_reports >= ADAPTER_LOGIT_LOOP_THRESHOLD
+        and adapter_contracts >= ADAPTER_LOGIT_LOOP_THRESHOLD
+        and adapter_focused_tests >= ADAPTER_LOGIT_LOOP_THRESHOLD
+    )
+    return {
+        "saturated": saturated,
+        "blocker_reports": blocker_reports,
+        "adapter_contracts": adapter_contracts,
+        "adapter_focused_tests": adapter_focused_tests,
+    }
+
+
+def is_adapter_logit_loop_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    target = str(task.get("target", ""))
+    hypothesis = str(task.get("hypothesis", "")).lower()
+    next_action = str(task.get("next_action", "")).lower()
+    return (
+        action in {"drafter-adapter-method-contract", "calibration-memory-report"}
+        or task_id.startswith("drafter-adapter-method-contract-")
+        or task_id.startswith("agent-deliberation-adapter-logit-contract-")
+        or task_id.startswith("implementation-drafter-adapter-method-")
+        or task_id.startswith("calibration-memory-report-")
+        or "calibration-memory-report" in next_action
+        or (
+            action == "focused-test"
+            and target == "openclaw/openclaw-mtp-drafter-calibrate.py"
+            and (
+                "adapter/logit" in hypothesis
+                or "adapter-logit" in hypothesis
+                or "logit-distillation" in hypothesis
+            )
+        )
+    )
+
+
 def promotion_decision(task: dict[str, Any], summary: dict[str, Any], *, status: str) -> dict[str, Any]:
     risk = task_risk_level(task)
     reasons: list[str] = []
@@ -2494,6 +2558,23 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
         ]
         if non_runtime_map:
             filtered = non_runtime_map
+    adapter_loop = adapter_logit_loop_evidence(root, recent_rows=240)
+    if adapter_loop["saturated"]:
+        non_adapter_loop = [task for task in filtered if not is_adapter_logit_loop_task(task)]
+        if non_adapter_loop:
+            filtered = non_adapter_loop
+        else:
+            append_jsonl(
+                root / "findings.jsonl",
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "adapter-logit-loop-suppression",
+                    "finding": "repeated adapter/logit blocker work was suppressed instead of counted as progress",
+                    "evidence": adapter_loop,
+                    "next": "synthesize a different frontier candidate or source-scout path",
+                },
+            )
+            return None
     if not filtered:
         return None
     contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]

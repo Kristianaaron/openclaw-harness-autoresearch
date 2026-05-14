@@ -74,6 +74,7 @@ CALIBRATION_TRACE_DISTILLATION_MODE = "trace-distillation"
 CALIBRATION_DIRECT_MODE = "direct-pre-projection"
 CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
 CALIBRATION_MODES = {CALIBRATION_DIRECT_MODE, CALIBRATION_ADAPTER_MODE}
+ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 CALIBRATION_CANARY_TERMINAL_BLOCKERS = {
     "calibration-runtime-missing-speculative",
     CALIBRATION_QUANTIZED_GRADIENT_BLOCKER,
@@ -1968,6 +1969,80 @@ def is_known_adapter_method_blocked_row(row: dict[str, str]) -> bool:
     )
 
 
+def adapter_logit_loop_evidence(root: Path, *, recent_rows: int = 240) -> dict[str, Any]:
+    """Return deterministic evidence that the adapter/logit lane is cycling.
+
+    Safety stays deterministic, but strategy should not treat repeated
+    blocked-report -> contract -> focused-test rows as progress. Once this
+    pattern repeats, direct adapter/logit reseeding is suppressed until a new
+    patch candidate or external evidence changes the lane.
+    """
+
+    window = result_rows(root)[-max(1, recent_rows) :]
+    blocker_reports = 0
+    adapter_contracts = 0
+    adapter_focused_tests = 0
+    for row in window:
+        run_id = row.get("run_id", "")
+        target = row.get("target", "")
+        notes = row.get("notes", "")
+        hypothesis = row.get("hypothesis", "").lower()
+        if (
+            row.get("status") == "blocked"
+            and target == "calibration-memory-report"
+            and CALIBRATION_QUANTIZED_GRADIENT_BLOCKER in notes
+        ):
+            blocker_reports += 1
+        if run_id.startswith("drafter-adapter-method-contract-") and target == "janq-drafter-adapter-method":
+            adapter_contracts += 1
+        if run_id.startswith("supervisor-focused-test-") and (
+            "adapter/logit" in hypothesis
+            or "adapter-logit" in hypothesis
+            or "logit-distillation" in hypothesis
+        ):
+            adapter_focused_tests += 1
+    saturated = (
+        blocker_reports >= ADAPTER_LOGIT_LOOP_THRESHOLD
+        and adapter_contracts >= ADAPTER_LOGIT_LOOP_THRESHOLD
+        and adapter_focused_tests >= ADAPTER_LOGIT_LOOP_THRESHOLD
+    )
+    return {
+        "saturated": saturated,
+        "blocker_reports": blocker_reports,
+        "adapter_contracts": adapter_contracts,
+        "adapter_focused_tests": adapter_focused_tests,
+    }
+
+
+def adapter_logit_loop_saturated(root: Path, *, recent_rows: int = 240) -> bool:
+    return bool(adapter_logit_loop_evidence(root, recent_rows=recent_rows)["saturated"])
+
+
+def is_adapter_logit_loop_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    target = str(task.get("target", ""))
+    hypothesis = str(task.get("hypothesis", "")).lower()
+    next_action = str(task.get("next_action", "")).lower()
+    return (
+        action in {"drafter-adapter-method-contract", "calibration-memory-report"}
+        or task_id.startswith("drafter-adapter-method-contract-")
+        or task_id.startswith("agent-deliberation-adapter-logit-contract-")
+        or task_id.startswith("implementation-drafter-adapter-method-")
+        or task_id.startswith("calibration-memory-report-")
+        or "calibration-memory-report" in next_action
+        or (
+            action == "focused-test"
+            and target == "openclaw/openclaw-mtp-drafter-calibrate.py"
+            and (
+                "adapter/logit" in hypothesis
+                or "adapter-logit" in hypothesis
+                or "logit-distillation" in hypothesis
+            )
+        )
+    )
+
+
 def is_memory_safety_blocked_row(row: dict[str, str]) -> bool:
     if row.get("status") != "blocked":
         return False
@@ -3725,6 +3800,7 @@ def drafter_bottleneck_state(
         for row in window
     )
     fallback_decode_count = recent_lane_contract_decode_fallback_count(root, recent_rows=min(recent_rows, 80))
+    adapter_loop = adapter_logit_loop_evidence(root, recent_rows=recent_rows)
     historical_bottleneck = (
         blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
         or bool(terminal_blocks)
@@ -3742,6 +3818,9 @@ def drafter_bottleneck_state(
     if not historical_bottleneck:
         state = "no_terminal_quantized_blocker"
         next_step = "continue_current_lane_contract"
+    elif adapter_loop["saturated"]:
+        state = "adapter_logit_loop_exhausted"
+        next_step = "seed_frontier_deliberation_escape"
     elif active_adapter_implementation:
         state = "adapter_method_implementation_active"
         next_step = "wait_for_adapter_method_implementation"
@@ -3820,6 +3899,7 @@ def drafter_bottleneck_state(
         "adapter_calibration_attempted": adapter_calibration_attempted,
         "adapter_calibration_stage_issue": adapter_calibration_stage_issue,
         "fallback_decode_count": fallback_decode_count,
+        "adapter_logit_loop": adapter_loop,
     }
 
 
@@ -3990,6 +4070,16 @@ def drafter_bottleneck_next_tasks(
             root,
             calibration_blocker_report_tasks(root, timestamp, blocker="calibration-memory-after-load"),
         )
+    if step == "seed_frontier_deliberation_escape":
+        evidence = {
+            "reason": "adapter/logit blocker loop saturated",
+            "bottleneck_state": state,
+        }
+        tasks = [
+            mtp_acceptance_yield_task(timestamp, evidence=evidence),
+            source_scout_task(timestamp, evidence=evidence),
+        ]
+        return filter_seedable_tasks(root, tasks)
     if step == "seed_adapter_calibration_canary":
         if active_task_has_prefix(root, "adapter-drafter-calibration-canary-"):
             return []
@@ -4670,6 +4760,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
     runtime_clean_exhausted = runtime_overhead_repeated_clean(root, recent_rows=160)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
     active_calibration_stages = {
         calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
     }
@@ -4693,6 +4784,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         ):
             continue
         if runtime_clean_exhausted and lane == "runtime-overhead" and "contamination" not in task_id:
+            continue
+        if adapter_loop_saturated and is_adapter_logit_loop_task(task):
             continue
         if has_active_calibration_stage and (
             action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
@@ -5302,6 +5395,7 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     canonical = canonical_autoresearch_state(root, recent_rows=160)
     bottleneck_state = drafter_bottleneck_state(root, rows, recent_rows=240)
+    adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
     bottleneck_tasks: list[dict[str, Any]] = []
     if bottleneck_state["state"] != "no_terminal_quantized_blocker":
         bottleneck_tasks = drafter_bottleneck_next_tasks(
@@ -5378,8 +5472,12 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     ):
         selected_task = source_scout_task(timestamp, evidence=evidence)
         selected_reason = "refresh external references before inventing another implementation contract"
-    elif calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER and not active_task_has_prefix(
-        root, "agent-deliberation-adapter-logit-contract-"
+    elif (
+        calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+        and not adapter_loop_saturated
+        and not active_task_has_prefix(
+            root, "agent-deliberation-adapter-logit-contract-"
+        )
     ):
         selected_task = drafter_adapter_method_contract_task(
             timestamp,

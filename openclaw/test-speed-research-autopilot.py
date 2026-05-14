@@ -814,6 +814,70 @@ def main() -> int:
             task["status"] == "done" or task["id"] == "drafter-calibration-memory-stage-metadata-test"
             for task in helper.read_jsonl(helper.TASKS)
         )
+        for index in range(2):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"calibration-memory-report-loop-{index}",
+                status="blocked",
+                target="calibration-memory-report",
+                hypothesis="Calibration plateau should become a no-model root-cause report.",
+                commit="unit",
+                notes="blocker=calibration-quantized-gradient-unsupported",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"drafter-adapter-method-contract-loop-{index}",
+                status="keep",
+                target="janq-drafter-adapter-method",
+                hypothesis="convert repeated quantized-gradient failures into adapter/logit implementation",
+                commit="unit",
+                notes="state=adapter_calibration_memory_blocked ok=False terminal_routed=True",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"supervisor-focused-test-loop-{index}",
+                status="keep",
+                target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                hypothesis="add a canary-only adapter/logit-distillation calibration path",
+                commit="unit",
+                notes="focused test passed",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "drafter-adapter-method-contract-current",
+                    "status": "ready",
+                    "priority": 100,
+                    "lane": "implementation-gate",
+                    "task_type": "supervisor",
+                    "supervisor_action": "drafter-adapter-method-contract",
+                    "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+                    "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py"],
+                    "hypothesis": "repeat adapter/logit contract",
+                    "metric": "adapter_method_contract",
+                    "acceptance": "contract artifact exists",
+                    "rollback": "discard contract",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-adapter-method-contract",
+                },
+                {
+                    "id": "mtp-acceptance-yield-escape",
+                    "status": "ready",
+                    "priority": 90,
+                    "lane": "frontier-deliberation",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "target": "openclaw-model-proxy.log",
+                    "source_files": ["openclaw/openclaw-model-proxy.py"],
+                    "hypothesis": "escape repeated adapter blocker by measuring acceptance yield",
+                    "metric": "mean_accept",
+                    "acceptance": "acceptance-yield artifact exists",
+                    "rollback": "read-only task",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 320",
+                },
+            ],
+        )
+        assert helper.select_next_task(helper.WORKSPACE)["id"] == "mtp-acceptance-yield-escape"
         helper.write_jsonl(helper.TASKS, original_tasks)
         selected_tool = helper.select_next_task(helper.WORKSPACE)
         before_claim = helper.durable_snapshot()

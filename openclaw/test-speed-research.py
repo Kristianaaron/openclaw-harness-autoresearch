@@ -119,6 +119,55 @@ def main() -> int:
                 if task.get("id") == "unit-duplicate-task" and task.get("status", "ready") in {"ready", "rework"}
             ]
             assert len(active_duplicates) == 1
+            loop_root = Path(tmp) / "adapter-loop-research" / "speed"
+            helper.ensure_research_state(loop_root)
+            for index in range(2):
+                helper.append_result(
+                    loop_root,
+                    run_id=f"calibration-memory-report-loop-{index}",
+                    status="blocked",
+                    target="calibration-memory-report",
+                    hypothesis="Calibration plateau should become a no-model root-cause report.",
+                    commit="unit",
+                    notes=f"blocker={helper.CALIBRATION_QUANTIZED_GRADIENT_BLOCKER}",
+                )
+                helper.append_result(
+                    loop_root,
+                    run_id=f"drafter-adapter-method-contract-loop-{index}",
+                    status="keep",
+                    target="janq-drafter-adapter-method",
+                    hypothesis="convert repeated quantized-gradient failures into adapter/logit implementation",
+                    commit="unit",
+                    notes="state=adapter_calibration_memory_blocked ok=False terminal_routed=True",
+                )
+                helper.append_result(
+                    loop_root,
+                    run_id=f"supervisor-focused-test-{index}",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="add a canary-only adapter/logit-distillation calibration path",
+                    commit="unit",
+                    notes="focused test passed",
+                )
+            adapter_task = helper.drafter_adapter_method_contract_task(
+                123,
+                task_id="drafter-adapter-method-contract-current",
+            )
+            memory_report_task = {
+                "id": "calibration-memory-report-current",
+                "status": "ready",
+                "lane": "drafter-alignment",
+                "task_type": "supervisor",
+                "supervisor_action": "calibration-memory-report",
+                "target": "calibration-memory-report",
+                "hypothesis": "repeat the same blocker report",
+                "metric": "calibration_memory_root_cause",
+                "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research calibration-memory-report",
+            }
+            escape_task = helper.mtp_acceptance_yield_task(123, evidence={"unit": True})
+            assert helper.adapter_logit_loop_saturated(loop_root)
+            assert helper.drafter_bottleneck_state(loop_root)["state"] == "adapter_logit_loop_exhausted"
+            assert helper.filter_seedable_tasks(loop_root, [adapter_task, memory_report_task, escape_task]) == [escape_task]
             assert helper.actionable_blocked_rows(
                 [
                     {"status": "blocked", "target": "autoresearch-quality"},
