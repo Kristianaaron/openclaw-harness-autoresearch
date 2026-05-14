@@ -293,12 +293,24 @@ def main() -> int:
             assert "normal `openclaw tui` decode speed" in prompt
             assert "Improve autoresearch itself only when it helps" in prompt
             assert "First assistant action" in prompt
+            assert "RUN_MEMORY.md" in prompt
             assert "benchmark --mode decode-sample" in prompt
             assert "Use one narrow tool call" in prompt
             assert "SUMMARY.md" in prompt
             assert "results.tsv" not in prompt
+            assert (root / "RUN_MEMORY.md").exists()
+            assert (root / "restart-context.json").exists()
             assert (root / "SUMMARY.md").exists()
             assert (root / "results-recent.tsv").exists()
+            run_memory = (root / "RUN_MEMORY.md").read_text(encoding="utf-8")
+            assert "OpenClaw Speed Research Run Memory" in run_memory
+            assert "Do Not Re-discover" in run_memory
+            restart_context = json.loads((root / "restart-context.json").read_text(encoding="utf-8"))
+            assert restart_context["primary_metric"] == "normal OpenClaw TUI decode tok/s"
+            assert "canonical_state" in restart_context
+            summary = (root / "SUMMARY.md").read_text(encoding="utf-8")
+            assert "run memory:" in summary
+            assert "restart context:" in summary
             program = (root / "program.md").read_text(encoding="utf-8")
             assert "Do not touch opencode" in program
             assert "## Tool Discipline" in program

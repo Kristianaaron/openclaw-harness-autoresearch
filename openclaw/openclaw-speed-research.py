@@ -1135,11 +1135,14 @@ Workspace: {root}
 
 Primary scope: improve normal `openclaw tui` decode speed and visible response smoothness first. Improve autoresearch itself only when it helps produce safer, better TUI decode-speed changes.
 
-First assistant action: run exactly this narrow benchmark command:
-`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`
+First assistant action: read exactly:
+`{root / 'RUN_MEMORY.md'}`
 
 Then read exactly:
 `{root / 'SUMMARY.md'}`
+
+Only after those two reads, run this narrow benchmark command when the run memory says measurement is needed:
+`/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample`
 
 Do not read the full `program.md` unless a human explicitly asks. It is installed policy, not first-turn context.
 
@@ -2310,6 +2313,174 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
     }
 
 
+def clipped_text(value: object, limit: int = 220) -> str:
+    text = str(value or "").replace("\n", " ").replace("\t", " ").strip()
+    return text[:limit].rstrip()
+
+
+def latest_keep_row(rows: list[dict[str, str]], target: str) -> dict[str, str]:
+    for row in reversed(rows):
+        if row.get("status") == "keep" and row.get("target") == target:
+            return row
+    return {}
+
+
+def latest_keep_row_prefix(rows: list[dict[str, str]], prefix: str) -> dict[str, str]:
+    for row in reversed(rows):
+        if row.get("status") == "keep" and row.get("run_id", "").startswith(prefix):
+            return row
+    return {}
+
+
+def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
+    """Build a compact restart handoff so new sessions do not rediscover old work."""
+    ensure_research_state(root)
+    rows = result_rows(root)
+    recent = rows[-max(1, int(recent_rows)) :]
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready_tasks = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+    deterministic_ready = [task for task in ready_tasks if is_deterministic_research_task(task)]
+    exhausted = exhausted_lanes(root)
+    latest_decode = latest_keep_row(recent, "decode-sample")
+    latest_mtp = latest_keep_row(recent, "mtp-acceptance-report")
+    latest_quality = latest_keep_row(recent, "autoresearch-quality")
+    latest_frontier = latest_keep_row(recent, "autoresearch-frontier-eval")
+    latest_autonomy = latest_keep_row(recent, "frontier-autonomy-score")
+    latest_handoff = latest_keep_row(recent, "autoresearch-implementation-handoff")
+    latest_adapter_contract = latest_keep_row_prefix(recent, "drafter-adapter-method-contract-")
+    return {
+        "version": 1,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "workspace": str(root),
+        "mission": (
+            "Improve normal OpenClaw TUI decode speed for Gemma-4-31B-JANG/JANQ while preserving "
+            "model choice, stability, tool/reasoning guards, and zero active noise."
+        ),
+        "primary_metric": "normal OpenClaw TUI decode tok/s",
+        "target_tps": 30,
+        "aspirational_tps": "50-70 if hardware/runtime/drafter evidence supports it",
+        "canonical_state": {
+            "state": canonical.get("state"),
+            "clean": canonical.get("clean"),
+            "next": canonical.get("next"),
+            "noise": canonical.get("noise", {}),
+            "decode_mean_tps": canonical.get("decode_mean_tps"),
+            "ready_lanes": canonical.get("ready_lanes", []),
+            "breakthrough_lanes": canonical.get("breakthrough_lanes", []),
+            "exhausted_lanes": canonical.get("exhausted_lanes", []),
+        },
+        "latest_signals": {
+            "decode_sample": {
+                "decode_tps": latest_decode.get("decode_tps", ""),
+                "notes": clipped_text(latest_decode.get("notes", "")),
+            },
+            "mtp_acceptance": {"notes": clipped_text(latest_mtp.get("notes", ""))},
+            "quality": {"notes": clipped_text(latest_quality.get("notes", ""))},
+            "frontier_eval": {"notes": clipped_text(latest_frontier.get("notes", ""))},
+            "autonomy": {"notes": clipped_text(latest_autonomy.get("notes", ""))},
+            "handoff": {"notes": clipped_text(latest_handoff.get("notes", ""))},
+            "adapter_contract": {"notes": clipped_text(latest_adapter_contract.get("notes", ""))},
+        },
+        "ready_tasks": [
+            {
+                "id": str(task.get("id", "")),
+                "lane": str(task.get("lane", "")),
+                "supervisor_action": str(task.get("supervisor_action", "")),
+                "target": str(task.get("target", "")),
+                "priority": task.get("priority", ""),
+                "hypothesis": clipped_text(task.get("hypothesis", ""), 260),
+            }
+            for task in deterministic_ready[:8]
+        ],
+        "do_not_rediscover": [
+            "Do not re-run broad DFlash compatibility unless the draft candidate changes.",
+            "Do not repeat block-size sweeps as progress after block 2 has converged unless new evidence appears.",
+            "Do not re-record terminal adapter/calibration blockers as active noise; route them to an executable canary or candidate change.",
+            "Do not treat clean-but-no-ready-work as success; seed a deterministic next action or declare an external blocker.",
+        ],
+        "exhausted_lane_reasons": {
+            lane: clipped_text(data.get("reason", ""), 260)
+            for lane, data in exhausted.items()
+            if isinstance(data, dict)
+        },
+        "restart_instructions": [
+            "Read this file before SUMMARY.md on every fresh research session.",
+            "Prefer the first ready deterministic task over synthesis.",
+            "If there are no ready deterministic tasks, run quality-review then synthesize --kind frontier once.",
+            "Record new evidence instead of repeating the last terminal report.",
+        ],
+    }
+
+
+def render_run_memory(memory: dict[str, Any]) -> str:
+    state = memory.get("canonical_state", {}) if isinstance(memory.get("canonical_state"), dict) else {}
+    signals = memory.get("latest_signals", {}) if isinstance(memory.get("latest_signals"), dict) else {}
+    lines = [
+        "# OpenClaw Speed Research Run Memory",
+        "",
+        "This is the compact restart handoff. Read it before `SUMMARY.md` so a new session continues from the current frontier instead of rediscovering old work.",
+        "",
+        "## Mission",
+        "",
+        f"- {memory.get('mission', '')}",
+        f"- primary_metric: {memory.get('primary_metric', '')}",
+        f"- target_tps: {memory.get('target_tps', '')}",
+        f"- aspirational_tps: {memory.get('aspirational_tps', '')}",
+        "",
+        "## Current State",
+        "",
+        f"- state: {state.get('state', '')}",
+        f"- clean: {state.get('clean', '')}",
+        f"- next: {state.get('next', '')}",
+        f"- decode_mean_tps: {state.get('decode_mean_tps', '')}",
+        f"- ready_lanes: {', '.join(state.get('ready_lanes', []) or []) or 'none'}",
+        f"- breakthrough_lanes: {', '.join(state.get('breakthrough_lanes', []) or []) or 'none'}",
+        f"- exhausted_lanes: {', '.join(state.get('exhausted_lanes', []) or []) or 'none'}",
+        f"- active_noise: {json.dumps(state.get('noise', {}), sort_keys=True)}",
+        "",
+        "## Latest Signals",
+        "",
+    ]
+    for name in ("decode_sample", "mtp_acceptance", "quality", "frontier_eval", "autonomy", "handoff", "adapter_contract"):
+        signal = signals.get(name, {}) if isinstance(signals.get(name), dict) else {}
+        bits = []
+        if signal.get("decode_tps"):
+            bits.append(f"decode_tps={signal['decode_tps']}")
+        if signal.get("notes"):
+            bits.append(str(signal["notes"]))
+        lines.append(f"- {name}: {'; '.join(bits) if bits else 'no recent signal'}")
+    lines.extend(["", "## Ready Deterministic Tasks", ""])
+    ready_tasks = memory.get("ready_tasks", []) if isinstance(memory.get("ready_tasks"), list) else []
+    if ready_tasks:
+        for task in ready_tasks:
+            lines.append(
+                f"- {task.get('id', '')}: lane={task.get('lane', '')} action={task.get('supervisor_action', '')} "
+                f"target={task.get('target', '')} hypothesis={task.get('hypothesis', '')}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Do Not Re-discover", ""])
+    for item in memory.get("do_not_rediscover", []) or []:
+        lines.append(f"- {item}")
+    exhausted_reasons = memory.get("exhausted_lane_reasons", {})
+    if isinstance(exhausted_reasons, dict) and exhausted_reasons:
+        lines.extend(["", "## Exhausted Lane Reasons", ""])
+        for lane, reason in sorted(exhausted_reasons.items()):
+            lines.append(f"- {lane}: {reason or 'recorded exhausted'}")
+    lines.extend(["", "## Restart Instructions", ""])
+    for item in memory.get("restart_instructions", []) or []:
+        lines.append(f"- {item}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_restart_context(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
+    memory = restart_context_payload(root, recent_rows=recent_rows)
+    write_if_changed(root / "restart-context.json", json.dumps(memory, indent=2, sort_keys=True) + "\n")
+    write_if_changed(root / "RUN_MEMORY.md", render_run_memory(memory))
+    return memory
+
+
 def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
     ensure_research_state(root)
     rows = result_rows(root)
@@ -2359,12 +2530,23 @@ def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
             "## Files",
             "",
             f"- recent results: {recent_path}",
+            f"- run memory: {root / 'RUN_MEMORY.md'}",
+            f"- restart context: {root / 'restart-context.json'}",
             f"- full ledger: {root / 'results.tsv'}",
             f"- tasks: {root / 'tasks.jsonl'}",
         ]
     )
     write_if_changed(root / "SUMMARY.md", "\n".join(summary_lines).rstrip() + "\n")
-    return {"ok": True, "recent_rows": len(recent), "ready_tasks": len(ready_tasks), "blocked_tasks": len(blocked_tasks)}
+    memory = write_restart_context(root, recent_rows=max(120, recent_rows))
+    return {
+        "ok": True,
+        "recent_rows": len(recent),
+        "ready_tasks": len(ready_tasks),
+        "blocked_tasks": len(blocked_tasks),
+        "run_memory": str(root / "RUN_MEMORY.md"),
+        "restart_context": str(root / "restart-context.json"),
+        "memory_state": (memory.get("canonical_state") or {}).get("state"),
+    }
 
 
 def float_values(rows: list[dict[str, str]], target: str, key: str) -> list[float]:
@@ -10732,7 +10914,16 @@ def benchmark_prompt(mode: str) -> tuple[str, int]:
 
 def prompt_size_probe(root: Path) -> dict[str, Any]:
     compact_workspace(root)
-    files = ["program.md", "STRATEGY.md", "SUMMARY.md", "results-recent.tsv", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
+    files = [
+        "program.md",
+        "STRATEGY.md",
+        "RUN_MEMORY.md",
+        "SUMMARY.md",
+        "results-recent.tsv",
+        "tasks.jsonl",
+        "findings.jsonl",
+        "experiments.jsonl",
+    ]
     measured: dict[str, int] = {}
     total_chars = 0
     for name in files:
@@ -10755,7 +10946,17 @@ def prompt_size_probe(root: Path) -> dict[str, Any]:
 
 def prompt_shape_probe(root: Path) -> dict[str, Any]:
     compact_workspace(root)
-    files = ["program.md", "STRATEGY.md", "SUMMARY.md", "results-recent.tsv", "ideas.md", "tasks.jsonl", "findings.jsonl", "experiments.jsonl"]
+    files = [
+        "program.md",
+        "STRATEGY.md",
+        "RUN_MEMORY.md",
+        "SUMMARY.md",
+        "results-recent.tsv",
+        "ideas.md",
+        "tasks.jsonl",
+        "findings.jsonl",
+        "experiments.jsonl",
+    ]
     entries: list[dict[str, Any]] = []
     stable_tokens = 0
     volatile_tokens = 0
@@ -10766,7 +10967,7 @@ def prompt_shape_probe(root: Path) -> dict[str, Any]:
         except OSError:
             text = ""
         tokens = estimate_tokens(text)
-        role = "stable" if name in {"program.md", "STRATEGY.md", "ideas.md"} else "volatile"
+        role = "stable" if name in {"program.md", "STRATEGY.md", "RUN_MEMORY.md", "ideas.md"} else "volatile"
         if role == "stable":
             stable_tokens += tokens
         else:
