@@ -1024,6 +1024,52 @@ def main() -> int:
                             canonical_state="prerequisite_needed",
                         )
                         assert certified_scorecard["overall"] >= 99.0
+                        low_signal_scorecard = helper.research_quality_scorecard(
+                            blocked_rows=0,
+                            missing_required_blocks=["2", "3", "4"],
+                            sweep_rows=3,
+                            min_sweeps=3,
+                            repeated_block2=True,
+                            repeated_keep_current=True,
+                            plateau_below_target=False,
+                            exhaustion_candidate=False,
+                            frontier_ready=["runtime-overhead"],
+                            seeded_tasks=[],
+                            ready_tasks=[
+                                {
+                                    "id": "low-signal-source-scout-cycle-000",
+                                    "acceptance": "bounded external source evidence updates the next route",
+                                    "rollback": "delete task and keep prior queue",
+                                    "guard_checks": ["no_model_load", "no_live_profile_change"],
+                                },
+                                {
+                                    "id": "low-signal-runtime-map-cycle-000",
+                                    "acceptance": "runtime map finds a patchable boundary or closes cleanly",
+                                    "rollback": "delete task and keep prior queue",
+                                    "guard_checks": ["no_model_load", "no_live_profile_change"],
+                                },
+                                {
+                                    "id": "low-signal-frontier-deliberation-cycle-000",
+                                    "acceptance": "deliberation selects one safe deterministic next task",
+                                    "rollback": "delete task and keep prior queue",
+                                    "guard_checks": ["no_model_load", "no_live_profile_change"],
+                                },
+                            ],
+                            contaminated_rows=0,
+                            clean_runtime_maps=1,
+                            variance={},
+                            artifact_check={"artifact_suspected": False},
+                            contract_ok=True,
+                            dflash_suppressed=True,
+                            repeated_dflash_synthesis=0,
+                            duplicate_stage_tasks=0,
+                            best_mean=None,
+                            target_tps=30.0,
+                            server_decode_values=[],
+                            canonical_state="breakthrough_lane_active",
+                        )
+                        assert low_signal_scorecard["overall"] >= 99.0
+                        assert low_signal_scorecard["components"]["causal"] >= 98.0
                         assert helper.actionable_blocked_rows(helper.result_rows(gradient_blocked_root)) == []
                         assert helper.filter_seedable_tasks(
                             gradient_blocked_root,

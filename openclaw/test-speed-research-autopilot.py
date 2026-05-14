@@ -2123,6 +2123,106 @@ def main() -> int:
         assert issue == ""
         assert '"status": "done"' in helper.TASKS.read_text(encoding="utf-8")
 
+        post_escape_workspace = Path(tmp) / "low-signal-post-escape-loop"
+        configure_workspace(helper, post_escape_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="runtime-overhead-map-earlier-escape",
+            status="keep",
+            target="runtime-overhead-map",
+            hypothesis="bounded runtime escape was attempted before the loop restarted",
+            commit="abc123",
+            notes="gap=tooling overhead map complete",
+        )
+        for index in range(3):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-post-escape-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another post-escape MTP report",
+                commit="abc123",
+                notes="seeded_tasks=1 deliberation_actions=agent-deliberation-mtp-acceptance-yield",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"mtp-report-post-escape-{index}",
+                status="keep",
+                target="mtp-acceptance-report",
+                hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence",
+                commit="abc123",
+                notes="samples=5 mtp_samples=3 mean_server_tok_s=3.5 mean_accept=0.87 path=/tmp/report.json",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "agent-deliberation-mtp-acceptance-yield-post-escape",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "mtp-report",
+                    "lane": "frontier-deliberation",
+                    "next_action": "openclaw-speed-research mtp-report --lines 320",
+                }
+            ],
+        )
+        post_escape_args = Namespace(
+            low_signal_window_rows=20,
+            low_signal_min_mtp_reports=3,
+            low_signal_min_synthesis_rows=3,
+        )
+        post_escape_status = helper.recent_low_signal_mtp_loop_status(post_escape_args)
+        assert post_escape_status["loop"], post_escape_status
+        assert post_escape_status["escape_rows"] == 1, post_escape_status
+        assert post_escape_status["rows_since_latest_escape"] == 6, post_escape_status
+        post_escape_repair = helper.repair_low_signal_mtp_loop(24, "post-escape-low-signal", post_escape_status)
+        assert post_escape_repair["blocked_tasks"] == 1
+        assert post_escape_repair["seeded_tasks"] == 3
+
+        pending_escape_workspace = Path(tmp) / "low-signal-pending-escape"
+        configure_workspace(helper, pending_escape_workspace)
+        helper.WORKSPACE.mkdir(parents=True, exist_ok=True)
+        helper.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+        helper.RESULTS.write_text(helper.RESULTS_HEADER, encoding="utf-8")
+        for index in range(3):
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"synthesis-pending-escape-{index}",
+                status="keep",
+                target="synthesis",
+                hypothesis="seeded another MTP report before pending escape work",
+                commit="abc123",
+                notes="seeded_tasks=1 deliberation_actions=agent-deliberation-mtp-acceptance-yield",
+            )
+            helper.append_result(
+                helper.WORKSPACE,
+                run_id=f"mtp-report-pending-escape-{index}",
+                status="keep",
+                target="mtp-acceptance-report",
+                hypothesis="recent OpenClaw server logs should expose drafter acceptance evidence",
+                commit="abc123",
+                notes="samples=5 mtp_samples=3 mean_server_tok_s=3.5 mean_accept=0.87 path=/tmp/report.json",
+            )
+        helper.write_jsonl(
+            helper.TASKS,
+            [
+                {
+                    "id": "low-signal-source-scout-cycle-024",
+                    "status": "ready",
+                    "task_type": "supervisor",
+                    "supervisor_action": "source-scout",
+                    "lane": "frontier-evidence",
+                    "next_action": "openclaw-speed-research source-scout --topic rapid-mlx",
+                }
+            ],
+        )
+        pending_escape_status = helper.recent_low_signal_mtp_loop_status(post_escape_args)
+        assert not pending_escape_status["loop"], pending_escape_status
+        assert pending_escape_status["ready_escape_tasks"] == ["low-signal-source-scout-cycle-024"], pending_escape_status
+
         remeasure_workspace = Path(tmp) / "low-signal-decode-remeasure"
         configure_workspace(helper, remeasure_workspace)
         helper.WORKSPACE.mkdir(parents=True, exist_ok=True)

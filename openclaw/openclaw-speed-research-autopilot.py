@@ -834,35 +834,63 @@ def recent_low_signal_mtp_loop_status(args: argparse.Namespace) -> dict[str, obj
     should route to a new benchmark, source scout, or patchable hypothesis.
     """
     rows = all_result_rows(WORKSPACE)[-max(12, int(getattr(args, "low_signal_window_rows", 40))) :]
+
+    def is_escape(row: dict[str, str]) -> bool:
+        return (
+            row.get("target") in LOW_SIGNAL_ESCAPE_TARGETS
+            or row.get("run_id", "").startswith(("source-scout-", "frontier-agent-deliberation-", "runtime-overhead-map-"))
+            or row.get("target") == "decode-sample"
+        )
+
+    escape_indexes = [index for index, row in enumerate(rows) if is_escape(row)]
+    latest_escape_index = escape_indexes[-1] if escape_indexes else -1
+    post_escape_rows = rows[latest_escape_index + 1 :]
     mtp_rows = [
         row
-        for row in rows
+        for row in post_escape_rows
         if row.get("target") == "mtp-acceptance-report" or row.get("run_id", "").startswith("mtp-report-")
     ]
     synthesis_rows = [
         row
-        for row in rows
+        for row in post_escape_rows
         if row.get("target") in {"synthesis", "synthesis-terminal"} or row.get("run_id", "").startswith("synthesis-")
-    ]
-    escape_rows = [
-        row
-        for row in rows
-        if row.get("target") in LOW_SIGNAL_ESCAPE_TARGETS
-        or row.get("run_id", "").startswith(("source-scout-", "frontier-agent-deliberation-", "runtime-overhead-map-"))
-        or row.get("target") == "decode-sample"
     ]
     min_mtp = int(getattr(args, "low_signal_min_mtp_reports", 4))
     min_synthesis = int(getattr(args, "low_signal_min_synthesis_rows", 4))
     repeated_notes = len({re.sub(r"path=[^ ]+", "path=<artifact>", row.get("notes", "")) for row in mtp_rows[-min_mtp:]})
-    loop = len(mtp_rows) >= min_mtp and len(synthesis_rows) >= min_synthesis and not escape_rows
+    ready_mtp_tasks = [
+        str(task.get("id", ""))
+        for task in read_jsonl(TASKS)
+        if task.get("status", "ready") in {"ready", "rework"}
+        and (
+            str(task.get("supervisor_action", "")) == "mtp-report"
+            or "mtp-acceptance-yield" in str(task.get("id", ""))
+        )
+    ]
+    ready_escape_tasks = [
+        str(task.get("id", ""))
+        for task in read_jsonl(TASKS)
+        if task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("supervisor_action", ""))
+        in {"source-scout", "runtime-overhead-map", "frontier-deliberation", "focused-test", "drafter-calibration-canary"}
+        and "mtp-acceptance-yield" not in str(task.get("id", ""))
+    ]
+    loop = len(mtp_rows) >= min_mtp and len(synthesis_rows) >= min_synthesis
     if not loop and len(mtp_rows) >= min_mtp + 2 and repeated_notes <= 2:
         loop = True
+    if not loop and len(mtp_rows) >= min_mtp and repeated_notes <= 1 and ready_mtp_tasks and not ready_escape_tasks:
+        loop = True
+    if loop and ready_escape_tasks and not ready_mtp_tasks:
+        loop = False
     return {
         "loop": loop,
         "mtp_reports": len(mtp_rows),
         "synthesis_rows": len(synthesis_rows),
-        "escape_rows": len(escape_rows),
+        "escape_rows": len(escape_indexes),
+        "rows_since_latest_escape": len(post_escape_rows),
         "repeated_note_shapes": repeated_notes,
+        "ready_mtp_tasks": ready_mtp_tasks[:8],
+        "ready_escape_tasks": ready_escape_tasks[:8],
         "latest_mtp_run": mtp_rows[-1].get("run_id", "") if mtp_rows else "",
         "reason": (
             "repeated synthesis/MTP-report loop without new candidate evidence"
@@ -5452,7 +5480,7 @@ def main() -> int:
     parser.add_argument(
         "--low-signal-check-interval-cycles",
         type=int,
-        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_CHECK_INTERVAL", "12")),
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_CHECK_INTERVAL", "4")),
         help="cycle interval for low-signal loop detection in addition to the wall-clock watchdog",
     )
     parser.add_argument(
@@ -5463,12 +5491,12 @@ def main() -> int:
     parser.add_argument(
         "--low-signal-min-mtp-reports",
         type=int,
-        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_MTP", "4")),
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_MTP", "3")),
     )
     parser.add_argument(
         "--low-signal-min-synthesis-rows",
         type=int,
-        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_SYNTHESIS", "4")),
+        default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_LOW_SIGNAL_MIN_SYNTHESIS", "3")),
     )
     parser.add_argument(
         "--low-signal-min-decode-remeasures",

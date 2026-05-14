@@ -5525,6 +5525,10 @@ def research_quality_scorecard(
             "drafter-fit",
             "calibration-memory-report",
             "runtime-overhead",
+            "runtime-map",
+            "source-scout",
+            "frontier-deliberation",
+            "low-signal-",
             "frontier-expansion",
             "exhaustion-report",
             "drafter-adapter-method-contract",
@@ -5538,6 +5542,8 @@ def research_quality_scorecard(
             "calibration-memory-report",
             "lane-contract-",
             "decode-remeasure-ready-work-gap",
+            "low-signal-",
+            "runtime-map",
         )
     )
     durable_sweep_coverage = repeated_block2 and repeated_keep_current and sweep_rows >= min_sweeps
