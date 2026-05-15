@@ -464,6 +464,34 @@ def main() -> int:
             ) == 0
             seeded_review_tasks = (root / "tasks.jsonl").read_text(encoding="utf-8")
             assert "review-drafter-sweep-next" in seeded_review_tasks
+            stale_speed_root = Path(tmp) / "stale-speed-evidence" / "speed"
+            helper.ensure_research_state(stale_speed_root)
+            helper.mark_lane_exhausted(stale_speed_root, lane="mtp-decode", reason="unit settled", evidence={})
+            helper.write_jsonl(stale_speed_root / "tasks.jsonl", [])
+            for index in range(4):
+                helper.append_result(
+                    stale_speed_root,
+                    run_id=f"mtp-report-stale-speed-{index}",
+                    status="keep",
+                    target="mtp-acceptance-report",
+                    hypothesis="unit stale speed evidence",
+                    commit="abc123",
+                    notes="samples=9 mtp_samples=6 mean_server_tok_s=5.733 mean_accept=0.805 path=/tmp/report.json",
+                )
+            with patch.dict(os.environ, {"OPENCLAW_SPEED_RESEARCH_DIR": str(stale_speed_root)}, clear=False):
+                assert helper.quality_review(
+                    Namespace(recent_rows=20, min_sweeps=3, min_samples_per_block=3, target_tps=30.0)
+                ) == 0
+            stale_review = json.loads(
+                max(
+                    (stale_speed_root / "benchmarks").glob("quality-review-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                ).read_text(encoding="utf-8")
+            )
+            assert stale_review["stale_speed_evidence"] is True
+            assert stale_review["gates"]["fresh_decode_metric"] is False
+            stale_tasks = helper.read_jsonl(stale_speed_root / "tasks.jsonl")
+            assert any(task.get("benchmark_mode") == "decode-sample" for task in stale_tasks)
             helper.write_jsonl(root / "tasks.jsonl", tasks)
             helper.write_jsonl(
                 root / "tasks.jsonl",

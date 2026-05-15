@@ -188,14 +188,31 @@ def main() -> int:
             shadow_min_score=90,
             stage_min_wins=2,
         )
-        assert second_evolution["shadow_reviews"]["generated"] >= 1
-        assert second_evolution["staged_authority"]["advisory"] >= 1
+        assert second_evolution["shadow_reviews"]["generated"] == 0
+        assert second_evolution["staged_authority"]["generated"] == 0
         assert second_evolution["active_skill_mutated"] is False
         status_after_evolution = sim.status(root)
         assert status_after_evolution["shadow_reviews"] >= len(shadow_reviews)
         assert status_after_evolution["promotions"] >= len(promotions)
         assert status_after_evolution["rollbacks"] >= len(rollbacks)
         assert status_after_evolution["rolled_back_promotions"] >= 1
+        shadow_path = root / "self-improvement" / "evolution-shadow-reviews.jsonl"
+        promotion_path = root / "self-improvement" / "evolution-promotions.jsonl"
+        rollback_path = root / "self-improvement" / "evolution-rollbacks.jsonl"
+        shadow_rows = sim.read_jsonl(shadow_path)
+        promotion_rows = sim.read_jsonl(promotion_path)
+        rollback_rows = sim.read_jsonl(rollback_path)
+        assert shadow_rows and promotion_rows and rollback_rows
+        sim.write_jsonl(shadow_path, [*shadow_rows, *shadow_rows[:3]])
+        sim.write_jsonl(promotion_path, [*promotion_rows, *promotion_rows[:2]])
+        sim.write_jsonl(rollback_path, [*rollback_rows, *rollback_rows[:2]])
+        compacted_status = sim.status(root)
+        assert compacted_status["ledger_compaction"]["compacted"]["evolution-shadow-reviews.jsonl"] >= 3
+        assert compacted_status["ledger_compaction"]["compacted"]["evolution-promotions.jsonl"] >= 2
+        assert compacted_status["ledger_compaction"]["compacted"]["evolution-rollbacks.jsonl"] >= 2
+        assert compacted_status["shadow_reviews"] == len(sim.dedupe_rows(sim.read_jsonl(shadow_path), kind=sim.SHADOW_REVIEWS))
+        assert compacted_status["promotions"] == len(sim.dedupe_rows(sim.read_jsonl(promotion_path), kind=sim.PROMOTIONS))
+        assert compacted_status["rollbacks"] == len(sim.dedupe_rows(sim.read_jsonl(rollback_path), kind=sim.ROLLBACKS))
         write_json = lambda path, payload: path.parent.mkdir(parents=True, exist_ok=True) or path.write_text(  # noqa: E731
             json.dumps(payload) + "\n",
             encoding="utf-8",

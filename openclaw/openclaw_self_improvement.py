@@ -176,9 +176,95 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def semantic_row_key(kind: str, row: dict[str, Any]) -> str:
+    """Return a stable identity for append-only sidecar ledgers.
+
+    The sidecar is allowed to observe and stage canaries repeatedly, but repeated
+    observations of the same candidate must not inflate liveness metrics. These
+    keys intentionally ignore timestamps and generated row ids.
+    """
+
+    if kind == SHADOW_REVIEWS:
+        return "|".join(
+            [
+                str(row.get("target_skill", "")),
+                str(row.get("min_score", "")),
+                str(row.get("stage_before", "")),
+                str(row.get("stage_after", "")),
+            ]
+        )
+    if kind == PROMOTIONS:
+        return "|".join(
+            [
+                str(row.get("target_skill", "")),
+                str(row.get("min_wins", "")),
+                str(row.get("min_score", "")),
+                str(row.get("proposed_stage", "")),
+                str(row.get("effective_authority", "")),
+            ]
+        )
+    if kind == ROLLBACKS:
+        return "|".join(
+            [
+                str(row.get("target_skill", "")),
+                str(row.get("reason", "")),
+                str(row.get("previous_effective_authority", "")),
+                str(row.get("new_effective_authority", "")),
+            ]
+        )
+    if kind == VARIANTS:
+        return "|".join(
+            [
+                str(row.get("target_skill", "")),
+                str(row.get("kind", "")),
+                str(row.get("base_hash", "")),
+            ]
+        )
+    if kind == DECISIONS:
+        return "|".join(
+            [
+                str(row.get("target_skill", "")),
+                str(row.get("decision", "")),
+                str(row.get("score", "")),
+            ]
+        )
+    return str(row.get("id", ""))
+
+
+def dedupe_rows(rows: list[dict[str, Any]], *, kind: str) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        key = semantic_row_key(kind, row)
+        if not key:
+            key = str(row.get("id", ""))
+        if not key:
+            continue
+        if key not in latest:
+            order.append(key)
+        latest[key] = row
+    return [latest[key] for key in order if key in latest]
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+
+def compact_self_improvement_ledgers(root: Path) -> dict[str, Any]:
+    """Deduplicate noisy self-improvement ledgers without touching active skills."""
+
+    ensure_self_improvement_state(root)
+    compacted: dict[str, int] = {}
+    for name in (VARIANTS, DECISIONS, SHADOW_REVIEWS, PROMOTIONS, ROLLBACKS):
+        path = self_root(root) / name
+        rows = read_jsonl(path)
+        deduped = dedupe_rows(rows, kind=name)
+        removed = len(rows) - len(deduped)
+        if removed > 0:
+            write_jsonl(path, deduped)
+        compacted[name] = removed
+    return {"ok": True, "compacted": compacted}
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -807,7 +893,7 @@ def eval_cases_by_id(root: Path) -> dict[str, dict[str, Any]]:
 
 def latest_shadow_reviews_by_variant(root: Path) -> dict[str, list[dict[str, Any]]]:
     reviews: dict[str, list[dict[str, Any]]] = {}
-    for row in read_jsonl(self_root(root) / SHADOW_REVIEWS):
+    for row in dedupe_rows(read_jsonl(self_root(root) / SHADOW_REVIEWS), kind=SHADOW_REVIEWS):
         variant_id = str(row.get("variant_id", ""))
         if variant_id:
             reviews.setdefault(variant_id, []).append(row)
@@ -865,7 +951,8 @@ def shadow_review_variants(root: Path, *, min_score: int = 90) -> dict[str, Any]
     variants = variant_metadata_by_id(root)
     latest_decisions = latest_decision_by_variant(root)
     existing = read_jsonl(self_root(root) / SHADOW_REVIEWS)
-    seen = {str(row.get("id", "")) for row in existing}
+    existing = dedupe_rows(existing, kind=SHADOW_REVIEWS)
+    seen = {semantic_row_key(SHADOW_REVIEWS, row) for row in existing}
     generated = 0
     wins = 0
     losses = 0
@@ -893,18 +980,10 @@ def shadow_review_variants(root: Path, *, min_score: int = 90) -> dict[str, Any]
             stable_score = float(stable["score"])
             missing = list(canary["missing_case_ids"])
             status = "win" if canary_score >= float(min_score) and canary_score >= stable_score else "loss"
-        review_id = lesson_id(
-            "shadow-review",
-            timestamp,
-            len(existing),
-            variant_id,
-            decision.get("id", ""),
-            canary_score,
-            stable_score,
-            status,
-        )
-        if review_id in seen:
+        semantic_key = "|".join([target_skill, str(int(min_score)), "canary", "shadow" if status == "win" else "canary"])
+        if semantic_key in seen:
             continue
+        review_id = lesson_id("shadow-review", semantic_key)
         existing.append(
             {
                 "id": review_id,
@@ -923,7 +1002,7 @@ def shadow_review_variants(root: Path, *, min_score: int = 90) -> dict[str, Any]
                 "active_skill_mutated": False,
             }
         )
-        seen.add(review_id)
+        seen.add(semantic_key)
         generated += 1
         if status == "win":
             wins += 1
@@ -968,8 +1047,8 @@ def stage_evolution_authority(
     ensure_self_improvement_state(root)
     reviews = latest_shadow_reviews_by_variant(root)
     variants = variant_metadata_by_id(root)
-    promotions = read_jsonl(self_root(root) / PROMOTIONS)
-    seen = {str(row.get("id", "")) for row in promotions}
+    promotions = dedupe_rows(read_jsonl(self_root(root) / PROMOTIONS), kind=PROMOTIONS)
+    seen = {semantic_row_key(PROMOTIONS, row) for row in promotions}
     generated = 0
     advisory = 0
     timestamp = now()
@@ -982,9 +1061,18 @@ def stage_evolution_authority(
         effective = capped_authority(proposed_stage, max_effective_authority)
         if effective in {"task_seed", "supervisor_route"}:
             effective = "advisory"
-        promotion_id = lesson_id("promotion", variant_id, len(wins), proposed_stage, effective)
-        if promotion_id in seen:
+        semantic_key = "|".join(
+            [
+                target_skill,
+                str(int(min_wins)),
+                str(int(min_score)),
+                proposed_stage,
+                effective,
+            ]
+        )
+        if semantic_key in seen:
             continue
+        promotion_id = lesson_id("promotion", semantic_key)
         promotions.append(
             {
                 "id": promotion_id,
@@ -1002,7 +1090,7 @@ def stage_evolution_authority(
                 "rollback": "Disable this promotion record; active skills and runtime were not changed.",
             }
         )
-        seen.add(promotion_id)
+        seen.add(semantic_key)
         generated += 1
         if effective == "advisory":
             advisory += 1
@@ -1035,14 +1123,22 @@ def rollback_unhealthy_promotions(root: Path, *, recent_rows: int = 160) -> dict
         return {"generated": 0, "reasons": [], "total": len(read_jsonl(self_root(root) / ROLLBACKS))}
     promotions = read_jsonl(self_root(root) / PROMOTIONS)
     active = [row for row in promotions if row.get("effective_authority") not in {"", "none"}]
-    rollbacks = read_jsonl(self_root(root) / ROLLBACKS)
-    seen = {str(row.get("id", "")) for row in rollbacks}
+    rollbacks = dedupe_rows(read_jsonl(self_root(root) / ROLLBACKS), kind=ROLLBACKS)
+    seen = {semantic_row_key(ROLLBACKS, row) for row in rollbacks}
     generated = 0
     timestamp = now()
     for promotion in active:
-        rollback_id = lesson_id("rollback", promotion.get("id", ""), ",".join(reasons))
-        if rollback_id in seen:
+        semantic_key = "|".join(
+            [
+                str(promotion.get("target_skill", "")),
+                ",".join(reasons),
+                str(promotion.get("effective_authority", "")),
+                "none",
+            ]
+        )
+        if semantic_key in seen:
             continue
+        rollback_id = lesson_id("rollback", semantic_key)
         rollbacks.append(
             {
                 "id": rollback_id,
@@ -1056,7 +1152,7 @@ def rollback_unhealthy_promotions(root: Path, *, recent_rows: int = 160) -> dict
                 "active_skill_mutated": False,
             }
         )
-        seen.add(rollback_id)
+        seen.add(semantic_key)
         generated += 1
     write_jsonl(self_root(root) / ROLLBACKS, rollbacks)
     return {"generated": generated, "reasons": reasons, "total": len(rollbacks)}
@@ -1065,7 +1161,7 @@ def rollback_unhealthy_promotions(root: Path, *, recent_rows: int = 160) -> dict
 def rolled_back_promotion_ids(root: Path) -> set[str]:
     return {
         str(row.get("promotion_id", ""))
-        for row in read_jsonl(self_root(root) / ROLLBACKS)
+        for row in dedupe_rows(read_jsonl(self_root(root) / ROLLBACKS), kind=ROLLBACKS)
         if row.get("promotion_id")
     }
 
@@ -1103,6 +1199,7 @@ def run_evolution(
 ) -> dict[str, Any]:
     """Run canary-only skill evolution, shadow review, and staged advisory records."""
     ensure_self_improvement_state(root)
+    compact_self_improvement_ledgers(root)
     snapshot = snapshot_self_improvement(root, reason="pre-evolution-run")
     rows = parse_results(root / "results.tsv", limit=recent_rows)
     capture_trajectory_cases(root, rows)
@@ -1339,6 +1436,7 @@ def curate(root: Path, recent_rows: int = 160) -> dict[str, Any]:
 def status(root: Path) -> dict[str, Any]:
     ensure_self_improvement_state(root)
     base = self_root(root)
+    compaction = compact_self_improvement_ledgers(root)
     lessons = read_jsonl(base / LESSONS)
     trajectories = read_jsonl(base / TRAJECTORIES)
     proposals = read_jsonl(base / PROPOSALS)
@@ -1358,6 +1456,44 @@ def status(root: Path) -> dict[str, Any]:
         for row in promotions
         if row.get("effective_authority") == "advisory" and str(row.get("id", "")) not in rolled_back
     ]
+    last_evolution = dict(state.get("last_evolution") or {})
+    if last_evolution:
+        last_evolution["ledger_compacted_after_run"] = any(compaction["compacted"].values())
+        last_evolution.setdefault("current_totals", {})
+        last_evolution["current_totals"].update(
+            {
+                "variants": len(variants),
+                "decisions": len(decisions),
+                "shadow_reviews": len(shadow_reviews),
+                "promotions": len(promotions),
+                "rollbacks": len(rollbacks),
+                "advisory_promotions": len(advisory_promotions),
+                "rolled_back_promotions": len(rolled_back),
+            }
+        )
+        if isinstance(last_evolution.get("shadow_reviews"), dict):
+            shadow_summary = last_evolution["shadow_reviews"]
+            for field in ("generated", "wins", "losses"):
+                if int(shadow_summary.get(field) or 0) > len(shadow_reviews):
+                    shadow_summary[f"{field}_pre_compaction"] = shadow_summary.get(field)
+                    shadow_summary[field] = 0
+            shadow_summary["wins"] = sum(1 for row in shadow_reviews if row.get("status") == "win")
+            shadow_summary["losses"] = sum(1 for row in shadow_reviews if row.get("status") == "loss")
+            shadow_summary["total"] = len(shadow_reviews)
+        if isinstance(last_evolution.get("staged_authority"), dict):
+            stage_summary = last_evolution["staged_authority"]
+            for field in ("generated", "advisory"):
+                if int(stage_summary.get(field) or 0) > len(promotions):
+                    stage_summary[f"{field}_pre_compaction"] = stage_summary.get(field)
+                    stage_summary[field] = 0
+            stage_summary["advisory"] = len(advisory_promotions)
+            stage_summary["total"] = len(promotions)
+        if isinstance(last_evolution.get("rollbacks"), dict):
+            last_evolution["rollbacks"]["total"] = len(rollbacks)
+        if isinstance(last_evolution.get("variants"), dict):
+            last_evolution["variants"]["total"] = len(variants)
+        if isinstance(last_evolution.get("decisions"), dict):
+            last_evolution["decisions"]["total"] = len(decisions)
     return {
         "ok": True,
         "path": str(base),
@@ -1379,5 +1515,6 @@ def status(root: Path) -> dict[str, Any]:
         "last_run_at": state.get("last_run_at"),
         "last_summary": state.get("last_summary"),
         "last_health": state.get("last_health"),
-        "last_evolution": state.get("last_evolution"),
+        "last_evolution": last_evolution,
+        "ledger_compaction": compaction,
     }

@@ -5884,6 +5884,14 @@ def quality_review(args: argparse.Namespace) -> int:
     canonical_state = canonical_autoresearch_state(root, recent_rows=int(args.recent_rows), target_tps=float(args.target_tps))
     blocked = list(canonical_state["unresolved_blocked_rows"])
     active_task_ids = [str(task.get("id", "")) for task in active_tasks]
+    recent_mtp_reports = [
+        row
+        for row in recent
+        if row.get("status") == "keep"
+        and (row.get("target") == "mtp-acceptance-report" or row.get("run_id", "").startswith("mtp-report-"))
+    ]
+    active_decode_benchmark = any(str(task.get("id", "")).startswith("review-fresh-decode-benchmark-") for task in active_tasks)
+    stale_speed_evidence = not decode_signals and len(recent_mtp_reports) >= 3 and not active_decode_benchmark
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=max(160, int(args.recent_rows)))
     has_terminal_calibration_route = calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS
     has_calibration_stage_route = any(
@@ -5991,6 +5999,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "no_contaminated_wall_clock": not contaminated_signals,
         "runtime_overhead_not_repeated": len(clean_runtime_maps) < 2 or not active_runtime_tasks,
         "ready_task_contracts_ok": bool(contract.get("ok")),
+        "fresh_decode_metric": not stale_speed_evidence,
     }
     quality_score = 100
     seeded_tasks: list[dict[str, Any]] = []
@@ -6045,6 +6054,30 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append("repeated DFlash synthesis detected without new compatibility evidence; route to prerequisite evidence or retire the lane.")
     if blocked:
         quality_score -= 30
+    if stale_speed_evidence:
+        quality_score -= 22
+        recommendations.append(
+            "speed research has fresh MTP reports but no fresh decode benchmark rows; run a bounded decode-sample before counting more speed progress."
+        )
+        if should_seed_action(root, "review-fresh-decode-benchmark-", recent_rows=40):
+            timestamp = int(time.time())
+            seeded_tasks.append(
+                {
+                    "id": f"review-fresh-decode-benchmark-{timestamp}",
+                    "status": "ready",
+                    "priority": 99,
+                    "lane": "speed-measurement",
+                    "task_type": "supervisor",
+                    "benchmark_mode": "decode-sample",
+                    "target": "Gemma-4-31B-JANG_4M-CRACK",
+                    "hypothesis": "MTP acceptance reports are stale unless paired with a fresh decode_tps measurement on the normal TUI path.",
+                    "metric": "decode_tps",
+                    "guard_checks": ["memory_gate", "bounded_tokens", "no_model_change", "no_live_profile_change"],
+                    "acceptance": "A decode-sample row records completion_tokens, token source, wall decode TPS, and server_tok_s if available.",
+                    "rollback": "No rollback needed; this is measurement-only and does not mutate the live profile.",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+                }
+            )
     if len(repeated_canary_ready_no_stage) >= 3 and has_calibration_stage_route:
         quality_score -= 25
         recommendations.append(
@@ -6250,7 +6283,7 @@ def quality_review(args: argparse.Namespace) -> int:
     coverage_gap = bool(missing_required_blocks and not has_calibration_route and not durable_sweep_coverage)
     if exhaustion_candidate:
         verdict = "exhaustion-candidate"
-    elif coverage_gap or blocked or (repeated_terminal_calibration and not terminal_bottleneck_routed):
+    elif coverage_gap or blocked or stale_speed_evidence or (repeated_terminal_calibration and not terminal_bottleneck_routed):
         verdict = "needs-repair"
     elif plateau_below_target:
         verdict = "converged-below-target"
@@ -6341,6 +6374,7 @@ def quality_review(args: argparse.Namespace) -> int:
         "compacted_direct_canaries": compacted_direct_canaries,
         "compacted_runtime_tasks": compacted_runtime_tasks,
         "repeated_canary_ready_no_stage": len(repeated_canary_ready_no_stage),
+        "stale_speed_evidence": stale_speed_evidence,
         "recommendations": recommendations,
         "seeded_tasks": seeded,
         "canonical_state": canonical_state,
@@ -6373,6 +6407,7 @@ def quality_review(args: argparse.Namespace) -> int:
             f"best_mean_tps={best_mean if best_mean is not None else ''} "
             f"mean_server_tps={artifact['mean_server_decode_tps'] if artifact['mean_server_decode_tps'] is not None else ''} "
             f"contaminated={len(contaminated_signals)} "
+            f"stale_speed_evidence={stale_speed_evidence} "
             f"repeated_block2={repeated_block2} seeded_tasks={seeded} "
             f"recommendation={recommendations[0]}"
         ),
