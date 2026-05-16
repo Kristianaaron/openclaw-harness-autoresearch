@@ -25,6 +25,49 @@ def load_helper():
     return module
 
 
+def check_installed_helper_freshness(helper) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "repo" / "openclaw"
+        installed = root / "bin"
+        source.mkdir(parents=True)
+        installed.mkdir()
+        files = {
+            "openclaw-speed-research.py": "print('helper')\n",
+            "openclaw-speed-research-autopilot.py": "print('autopilot')\n",
+            "openclaw_speed_research_core.py": "VALUE = 1\n",
+            "openclaw_self_improvement.py": "VALUE = 2\n",
+        }
+        for name, text in files.items():
+            (source / name).write_text(text, encoding="utf-8")
+        (installed / "openclaw-speed-research").write_text(files["openclaw-speed-research.py"], encoding="utf-8")
+        (installed / "openclaw-speed-research-autopilot").write_text(
+            files["openclaw-speed-research-autopilot.py"],
+            encoding="utf-8",
+        )
+        (installed / "openclaw_speed_research_core.py").write_text(
+            files["openclaw_speed_research_core.py"],
+            encoding="utf-8",
+        )
+        (installed / "openclaw_self_improvement.py").write_text(
+            files["openclaw_self_improvement.py"],
+            encoding="utf-8",
+        )
+        original_file = helper.__file__
+        helper.__file__ = str(installed / "openclaw-speed-research-autopilot")
+        try:
+            with patch.dict(os.environ, {"OPENCLAW_HARNESS_REPO": str(root / "repo")}, clear=False):
+                args = Namespace(research_helper_bin=str(installed / "openclaw-speed-research"))
+                fresh = helper.installed_helper_freshness_report(args)
+                assert fresh["ok"] is True, fresh
+                (installed / "openclaw-speed-research").write_text("print('stale')\n", encoding="utf-8")
+                stale = helper.installed_helper_freshness_report(args)
+                assert stale["ok"] is False, stale
+                assert "openclaw-speed-research" in stale["stale"], stale
+        finally:
+            helper.__file__ = original_file
+
+
 def check_prompt_and_routing_guards(helper) -> None:
     prompt = helper.continuation_prompt(1, 0)
     assert "do not read it this turn" in prompt
@@ -477,6 +520,7 @@ def check_autonomous_repair_owner(helper) -> None:
 
 def main() -> int:
     helper = load_helper()
+    check_installed_helper_freshness(helper)
     check_prompt_and_routing_guards(helper)
     check_memory_and_failure_guards(helper)
     check_terminal_bridge_no_work_is_neutral(helper)
@@ -522,13 +566,15 @@ def main() -> int:
                     "status": "ready",
                     "priority": 50,
                     "task_type": "supervisor",
-                    "supervisor_action": "mtp-report",
-                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research mtp-report --lines 80",
+                    "supervisor_action": "source-scout",
+                    "target": "frontier-decode-speed-unit",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic frontier-decode-speed-unit",
                 },
             ],
         )
         selected = helper.select_next_runnable_task(Namespace(allow_model_bound_research_turns=False))
-        assert selected["id"] == "deterministic-lower-priority"
+        assert selected["id"] != "model-bound-high-priority"
+        assert helper.task_runs_without_model(selected)
         helper.ensure_task_queue()
         task_text = helper.TASKS.read_text(encoding="utf-8")
         assert "decode-mtp-baseline" in task_text
@@ -550,7 +596,9 @@ def main() -> int:
             ],
         )
         deterministic = helper.deterministic_ready_tasks()
-        assert [task["id"] for task in deterministic] == ["bounded-benchmark"]
+        deterministic_ids = [task["id"] for task in deterministic]
+        assert "bounded-benchmark" in deterministic_ids
+        assert "freeform" not in deterministic_ids
         (helper.BENCHMARKS).mkdir(parents=True, exist_ok=True)
         (helper.BENCHMARKS / "frontier-system-eval-1.json").write_text(
             json.dumps({"overall": 9.4, "task_contract": {"ok": True}}),

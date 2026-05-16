@@ -30,6 +30,7 @@ from openclaw_speed_research_core import (
     append_jsonl,
     benchmark_result_schema_ok,
     benchmark_spec,
+    block_operational_strategy_ready_tasks,
     causal_review_report,
     decode_measurement_signal,
     ensure_research_state,
@@ -41,14 +42,18 @@ from openclaw_speed_research_core import (
     latest_decode_mean,
     mark_lane_exhausted,
     measurement_artifact_analysis,
+    filter_operational_strategy_tasks,
     load_benchmark_manifest,
+    operational_strategy_memory,
     paired_profile_plan,
     read_jsonl,
     rank_tasks,
     replay_checks,
     score_insight,
+    semantic_task_key,
     seed_gepa_canary_task,
     suppress_stale_gepa_policy_canaries,
+    task_operational_blocker,
     task_contract_issues,
     task_contract_report,
     variance_analysis,
@@ -2018,8 +2023,67 @@ def adapter_logit_loop_saturated(root: Path, *, recent_rows: int = 240) -> bool:
     return bool(adapter_logit_loop_evidence(root, recent_rows=recent_rows)["saturated"])
 
 
+def repeated_frontier_escape_evidence(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    source_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep"
+        and (row.get("target") == "frontier-source-scout" or row.get("run_id", "").startswith("source-scout-"))
+    ]
+    mtp_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep"
+        and (row.get("target") == "mtp-acceptance-report" or row.get("run_id", "").startswith("mtp-report-"))
+    ]
+    synthesis_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep"
+        and row.get("target") == "synthesis"
+        and "agent-deliberation-mtp-acceptance-yield-" in row.get("notes", "")
+        and "agent-deliberation-source-scout-" in row.get("notes", "")
+    ]
+    candidate_exists = any_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-") or any(
+        "quant-safe-drafter-candidate" in " ".join(
+            [row.get("run_id", ""), row.get("target", ""), row.get("hypothesis", ""), row.get("notes", "")]
+        )
+        for row in rows
+    )
+    ready = (
+        adapter_logit_loop_saturated(root, recent_rows=max(240, recent_rows))
+        and len(source_rows) >= 2
+        and len(mtp_rows) >= 2
+        and not candidate_exists
+    )
+    return {
+        "ready": ready,
+        "source_scout_count": len(source_rows),
+        "mtp_report_count": len(mtp_rows),
+        "synthesis_escape_count": len(synthesis_rows),
+        "candidate_exists": candidate_exists,
+        "last_source_scout": source_rows[-1].get("run_id", "") if source_rows else "",
+        "last_mtp_report": mtp_rows[-1].get("run_id", "") if mtp_rows else "",
+    }
+
+
+def is_generic_frontier_escape_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    target = str(task.get("target", ""))
+    return (
+        action in {"source-scout", "mtp-report"}
+        or task_id.startswith("agent-deliberation-source-scout-")
+        or task_id.startswith("agent-deliberation-mtp-acceptance-yield-")
+        or target in {"external-speed-references", "openclaw-model-proxy.log"}
+    )
+
+
 def is_adapter_logit_loop_task(task: dict[str, Any]) -> bool:
     task_id = str(task.get("id", ""))
+    if task_id.startswith("agent-deliberation-quant-safe-drafter-candidate-"):
+        return False
     action = str(task.get("supervisor_action", ""))
     target = str(task.get("target", ""))
     hypothesis = str(task.get("hypothesis", "")).lower()
@@ -2070,6 +2134,11 @@ def actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         for row in rows
         if row.get("status") == "blocked"
         and not is_certification_blocked_row(row)
+        and not (
+            row.get("target") == "autoresearch-review-council"
+            and "decision=continue" in row.get("notes", "")
+            and "run progress-memory owner" in row.get("notes", "")
+        )
         and not is_known_terminal_calibration_blocked_row(row)
         and not is_known_calibration_memory_blocked_row(row)
         and not is_known_adapter_method_blocked_row(row)
@@ -2407,6 +2476,286 @@ def latest_keep_row_prefix(rows: list[dict[str, str]], prefix: str) -> dict[str,
     return {}
 
 
+def parse_float(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def speed_handoff_context(root: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
+    """Separate live TUI speed evidence from fixture-only candidate evidence."""
+    decode_rows = [row for row in rows if row.get("status") == "keep" and row.get("target") == "decode-sample"]
+    decode_values = [value for value in (parse_float(row.get("decode_tps")) for row in decode_rows) if value is not None]
+    latest_decode = decode_rows[-1] if decode_rows else {}
+    best_live = max(decode_values) if decode_values else None
+    candidate_fixture_tps: float | None = None
+    fixture_path = Path(__file__).with_name("test-drafter-fit.py")
+    try:
+        fixture_text = fixture_path.read_text(encoding="utf-8")
+    except OSError:
+        fixture_text = ""
+    if '"decode_tps": 45.5' in fixture_text or '"decode_tps":45.5' in fixture_text:
+        candidate_fixture_tps = 45.5
+    paired_live_candidate_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep"
+        and "candidate" in " ".join([row.get("run_id", ""), row.get("target", ""), row.get("hypothesis", ""), row.get("notes", "")]).lower()
+        and parse_float(row.get("decode_tps")) is not None
+    ]
+    return {
+        "live_tui_decode_tps": parse_float(latest_decode.get("decode_tps")),
+        "best_live_tui_decode_tps": best_live,
+        "latest_live_decode_run_id": latest_decode.get("run_id", ""),
+        "candidate_fixture_decode_tps": candidate_fixture_tps,
+        "candidate_fixture_source": str(fixture_path) if candidate_fixture_tps is not None else "",
+        "paired_live_candidate_evidence": bool(paired_live_candidate_rows),
+        "status": (
+            "candidate needs paired live TUI decode benchmark before promotion"
+            if candidate_fixture_tps is not None and not paired_live_candidate_rows
+            else "paired live candidate evidence exists"
+            if paired_live_candidate_rows
+            else "no candidate speed evidence yet"
+        ),
+    }
+
+
+def breakthrough_progress_context(
+    root: Path,
+    rows: list[dict[str, str]],
+    *,
+    target_tps: float = 30.0,
+) -> dict[str, Any]:
+    """State the speed breakthrough truth plainly so the loop cannot celebrate setup work."""
+    speed = speed_handoff_context(root, rows)
+    live_tps = parse_float(speed.get("live_tui_decode_tps"))
+    best_live_tps = parse_float(speed.get("best_live_tui_decode_tps"))
+    bottleneck = drafter_bottleneck_state(root, rows, recent_rows=240)
+    ready = [
+        task
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+        and is_deterministic_research_task(task)
+    ]
+    first_ready = ready[0] if ready else {}
+    achieved = bool(best_live_tps is not None and best_live_tps >= target_tps and speed.get("paired_live_candidate_evidence"))
+    if achieved:
+        status = "breakthrough_proven_live"
+        now = "run promotion safety replay, mark stable build, and monitor post-promotion decode"
+    elif first_ready:
+        status = "breakthrough_not_yet_proven"
+        now = f"execute_ready_task:{first_ready.get('id', '')}"
+    else:
+        status = "blocked_no_ready_breakthrough_task"
+        now = "run drafter-bottleneck-review to seed exactly one deterministic next task"
+    return {
+        "status": status,
+        "achieved": achieved,
+        "target_tps": target_tps,
+        "latest_live_tui_decode_tps": live_tps,
+        "best_live_tui_decode_tps": best_live_tps,
+        "candidate_fixture_decode_tps": speed.get("candidate_fixture_decode_tps"),
+        "candidate_fixture_is_proof": False,
+        "paired_live_candidate_evidence": bool(speed.get("paired_live_candidate_evidence")),
+        "current_bottleneck_state": bottleneck.get("state", ""),
+        "current_bottleneck_next_step": bottleneck.get("next_step", ""),
+        "exhausted": [
+            "MTP/block-size sweeps below target",
+            "current DFlash path without changed drafter candidate",
+            "direct quantized drafter training",
+            "trace-distillation through quantized drafter weights",
+            "adapter calibration path when it hits after-load memory pressure",
+        ],
+        "live_frontier": "quant-safe JANQ drafter candidate with frozen target/drafter and newly introduced correction parameters",
+        "now": now,
+        "ready_task": {
+            "id": str(first_ready.get("id", "")),
+            "target": str(first_ready.get("target", "")),
+            "metric": str(first_ready.get("metric", "")),
+            "next_action": str(first_ready.get("next_action", "")),
+        }
+        if first_ready
+        else {},
+    }
+
+
+def system_capability_context(root: Path, *, recent_rows: int = 160) -> dict[str, Any]:
+    """Summarize the operating contract that keeps autonomy useful and bounded."""
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    noise = canonical.get("noise") if isinstance(canonical.get("noise"), dict) else {}
+    quality = latest_json_artifact(root, "quality-review-*.json")
+    frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
+    autonomy = latest_json_artifact(root, "frontier-autonomy-score-*.json")
+    handoff = latest_json_artifact(root, "implementation-handoff-audit-*.json")
+    alive = self_improvement_alive_report(root, recent_rows=recent_rows)
+    profile_path = root / "research-profile.json"
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        profile = {}
+    scope = profile.get("scope") if isinstance(profile.get("scope"), dict) else {}
+    metrics = profile.get("metrics") if isinstance(profile.get("metrics"), dict) else {}
+    scorecard = quality.get("scorecard") if isinstance(quality.get("scorecard"), dict) else {}
+    return {
+        "self_improvement": {
+            "status": "active" if alive.get("ok") else "needs_repair",
+            "score": alive.get("total_score"),
+            "readiness": alive.get("readiness"),
+            "contract": "observe -> diagnose -> route -> canary/evolve in shadow -> contain; no active skill mutation without gates",
+        },
+        "autonomous_layer": {
+            "frontier_autonomy_score": autonomy.get("total_score"),
+            "frontier_autonomy_decision": autonomy.get("decision"),
+            "frontier_eval_overall": frontier.get("overall"),
+            "frontier_eval_readiness": frontier.get("readiness"),
+            "quality_score": quality.get("quality_score"),
+            "quality_verdict": quality.get("verdict"),
+            "handoff_score": handoff.get("score"),
+            "canonical_clean": canonical.get("clean"),
+            "active_noise": noise,
+        },
+        "modularity": {
+            "profile": profile.get("name", ""),
+            "objective": profile.get("objective", ""),
+            "allowed_lanes": scope.get("allowed_lanes", []),
+            "forbidden": scope.get("forbidden", []),
+            "primary_metrics": metrics.get("primary", []),
+            "secondary_metrics": metrics.get("secondary", []),
+            "topic_portable": bool(scope.get("allowed_lanes") and metrics.get("primary")),
+        },
+        "creative_problem_solving": {
+            "allowed": True,
+            "mode": "generate novel candidate hypotheses only as bounded tasks with acceptance, rollback, and evidence gates",
+            "forbidden": [
+                "counting repeated synthesis as progress",
+                "live profile mutation before paired benchmark proof",
+                "retrying exhausted lanes without materially new evidence",
+                "tool or reasoning output loops",
+                "secret/opencode/private-config changes",
+            ],
+            "next_best_move_source": "breakthrough_context.now",
+        },
+        "bad_behavior_guards": {
+            "zero_active_noise": all(int(noise.get(key, 0) or 0) == 0 for key in noise),
+            "loop_guards": "low-signal MTP/source loops, duplicate semantic tasks, exhausted lanes, and decode remeasure loops are suppressed",
+            "mutation_guards": "patch classifier, canary, Crabbox for high risk, rollback rehearsal, frontier autonomy score",
+        },
+    }
+
+
+def progress_memory_context(root: Path, rows: list[dict[str, str]], *, recent_rows: int = 240) -> dict[str, Any]:
+    """Durable progress ledger for restart-safe research continuity.
+
+    This is intentionally explicit and repetitive. Autonomy degrades when a
+    fresh session treats old evidence as a new idea, so the memory lane names
+    the current owner, what has already failed, what is merely diagnostic, and
+    which evidence is still required before the decode-speed outcome can move.
+    """
+
+    canonical = canonical_autoresearch_state(root, recent_rows=recent_rows)
+    breakthrough = breakthrough_progress_context(root, rows, target_tps=30.0)
+    speed = speed_handoff_context(root, rows)
+    operational = operational_strategy_memory(root, recent_rows=recent_rows)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    ready = [
+        task
+        for task in tasks
+        if task.get("status", "ready") in {"ready", "rework"}
+        and is_deterministic_research_task(task)
+        and not task_operational_blocker(root, task, memory=operational)
+    ]
+    ready.sort(key=lambda task: int(task.get("priority", 0) or 0), reverse=True)
+    owner = ready[0] if ready else {}
+    material_targets = {
+        "decode-sample",
+        "janq-drafter-calibration-canary",
+        "janq-drafter-fit-trace-data",
+        "calibration-memory-report",
+        "mtp-acceptance-report",
+        "runtime-overhead-map",
+        "frontier-source-scout",
+        "autoresearch-quality",
+        "autoresearch-frontier-eval",
+        "frontier-autonomy-score",
+    }
+    material_rows = [
+        row
+        for row in rows
+        if row.get("status") == "keep"
+        and (row.get("target") in material_targets or row.get("run_id", "").startswith("drafter-calibration-canary-"))
+    ]
+    latest_material = material_rows[-1] if material_rows else {}
+    semantic_blockers = operational.get("semantic_tasks", {}) if isinstance(operational.get("semantic_tasks"), dict) else {}
+    lane_reasons = {
+        lane: str(data.get("reason", ""))
+        for lane, data in exhausted_lanes(root).items()
+        if isinstance(data, dict)
+    }
+    return {
+        "version": 1,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "objective": "raise normal OpenClaw TUI decode speed for Gemma-4-31B-JANG/JANQ without changing the target model",
+        "primary_metric": "normal_openclaw_tui_decode_tps",
+        "target_tps": 30,
+        "current_status": breakthrough.get("status", ""),
+        "breakthrough_achieved": bool(breakthrough.get("achieved")),
+        "live_tui_decode_tps": speed.get("live_tui_decode_tps"),
+        "best_live_tui_decode_tps": speed.get("best_live_tui_decode_tps"),
+        "candidate_fixture_decode_tps": speed.get("candidate_fixture_decode_tps"),
+        "candidate_fixture_is_proof": False,
+        "paired_live_candidate_evidence": bool(speed.get("paired_live_candidate_evidence")),
+        "current_owner": {
+            "task_id": str(owner.get("id", "")),
+            "lane": str(owner.get("lane", "")),
+            "action": str(owner.get("supervisor_action", "")),
+            "target": str(owner.get("target", "")),
+            "metric": str(owner.get("metric", "")),
+            "next_action": str(owner.get("next_action", "")),
+        },
+        "current_bottleneck": {
+            "state": breakthrough.get("current_bottleneck_state", ""),
+            "next_step": breakthrough.get("current_bottleneck_next_step", ""),
+            "live_frontier": breakthrough.get("live_frontier", ""),
+        },
+        "latest_material_progress": {
+            "run_id": latest_material.get("run_id", ""),
+            "target": latest_material.get("target", ""),
+            "decode_tps": latest_material.get("decode_tps", ""),
+            "notes": clipped_text(latest_material.get("notes", ""), 320),
+        },
+        "already_done": [
+            "MTP/block-size sweeps plateaued below target; block-size repeats are not progress without new paired evidence.",
+            "DFlash/current draft compatibility is blocked until the draft candidate changes.",
+            "Direct quantized drafter training hit unsupported quantized-gradient behavior.",
+            "Adapter/logit and trace-distillation routes hit quantized-gradient or after-load memory blockers.",
+            "Calibration-memory reports are diagnostic; after them, source-scout/MTP reseeding is not progress.",
+        ],
+        "not_progress": [
+            "Repeating source-scout or MTP reports after calibration-memory reports.",
+            "Counting fixture-only 45.5 tok/s as a live TUI speed breakthrough.",
+            "Repeating block-size sweeps after plateau without changed candidate evidence.",
+            "Recording another blocker report without routing to a candidate, canary, or explicit external blocker.",
+        ],
+        "required_next_evidence": [
+            "Run the quant-safe drafter candidate gate.",
+            "Produce a bounded candidate/canary contract or explicit no-go reason.",
+            "Run paired live TUI decode benchmarks before promotion.",
+            "Keep tool/reasoning/stream/memory guards green before any live profile mutation.",
+        ],
+        "exhausted_lanes": lane_reasons,
+        "semantic_memory_blockers": semantic_blockers,
+        "canonical_state": {
+            "state": canonical.get("state"),
+            "clean": canonical.get("clean"),
+            "noise": canonical.get("noise", {}),
+            "next": canonical.get("next"),
+        },
+    }
+
+
 def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
     """Build a compact restart handoff so new sessions do not rediscover old work."""
     ensure_research_state(root)
@@ -2424,6 +2773,10 @@ def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, 
     latest_autonomy = latest_keep_row(recent, "frontier-autonomy-score")
     latest_handoff = latest_keep_row(recent, "autoresearch-implementation-handoff")
     latest_adapter_contract = latest_keep_row_prefix(recent, "drafter-adapter-method-contract-")
+    speed_context = speed_handoff_context(root, rows)
+    breakthrough_context = breakthrough_progress_context(root, rows, target_tps=30.0)
+    capability_context = system_capability_context(root, recent_rows=max(120, int(recent_rows)))
+    progress_context = progress_memory_context(root, rows, recent_rows=max(240, int(recent_rows)))
     return {
         "version": 1,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2445,6 +2798,24 @@ def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, 
             "breakthrough_lanes": canonical.get("breakthrough_lanes", []),
             "exhausted_lanes": canonical.get("exhausted_lanes", []),
         },
+        "speed_context": speed_context,
+        "breakthrough_context": breakthrough_context,
+        "system_capability_context": capability_context,
+        "progress_memory": progress_context,
+        "worked_on": [
+            "Block-size/MTP sweep work converged around block size 2; repeat sweeps are not progress without new evidence.",
+            "DFlash/current draft compatibility has been blocked unless the draft candidate materially changes.",
+            "Direct, trace-distillation, and adapter/logit calibration attempts hit quantized-gradient or after-load memory blockers.",
+            "Generic source-scout and MTP-report loops are disallowed while the JANQ drafter bottleneck is active.",
+            "The current live TUI decode baseline is roughly the latest decode-sample result, not the 45.5 tok/s fixture.",
+        ],
+        "next_clear_tests": [
+            "Run the quant-safe drafter candidate focused gate and confirm it produces a bounded candidate contract, not another source/MTP loop.",
+            "For any source patch or high-risk candidate, run Crabbox/sandbox evidence before local promotion.",
+            "Run paired live TUI decode benchmarks: current baseline drafter versus candidate, same prompts and token budget.",
+            "Require acceptance, TTFT, memory, stream, tool-call, and reasoning-leak gates before promotion.",
+            "Promote only if paired live candidate speed beats baseline and the rollback path is rehearsed.",
+        ],
         "latest_signals": {
             "decode_sample": {
                 "decode_tps": latest_decode.get("decode_tps", ""),
@@ -2465,6 +2836,7 @@ def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, 
                 "target": str(task.get("target", "")),
                 "priority": task.get("priority", ""),
                 "hypothesis": clipped_text(task.get("hypothesis", ""), 260),
+                "next_action": clipped_text(task.get("next_action", ""), 260),
             }
             for task in deterministic_ready[:8]
         ],
@@ -2473,6 +2845,7 @@ def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, 
             "Do not repeat block-size sweeps as progress after block 2 has converged unless new evidence appears.",
             "Do not re-record terminal adapter/calibration blockers as active noise; route them to an executable canary or candidate change.",
             "Do not treat clean-but-no-ready-work as success; seed a deterministic next action or declare an external blocker.",
+            "Do not call the speed work a breakthrough until paired live TUI decode evidence beats the target.",
         ],
         "exhausted_lane_reasons": {
             lane: clipped_text(data.get("reason", ""), 260)
@@ -2481,6 +2854,7 @@ def restart_context_payload(root: Path, *, recent_rows: int = 120) -> dict[str, 
         },
         "restart_instructions": [
             "Read this file before SUMMARY.md on every fresh research session.",
+            "Treat candidate fixture speed as unproven until paired live TUI evidence exists.",
             "Prefer the first ready deterministic task over synthesis.",
             "If there are no ready deterministic tasks, run quality-review then synthesize --kind frontier once.",
             "Record new evidence instead of repeating the last terminal report.",
@@ -2514,9 +2888,127 @@ def render_run_memory(memory: dict[str, Any]) -> str:
         f"- exhausted_lanes: {', '.join(state.get('exhausted_lanes', []) or []) or 'none'}",
         f"- active_noise: {json.dumps(state.get('noise', {}), sort_keys=True)}",
         "",
-        "## Latest Signals",
+        "## Live Speed vs Candidate Speed",
         "",
     ]
+    speed = memory.get("speed_context", {}) if isinstance(memory.get("speed_context"), dict) else {}
+    for key in (
+        "live_tui_decode_tps",
+        "best_live_tui_decode_tps",
+        "latest_live_decode_run_id",
+        "candidate_fixture_decode_tps",
+        "candidate_fixture_source",
+        "paired_live_candidate_evidence",
+        "status",
+    ):
+        value = speed.get(key, "")
+        if value not in ("", None):
+            lines.append(f"- {key}: {value}")
+    breakthrough = (
+        memory.get("breakthrough_context", {})
+        if isinstance(memory.get("breakthrough_context"), dict)
+        else {}
+    )
+    lines.extend([
+        "",
+        "## Breakthrough Truth",
+        "",
+    ])
+    for key in (
+        "status",
+        "achieved",
+        "target_tps",
+        "latest_live_tui_decode_tps",
+        "best_live_tui_decode_tps",
+        "candidate_fixture_decode_tps",
+        "candidate_fixture_is_proof",
+        "paired_live_candidate_evidence",
+        "current_bottleneck_state",
+        "current_bottleneck_next_step",
+        "live_frontier",
+        "now",
+    ):
+        value = breakthrough.get(key, "")
+        if value not in ("", None):
+            lines.append(f"- {key}: {value}")
+    ready_task = breakthrough.get("ready_task", {}) if isinstance(breakthrough.get("ready_task"), dict) else {}
+    if ready_task:
+        lines.append(
+            "- ready_task: "
+            f"{ready_task.get('id', '')} target={ready_task.get('target', '')} "
+            f"metric={ready_task.get('metric', '')} next_action={ready_task.get('next_action', '')}"
+        )
+    exhausted_now = breakthrough.get("exhausted", [])
+    if isinstance(exhausted_now, list) and exhausted_now:
+        lines.append("- exhausted_now: " + "; ".join(str(item) for item in exhausted_now))
+    progress = memory.get("progress_memory", {}) if isinstance(memory.get("progress_memory"), dict) else {}
+    owner = progress.get("current_owner", {}) if isinstance(progress.get("current_owner"), dict) else {}
+    bottleneck = progress.get("current_bottleneck", {}) if isinstance(progress.get("current_bottleneck"), dict) else {}
+    lines.extend([
+        "",
+        "## Progress Memory Lane",
+        "",
+        f"- objective: {progress.get('objective', '')}",
+        f"- current_owner: {owner.get('task_id', '') or 'none'} action={owner.get('action', '')} next_action={owner.get('next_action', '')}",
+        f"- bottleneck: state={bottleneck.get('state', '')} next_step={bottleneck.get('next_step', '')}",
+        f"- live_tui_decode_tps: {progress.get('live_tui_decode_tps', '')}",
+        f"- best_live_tui_decode_tps: {progress.get('best_live_tui_decode_tps', '')}",
+        f"- breakthrough_achieved: {progress.get('breakthrough_achieved', '')}",
+    ])
+    for item in progress.get("not_progress", []) or []:
+        lines.append(f"- not_progress: {item}")
+    capability = (
+        memory.get("system_capability_context", {})
+        if isinstance(memory.get("system_capability_context"), dict)
+        else {}
+    )
+    autonomy = capability.get("autonomous_layer", {}) if isinstance(capability.get("autonomous_layer"), dict) else {}
+    self_improvement = capability.get("self_improvement", {}) if isinstance(capability.get("self_improvement"), dict) else {}
+    modularity = capability.get("modularity", {}) if isinstance(capability.get("modularity"), dict) else {}
+    creative = capability.get("creative_problem_solving", {}) if isinstance(capability.get("creative_problem_solving"), dict) else {}
+    guards = capability.get("bad_behavior_guards", {}) if isinstance(capability.get("bad_behavior_guards"), dict) else {}
+    lines.extend([
+        "",
+        "## Autonomy, Modularity, And Self-Improvement",
+        "",
+        f"- self_improvement_status: {self_improvement.get('status', '')}",
+        f"- self_improvement_score: {self_improvement.get('score', '')}",
+        f"- self_improvement_contract: {self_improvement.get('contract', '')}",
+        f"- frontier_autonomy_score: {autonomy.get('frontier_autonomy_score', '')}",
+        f"- frontier_autonomy_decision: {autonomy.get('frontier_autonomy_decision', '')}",
+        f"- quality: score={autonomy.get('quality_score', '')} verdict={autonomy.get('quality_verdict', '')}",
+        f"- handoff_score: {autonomy.get('handoff_score', '')}",
+        f"- canonical_clean: {autonomy.get('canonical_clean', '')}",
+        f"- active_noise: {json.dumps(autonomy.get('active_noise', {}), sort_keys=True)}",
+        f"- modular_profile: {modularity.get('profile', '')}",
+        f"- modular_objective: {modularity.get('objective', '')}",
+        f"- topic_portable: {modularity.get('topic_portable', '')}",
+        f"- allowed_lanes: {', '.join(modularity.get('allowed_lanes', []) or [])}",
+        f"- primary_metrics: {', '.join(modularity.get('primary_metrics', []) or [])}",
+        f"- creative_mode: {creative.get('mode', '')}",
+        f"- zero_active_noise_gate: {guards.get('zero_active_noise', '')}",
+        f"- loop_guards: {guards.get('loop_guards', '')}",
+        f"- mutation_guards: {guards.get('mutation_guards', '')}",
+    ])
+    lines.extend([
+        "",
+        "## What Has Been Worked On",
+        "",
+    ])
+    for item in memory.get("worked_on", []) or []:
+        lines.append(f"- {item}")
+    lines.extend([
+        "",
+        "## Next Clear Tests",
+        "",
+    ])
+    for index, item in enumerate(memory.get("next_clear_tests", []) or [], start=1):
+        lines.append(f"{index}. {item}")
+    lines.extend([
+        "",
+        "## Latest Signals",
+        "",
+    ])
     for name in ("decode_sample", "mtp_acceptance", "quality", "frontier_eval", "autonomy", "handoff", "adapter_contract"):
         signal = signals.get(name, {}) if isinstance(signals.get(name), dict) else {}
         bits = []
@@ -2531,7 +3023,8 @@ def render_run_memory(memory: dict[str, Any]) -> str:
         for task in ready_tasks:
             lines.append(
                 f"- {task.get('id', '')}: lane={task.get('lane', '')} action={task.get('supervisor_action', '')} "
-                f"target={task.get('target', '')} hypothesis={task.get('hypothesis', '')}"
+                f"target={task.get('target', '')} hypothesis={task.get('hypothesis', '')} "
+                f"next_action={task.get('next_action', '')}"
             )
     else:
         lines.append("- none")
@@ -2549,10 +3042,194 @@ def render_run_memory(memory: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_progress_memory(progress: dict[str, Any]) -> str:
+    """Render the durable research progress ledger.
+
+    RUN_MEMORY.md is a broad restart handoff. PROGRESS.md is narrower: it
+    names the owner, the exact evidence still missing, and the work that must
+    not be repeated. This gives fresh sessions a stable memory lane before
+    they generate or schedule new work.
+    """
+
+    owner = progress.get("current_owner", {}) if isinstance(progress.get("current_owner"), dict) else {}
+    bottleneck = (
+        progress.get("current_bottleneck", {})
+        if isinstance(progress.get("current_bottleneck"), dict)
+        else {}
+    )
+    latest = (
+        progress.get("latest_material_progress", {})
+        if isinstance(progress.get("latest_material_progress"), dict)
+        else {}
+    )
+    canonical = (
+        progress.get("canonical_state", {})
+        if isinstance(progress.get("canonical_state"), dict)
+        else {}
+    )
+    lines = [
+        "# OpenClaw Research Progress Memory",
+        "",
+        "This file is the durable memory lane for autoresearch. Read it before creating new tasks so the loop continues the current frontier instead of rediscovering old work.",
+        "",
+        "## Current Owner",
+        "",
+        f"- task_id: {owner.get('task_id', '') or 'none'}",
+        f"- lane: {owner.get('lane', '')}",
+        f"- action: {owner.get('action', '')}",
+        f"- target: {owner.get('target', '')}",
+        f"- metric: {owner.get('metric', '')}",
+        f"- next_action: {owner.get('next_action', '')}",
+        "",
+        "## Outcome Metric",
+        "",
+        f"- objective: {progress.get('objective', '')}",
+        f"- primary_metric: {progress.get('primary_metric', '')}",
+        f"- target_tps: {progress.get('target_tps', '')}",
+        f"- current_status: {progress.get('current_status', '')}",
+        f"- breakthrough_achieved: {progress.get('breakthrough_achieved', '')}",
+        f"- live_tui_decode_tps: {progress.get('live_tui_decode_tps', '')}",
+        f"- best_live_tui_decode_tps: {progress.get('best_live_tui_decode_tps', '')}",
+        f"- candidate_fixture_decode_tps: {progress.get('candidate_fixture_decode_tps', '')}",
+        f"- candidate_fixture_is_proof: {progress.get('candidate_fixture_is_proof', '')}",
+        f"- paired_live_candidate_evidence: {progress.get('paired_live_candidate_evidence', '')}",
+        "",
+        "## Current Bottleneck",
+        "",
+        f"- state: {bottleneck.get('state', '')}",
+        f"- next_step: {bottleneck.get('next_step', '')}",
+        f"- live_frontier: {bottleneck.get('live_frontier', '')}",
+        "",
+        "## Latest Material Progress",
+        "",
+        f"- run_id: {latest.get('run_id', '')}",
+        f"- target: {latest.get('target', '')}",
+        f"- decode_tps: {latest.get('decode_tps', '')}",
+        f"- notes: {latest.get('notes', '')}",
+        "",
+        "## Already Done",
+        "",
+    ]
+    already_done = progress.get("already_done", []) if isinstance(progress.get("already_done"), list) else []
+    if already_done:
+        for item in already_done:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "## Not Progress", ""])
+    not_progress = progress.get("not_progress", []) if isinstance(progress.get("not_progress"), list) else []
+    if not_progress:
+        for item in not_progress:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none recorded")
+    lines.extend(["", "## Required Next Evidence", ""])
+    required = (
+        progress.get("required_next_evidence", [])
+        if isinstance(progress.get("required_next_evidence"), list)
+        else []
+    )
+    if required:
+        for index, item in enumerate(required, start=1):
+            lines.append(f"{index}. {item}")
+    else:
+        lines.append("1. no required evidence recorded")
+    exhausted = progress.get("exhausted_lanes", {})
+    if isinstance(exhausted, dict) and exhausted:
+        lines.extend(["", "## Exhausted Lanes", ""])
+        for lane, reason in sorted(exhausted.items()):
+            lines.append(f"- {lane}: {reason or 'recorded exhausted'}")
+    blockers = progress.get("semantic_memory_blockers", {})
+    if isinstance(blockers, dict) and blockers:
+        lines.extend(["", "## Semantic Blockers", ""])
+        for key, value in sorted(blockers.items()):
+            if isinstance(value, dict):
+                reason = value.get("reason") or value.get("required_evidence") or json.dumps(value, sort_keys=True)
+            else:
+                reason = str(value)
+            lines.append(f"- {key}: {reason}")
+    lines.extend([
+        "",
+        "## Restart Contract",
+        "",
+        f"- canonical_state: {canonical.get('state', '')}",
+        f"- canonical_clean: {canonical.get('clean', '')}",
+        f"- canonical_next: {canonical.get('next', '')}",
+        f"- active_noise: {json.dumps(canonical.get('noise', {}), sort_keys=True)}",
+        "- If the current owner exists, execute or repair that owner before adding synthesis work.",
+        "- If the owner is missing, run the quality review and seed one deterministic next action.",
+        "- Do not count any item in Not Progress as progress unless new evidence changes its prerequisite.",
+        "- Treat missing evidence as blocked, not as permission to restart old lanes.",
+    ])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def progress_memory_preflight(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
+    """Refresh and read the durable progress lane before strategic review."""
+
+    memory = write_restart_context(root, recent_rows=recent_rows)
+    progress = memory.get("progress_memory", {}) if isinstance(memory.get("progress_memory"), dict) else {}
+    owner = progress.get("current_owner", {}) if isinstance(progress.get("current_owner"), dict) else {}
+    bottleneck = progress.get("current_bottleneck", {}) if isinstance(progress.get("current_bottleneck"), dict) else {}
+    task_id = str(owner.get("task_id", ""))
+    next_action = str(owner.get("next_action", ""))
+    ready_ids = {
+        str(task.get("id", ""))
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    }
+    owner_ready = bool(task_id and task_id in ready_ids)
+    docs = {
+        "progress_json": str(root / "progress-memory.json"),
+        "progress_md": str(root / "PROGRESS.md"),
+        "run_memory": str(root / "RUN_MEMORY.md"),
+        "restart_context": str(root / "restart-context.json"),
+    }
+    docs_present = all(Path(path).exists() for path in docs.values())
+    if owner_ready:
+        phase = "execute-progress-owner"
+        decision = "continue"
+        path_action = f"run progress owner {task_id}"
+    elif next_action:
+        phase = "repair-progress-owner"
+        decision = "repair"
+        path_action = "repair or reseed missing progress owner before synthesis"
+    else:
+        phase = "derive-next-owner"
+        decision = "repair"
+        path_action = "run quality review and seed exactly one deterministic owner"
+    return {
+        "ok": bool(docs_present and progress),
+        "docs": docs,
+        "docs_present": docs_present,
+        "progress_memory": progress,
+        "deterministic_path": {
+            "phase": phase,
+            "decision": decision,
+            "action": path_action,
+            "owner_ready": owner_ready,
+            "owner_task_id": task_id,
+            "owner_next_action": next_action,
+            "bottleneck_state": bottleneck.get("state", ""),
+            "bottleneck_next_step": bottleneck.get("next_step", ""),
+            "breakthrough_achieved": bool(progress.get("breakthrough_achieved")),
+            "not_progress": progress.get("not_progress", []) if isinstance(progress.get("not_progress"), list) else [],
+            "required_next_evidence": (
+                progress.get("required_next_evidence", [])
+                if isinstance(progress.get("required_next_evidence"), list)
+                else []
+            ),
+        },
+    }
+
+
 def write_restart_context(root: Path, *, recent_rows: int = 120) -> dict[str, Any]:
     memory = restart_context_payload(root, recent_rows=recent_rows)
     write_if_changed(root / "restart-context.json", json.dumps(memory, indent=2, sort_keys=True) + "\n")
     write_if_changed(root / "RUN_MEMORY.md", render_run_memory(memory))
+    progress = memory.get("progress_memory", {}) if isinstance(memory.get("progress_memory"), dict) else {}
+    write_if_changed(root / "progress-memory.json", json.dumps(progress, indent=2, sort_keys=True) + "\n")
+    write_if_changed(root / "PROGRESS.md", render_progress_memory(progress))
     return memory
 
 
@@ -2903,6 +3580,8 @@ def compact_terminal_calibration_tasks(root: Path) -> int:
             or "drafter-calibration-run" in task_id
         ):
             continue
+        if calibration_task_mode(task) == CALIBRATION_ADAPTER_MODE:
+            continue
         if is_trace_distillation_task(task) and not distillation_failed:
             continue
         task["status"] = "done"
@@ -3027,10 +3706,22 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
     existing = read_jsonl(path)
     changed = False
     active_ids: set[str] = set()
+    active_semantic_keys: set[str] = set()
+    active_semantic_owners: dict[str, str] = {}
     for task in existing:
         task_id = str(task.get("id", ""))
         if not task_id or task.get("status", "ready") not in {"ready", "rework"}:
             continue
+        semantic_key = semantic_task_key(task)
+        if semantic_key in active_semantic_keys:
+            task["status"] = "blocked"
+            task["blocked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            task["blocked_reason"] = f"duplicate active semantic task compacted by upsert: {semantic_key}"
+            task["semantic_task_key"] = semantic_key
+            task["supervisor_summary"] = {"reason": "duplicate active semantic task compacted by upsert"}
+            changed = True
+            continue
+        active_semantic_keys.add(semantic_key)
         if task_id in active_ids:
             task["status"] = "done"
             task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -3038,6 +3729,7 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
             changed = True
         else:
             active_ids.add(task_id)
+            active_semantic_owners[semantic_key] = task_id
     existing_by_id: dict[str, int] = {}
     for index, task in enumerate(existing):
         task_id = str(task.get("id", ""))
@@ -3056,12 +3748,18 @@ def upsert_tasks(root: Path, tasks: list[dict[str, Any]]) -> int:
         task_id = str(task.get("id", ""))
         if not task_id:
             continue
+        semantic_key = semantic_task_key(task)
+        semantic_owner = active_semantic_owners.get(semantic_key)
+        if semantic_owner and semantic_owner != task_id:
+            continue
         stage_key = calibration_memory_stage_key(task)
         if stage_key and (stage_key in active_stage_keys or stage_key in completed_stages):
             continue
         if task_id not in existing_by_id:
             existing.append(task)
             existing_by_id[task_id] = len(existing) - 1
+            active_semantic_keys.add(semantic_key)
+            active_semantic_owners[semantic_key] = task_id
             if stage_key:
                 active_stage_keys.add(stage_key)
             additions += 1
@@ -3108,6 +3806,22 @@ def recent_keep_result_has_prefix(root: Path, prefix: str, *, recent_rows: int =
 def active_task_has_prefix(root: Path, prefix: str) -> bool:
     return any(
         task.get("status", "ready") in {"ready", "rework"} and str(task.get("id", "")).startswith(prefix)
+        for task in read_jsonl(root / "tasks.jsonl")
+    )
+
+
+def active_task_has_any_prefix(root: Path, prefixes: tuple[str, ...]) -> bool:
+    return any(
+        task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("id", "")).startswith(prefixes)
+        for task in read_jsonl(root / "tasks.jsonl")
+    )
+
+
+def active_task_has_action(root: Path, actions: set[str]) -> bool:
+    return any(
+        task.get("status", "ready") in {"ready", "rework"}
+        and str(task.get("supervisor_action", "")) in actions
         for task in read_jsonl(root / "tasks.jsonl")
     )
 
@@ -3801,6 +4515,7 @@ def drafter_bottleneck_state(
     )
     fallback_decode_count = recent_lane_contract_decode_fallback_count(root, recent_rows=min(recent_rows, 80))
     adapter_loop = adapter_logit_loop_evidence(root, recent_rows=recent_rows)
+    quant_safe_candidate_active = active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-")
     historical_bottleneck = (
         blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
         or bool(terminal_blocks)
@@ -3818,6 +4533,9 @@ def drafter_bottleneck_state(
     if not historical_bottleneck:
         state = "no_terminal_quantized_blocker"
         next_step = "continue_current_lane_contract"
+    elif quant_safe_candidate_active:
+        state = "quant_safe_candidate_ready"
+        next_step = "run_quant_safe_candidate_gate"
     elif adapter_loop["saturated"]:
         state = "adapter_logit_loop_exhausted"
         next_step = "seed_frontier_deliberation_escape"
@@ -3898,6 +4616,7 @@ def drafter_bottleneck_state(
         "adapter_calibration_active": adapter_calibration_active,
         "adapter_calibration_attempted": adapter_calibration_attempted,
         "adapter_calibration_stage_issue": adapter_calibration_stage_issue,
+        "quant_safe_candidate_active": quant_safe_candidate_active,
         "fallback_decode_count": fallback_decode_count,
         "adapter_logit_loop": adapter_loop,
     }
@@ -3998,6 +4717,8 @@ def drafter_bottleneck_next_tasks(
 ) -> list[dict[str, Any]]:
     state = drafter_bottleneck_state(root, rows, recent_rows=240)
     step = state["next_step"]
+    if active_drafter_bottleneck_route(root) and step != "seed_adapter_calibration_canary":
+        return []
     if step.startswith("wait_for_"):
         recent_wait = any(
             item.get("task_id") == "drafter-bottleneck-wait" and item.get("next") == step
@@ -4022,6 +4743,15 @@ def drafter_bottleneck_next_tasks(
             [drafter_trace_collect_task(timestamp, task_id=f"drafter-bottleneck-trace-collect-{timestamp}")],
         )
     if step == "seed_trace_distillation":
+        canary_tasks = drafter_calibration_breakthrough_tasks(
+            root,
+            timestamp,
+            task_id=f"drafter-calibration-canary-{timestamp}",
+            priority=99,
+            recent_rows=240,
+        )
+        if canary_tasks:
+            return canary_tasks
         distillation_task = trace_distillation_candidate_task(
             root,
             timestamp,
@@ -4066,20 +4796,26 @@ def drafter_bottleneck_next_tasks(
             [drafter_adapter_method_implementation_task(timestamp)],
         )
     if step == "seed_adapter_calibration_memory_report":
-        return filter_seedable_tasks(
+        report_tasks = filter_seedable_tasks(
             root,
             calibration_blocker_report_tasks(root, timestamp, blocker="calibration-memory-after-load"),
         )
-    if step == "seed_frontier_deliberation_escape":
+        if report_tasks:
+            return report_tasks
         evidence = {
-            "reason": "adapter/logit blocker loop saturated",
+            "reason": "adapter calibration memory report route exhausted; promote a quantization-safe drafter candidate instead of source-scout/MTP reseeding",
             "bottleneck_state": state,
         }
-        tasks = [
-            mtp_acceptance_yield_task(timestamp, evidence=evidence),
-            source_scout_task(timestamp, evidence=evidence),
-        ]
-        return filter_seedable_tasks(root, tasks)
+        return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
+    if step == "seed_frontier_deliberation_escape":
+        candidate_tasks = frontier_escape_candidate_tasks(root, rows if rows is not None else result_rows(root), timestamp)
+        if candidate_tasks:
+            return candidate_tasks
+        evidence = {
+            "reason": "adapter/logit blocker loop saturated; generic source-scout/MTP fallback is disallowed",
+            "bottleneck_state": state,
+        }
+        return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
     if step == "seed_adapter_calibration_canary":
         if active_task_has_prefix(root, "adapter-drafter-calibration-canary-"):
             return []
@@ -4100,15 +4836,34 @@ def drafter_bottleneck_next_tasks(
 
 
 def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120) -> bool:
-    if drafter_bottleneck_state(root, recent_rows=recent_rows)["state"] != "no_terminal_quantized_blocker":
+    state = drafter_bottleneck_state(root, recent_rows=recent_rows)["state"]
+    if state not in {"no_terminal_quantized_blocker", "trace_data_ready"}:
         return False
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
-    return bool(existing_drafter_trace_paths()) and should_seed_action(
+    if active_drafter_bottleneck_route(root):
+        return False
+    return recent_drafter_trace_ready(root, recent_rows=recent_rows) and should_seed_action(
         root,
         "drafter-calibration-canary-",
         recent_rows=recent_rows,
     )
+
+
+def should_seed_quant_safe_drafter_canary(root: Path, *, recent_rows: int = 240) -> bool:
+    """Advance the post-deliberation JANQ route instead of falling back to scout loops."""
+
+    state = drafter_bottleneck_state(root, recent_rows=recent_rows)
+    quant_safe_active = active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-")
+    if not quant_safe_active and state.get("state") not in {"quant_safe_candidate_ready", "adapter_logit_loop_exhausted"}:
+        return False
+    if not existing_drafter_trace_paths():
+        return False
+    if active_task_has_prefix(root, "adapter-drafter-calibration-canary-"):
+        return False
+    if active_task_has_prefix(root, "drafter-calibration-canary-"):
+        return False
+    return should_seed_action(root, "adapter-drafter-calibration-canary-", recent_rows=recent_rows)
 
 
 def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -> bool:
@@ -4239,6 +4994,82 @@ def recent_drafter_trace_missing(root: Path, *, recent_rows: int = 120) -> bool:
         )
         and "target-generated-trace-data-missing" in row.get("notes", "")
         for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
+def recent_drafter_trace_ready(root: Path, *, recent_rows: int = 160) -> bool:
+    if existing_drafter_trace_paths():
+        return True
+    return any(
+        (
+            row.get("run_id", "").startswith("drafter-trace-gate-")
+            or row.get("run_id", "").startswith("supervisor-drafter-trace-gate-")
+        )
+        and "target-generated-trace-data-present" in row.get("notes", "")
+        for row in result_rows(root)[-max(1, recent_rows) :]
+    )
+
+
+def active_drafter_bottleneck_route(root: Path) -> bool:
+    """Return true when a deterministic JANQ drafter route is already queued."""
+    return active_task_has_action(
+        root,
+        {
+            "drafter-calibration-canary",
+            "drafter-calibration-memory-stage",
+            "drafter-calibration-run",
+            "calibration-memory-report",
+            "drafter-adapter-method-contract",
+        },
+    ) or active_task_has_any_prefix(
+        root,
+        (
+            "drafter-calibration-canary-",
+            "deliberate-drafter-calibration-canary-",
+            "review-drafter-calibration-canary-",
+            "handoff-audit-drafter-calibration-canary-",
+            "lane-contract-drafter-calibration-canary-",
+            "adapter-drafter-calibration-canary-",
+            "drafter-calibration-memory-stage-",
+            "drafter-calibration-run-",
+            "calibration-memory-report-",
+            "drafter-adapter-method-contract-",
+            "implementation-drafter-adapter-method-",
+            "trace-distillation-gradient-repair-",
+            "trace-distillation-adapter-bridge-",
+            "agent-deliberation-quant-safe-drafter-candidate-",
+        ),
+    )
+
+
+def drafter_calibration_breakthrough_tasks(
+    root: Path,
+    timestamp: int,
+    *,
+    task_id: str,
+    priority: int = 99,
+    recent_rows: int = 160,
+) -> list[dict[str, Any]]:
+    """Codex-style tripwire: trace-ready drafter work must hand off to calibration, not churn."""
+    if not recent_drafter_fit_plan_ready(root, recent_rows=max(160, recent_rows)):
+        return []
+    if not recent_drafter_trace_ready(root, recent_rows=max(160, recent_rows)):
+        return []
+    if active_drafter_bottleneck_route(root):
+        return []
+    if recent_calibration_run_hard_blocker(root, recent_rows=max(160, recent_rows)) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
+        return []
+    if not should_seed_action(root, "drafter-calibration-canary-", recent_rows=recent_rows):
+        return []
+    return filter_seedable_tasks(
+        root,
+        [
+            drafter_calibration_canary_task(
+                timestamp,
+                task_id=unique_task_id(root, task_id),
+                priority=priority,
+            )
+        ],
     )
 
 
@@ -4756,18 +5587,20 @@ def lane_contract_fallback_tasks(
 def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop tasks from retired lanes before they enter the durable queue."""
     ensure_lane_contracts(root)
+    operational_strategy_memory(root)
     exhausted = exhausted_lanes(root)
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
     runtime_clean_exhausted = runtime_overhead_repeated_clean(root, recent_rows=160)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
     adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
+    bottleneck_state = drafter_bottleneck_state(root, recent_rows=240)
     active_calibration_stages = {
         calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
     }
     has_active_calibration_stage = bool(active_calibration_stages - {""})
     completed_calibration_stages = completed_calibration_memory_stages(root)
     seedable: list[dict[str, Any]] = []
-    for task in tasks:
+    for task in filter_operational_strategy_tasks(root, tasks):
         lane = str(task.get("lane", ""))
         task_id = str(task.get("id", ""))
         action = str(task.get("supervisor_action", ""))
@@ -4787,6 +5620,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             continue
         if adapter_loop_saturated and is_adapter_logit_loop_task(task):
             continue
+        if bottleneck_state["state"] != "no_terminal_quantized_blocker" and is_generic_frontier_escape_task(task):
+            continue
         if has_active_calibration_stage and (
             action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
         ):
@@ -4800,6 +5635,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
                 action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
             )
         if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+            if is_generic_frontier_escape_task(task):
+                continue
             calibration_blocked_action = calibration_blocked_action or (
                 action == "drafter-calibration-memory-stage"
                 or "drafter-calibration-memory-stage" in task_id
@@ -5007,6 +5844,18 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
     dflash_blocked = dflash_suppressed or dflash_lane_is_blocked(root, recent_rows=160) or "frontier-dflash" in exhausted
     bottleneck_state = drafter_bottleneck_state(root, rows, recent_rows=240)
 
+    breakthrough_tasks = drafter_calibration_breakthrough_tasks(
+        root,
+        timestamp,
+        task_id=f"deliberate-drafter-calibration-canary-{timestamp}",
+        priority=99,
+        recent_rows=240,
+    )
+    if breakthrough_tasks:
+        return breakthrough_tasks
+    if active_drafter_bottleneck_route(root):
+        return []
+
     if bottleneck_state["state"] != "no_terminal_quantized_blocker":
         bottleneck_tasks = drafter_bottleneck_next_tasks(
             root,
@@ -5016,7 +5865,11 @@ def synthesis_deliberate_action_tasks(root: Path, rows: list[dict[str, str]], ti
         )
         if bottleneck_tasks:
             return bottleneck_tasks
+        if active_drafter_bottleneck_route(root):
+            return []
         if str(bottleneck_state["next_step"]).startswith("wait_for_"):
+            return []
+        if str(bottleneck_state["next_step"]) != "seed_frontier_deliberation_escape":
             return []
 
     if block_sweep_converged and below_practical_floor:
@@ -5385,6 +6238,51 @@ def agent_deliberation_task(timestamp: int, *, slug: str, priority: int, target:
     return task
 
 
+def quant_safe_drafter_candidate_task(timestamp: int, *, evidence: dict[str, Any]) -> dict[str, Any]:
+    task = agent_deliberation_task(
+        timestamp,
+        slug="quant-safe-drafter-candidate",
+        priority=100,
+        target="openclaw/openclaw-mtp-drafter-calibrate.py",
+        hypothesis=(
+            "The JANQ drafter route is past observation: direct, trace-distillation, and adapter/logit attempts "
+            "hit quantized-gradient or after-load memory blockers. Create the next quantization-safe drafter "
+            "candidate that trains only newly introduced correction parameters from frozen JANQ traces."
+        ),
+        acceptance=(
+            "A canary-only candidate contract names the new trainable surface, proves the JANQ target and "
+            "quantized drafter remain frozen, rejects another source-scout/MTP-only loop, and defines paired "
+            "TUI decode promotion gates for TPS, TTFT, memory, tool calling, and stream hygiene."
+        ),
+        evidence=evidence,
+    )
+    task["metric"] = "quant_safe_drafter_candidate_gate"
+    task["next_action"] = "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-prerequisite"
+    task["source_files"] = [
+        "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "openclaw/test-mtp-drafter-calibrate-guards.py",
+        "openclaw/test-speed-research.py",
+    ]
+    return task
+
+
+def frontier_escape_candidate_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
+    loop = repeated_frontier_escape_evidence(root, recent_rows=180)
+    if not loop["ready"]:
+        return []
+    bottleneck = drafter_bottleneck_state(root, rows, recent_rows=240)
+    evidence = {
+        "reason": "repeated source-scout/MTP escape loop after adapter/logit exhaustion",
+        "escape_loop": loop,
+        "drafter_bottleneck_state": bottleneck,
+        "decode_mean_tps": latest_decode_mean(root, recent_rows=160),
+        "source_scout_artifact": latest_source_scout_artifact(root).get("_artifact_path", ""),
+        "calibration_blocker": recent_calibration_run_hard_blocker(root, recent_rows=240),
+    }
+    task = quant_safe_drafter_candidate_task(timestamp, evidence=evidence)
+    return filter_seedable_tasks(root, [task])
+
+
 def latest_source_scout_artifact(root: Path) -> dict[str, Any]:
     return latest_json_artifact(root, "source-scout-*.json")
 
@@ -5404,6 +6302,16 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
             timestamp,
             reason="Frontier deliberation selected the canonical JANQ drafter bottleneck route",
         )
+    escape_candidate_tasks = frontier_escape_candidate_tasks(root, rows, timestamp)
+    waiting_on_bottleneck_route = active_drafter_bottleneck_route(root) or (
+        bottleneck_state["state"] != "no_terminal_quantized_blocker"
+        and not bottleneck_tasks
+        and not escape_candidate_tasks
+        and (
+            str(bottleneck_state.get("next_step", "")).startswith("wait_for_")
+            or bottleneck_state.get("next_step") != "seed_frontier_deliberation_escape"
+        )
+    )
     source_artifact = latest_source_scout_artifact(root)
     decode_mean = latest_decode_mean(root, recent_rows=160)
     measurement = measurement_artifact_analysis(root, recent_rows=160)
@@ -5464,7 +6372,15 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     selected_reason = ""
     if bottleneck_tasks:
         selected_task = bottleneck_tasks[0]
-        selected_reason = f"canonical JANQ drafter bottleneck next_step={bottleneck_state.get('next_step')}"
+        if str(selected_task.get("id", "")).startswith("agent-deliberation-quant-safe-drafter-candidate-"):
+            selected_reason = "repeated source-scout/MTP escape requires a quantization-safe drafter candidate"
+        else:
+            selected_reason = f"canonical JANQ drafter bottleneck next_step={bottleneck_state.get('next_step')}"
+    elif escape_candidate_tasks:
+        selected_task = escape_candidate_tasks[0]
+        selected_reason = "repeated source-scout/MTP escape requires a quantization-safe drafter candidate"
+    elif waiting_on_bottleneck_route:
+        selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
     elif (
         not source_artifact
         and not active_task_has_prefix(root, "agent-deliberation-source-scout-")
@@ -5490,22 +6406,23 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_task = mtp_acceptance_yield_task(timestamp, evidence=evidence)
         selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
     if selected_task is None:
-        selected_task = agent_deliberation_task(
-            timestamp,
-            slug="open-problem-contract",
-            priority=95,
-            target="openclaw/openclaw-speed-research.py",
-            hypothesis=(
-                "All named frontier deliberation paths have prior evidence; create a fresh open-problem "
-                "contract that requires new evidence before any implementation task can run."
-            ),
-            acceptance=(
-                "The contract records exhausted proposals, required new evidence, source-scout requirements, "
-                "and a no-op rollback; it cannot promote code or mutate runtime by itself."
-            ),
-            evidence=evidence,
-        )
-        selected_reason = "all named deliberation paths have been attempted, so create a fresh evidence contract"
+        if not waiting_on_bottleneck_route:
+            selected_task = agent_deliberation_task(
+                timestamp,
+                slug="open-problem-contract",
+                priority=95,
+                target="openclaw/openclaw-speed-research.py",
+                hypothesis=(
+                    "All named frontier deliberation paths have prior evidence; create a fresh open-problem "
+                    "contract that requires new evidence before any implementation task can run."
+                ),
+                acceptance=(
+                    "The contract records exhausted proposals, required new evidence, source-scout requirements, "
+                    "and a no-op rollback; it cannot promote code or mutate runtime by itself."
+                ),
+                evidence=evidence,
+            )
+            selected_reason = "all named deliberation paths have been attempted, so create a fresh evidence contract"
     if selected_task:
         selected_task["id"] = unique_task_id(root, str(selected_task.get("id", "")))
     architect = {
@@ -6011,6 +6928,19 @@ def quality_review(args: argparse.Namespace) -> int:
     )
     if dflash_suppressed:
         recommendations.append("DFlash/JANQ compatibility was hard-blocked and the lane was retired until the draft candidate changes.")
+    review_timestamp = int(time.time())
+    breakthrough_tasks = drafter_calibration_breakthrough_tasks(
+        root,
+        review_timestamp,
+        task_id=f"review-drafter-calibration-canary-{review_timestamp}",
+        priority=99,
+        recent_rows=max(160, int(args.recent_rows)),
+    )
+    if breakthrough_tasks:
+        recommendations.append(
+            "target-generated JANQ traces exist and decode is below target; route directly to the drafter calibration canary instead of repeating MTP/source-scout synthesis."
+        )
+        seeded_tasks.extend(breakthrough_tasks)
     if trace_distillation_failed and not has_trace_distillation_repair_route and not trace_distillation_repair_done:
         quality_score -= 18
         recommendations.append(
@@ -6523,6 +7453,8 @@ def score_review_council_artifact(report: dict[str, Any]) -> dict[str, Any]:
     canonical = report.get("canonical_state") if isinstance(report.get("canonical_state"), dict) else {}
     measurement = report.get("measurement") if isinstance(report.get("measurement"), dict) else {}
     variance = report.get("variance") if isinstance(report.get("variance"), dict) else {}
+    progress_memory = report.get("progress_memory") if isinstance(report.get("progress_memory"), dict) else {}
+    deterministic_path = report.get("deterministic_path") if isinstance(report.get("deterministic_path"), dict) else {}
     strategist = roles.get("strategist") if isinstance(roles.get("strategist"), dict) else {}
     gatekeeper = roles.get("gatekeeper") if isinstance(roles.get("gatekeeper"), dict) else {}
     prober = roles.get("prober") if isinstance(roles.get("prober"), dict) else {}
@@ -6561,12 +7493,30 @@ def score_review_council_artifact(report: dict[str, Any]) -> dict[str, Any]:
         "autonomy_clean",
         "measurement_clean",
     )
-    safety_gates_clear = all(bool(gates.get(name)) for name in safety_gate_names)
+    progress_owner_ready = bool(deterministic_path.get("owner_ready"))
+    promotion_allowed = bool(gatekeeper.get("promotion_allowed"))
+    effective_safety_gate_names = safety_gate_names
+    if progress_owner_ready and decision == "continue" and not promotion_allowed:
+        effective_safety_gate_names = tuple(name for name in safety_gate_names if name != "autonomy_clean")
+    safety_gates_clear = all(bool(gates.get(name)) for name in effective_safety_gate_names)
+    progress_memory_read = (
+        bool(gates.get("progress_memory_present"))
+        and bool(gates.get("progress_docs_present"))
+        and bool(progress_memory.get("objective"))
+        and bool(deterministic_path.get("phase"))
+        and bool(deterministic_path.get("action"))
+    )
+    progress_owner_respected = not (
+        deterministic_path.get("owner_ready")
+        and decision == "seed-frontier-deliberation"
+        and seeded_tasks > 0
+    )
     evidence_grounded = (
         bool(evidence_paths)
         and bool(canonical)
         and bool(measurement)
         and bool(variance)
+        and progress_memory_read
         and bool(report.get("deterministic_ready_tasks") or decision in {"seed-frontier-deliberation", "repair", "observe"})
     )
     artifact_complete = required_roles.issubset(role_names) and bool(questions) and bool(next_action)
@@ -6582,11 +7532,11 @@ def score_review_council_artifact(report: dict[str, Any]) -> dict[str, Any]:
         and not evidence.get("source_scout")
     )
     components = {
-        "artifact_completeness": 20 if artifact_complete else 0,
+        "artifact_completeness": 20 if artifact_complete and progress_memory_read else 0,
         "evidence_grounding": 20 if evidence_grounded else 0,
         "safety_noise": 20 if no_noise and safety_gates_clear else 0,
         "actionability": 15 if actionable else 0,
-        "novelty_no_duplication": 10 if novelty_guard and not duplicate_seed else 0,
+        "novelty_no_duplication": 10 if novelty_guard and not duplicate_seed and progress_owner_respected else 0,
         "mutation_containment": 15 if mutation_contained else 0,
     }
     total = int(sum(components.values()))
@@ -6594,6 +7544,8 @@ def score_review_council_artifact(report: dict[str, Any]) -> dict[str, Any]:
         name
         for name, passed in {
             "artifact_complete": artifact_complete,
+            "progress_memory_read": progress_memory_read,
+            "progress_owner_respected": progress_owner_respected,
             "evidence_grounded": evidence_grounded,
             "safety_gates_clear": safety_gates_clear,
             "zero_noise": no_noise,
@@ -6613,9 +7565,16 @@ def score_review_council_artifact(report: dict[str, Any]) -> dict[str, Any]:
             "decision": decision,
             "seeded_tasks": seeded_tasks,
             "duplicate_seed": duplicate_seed,
-            "promotion_allowed": bool(gatekeeper.get("promotion_allowed")),
+            "promotion_allowed": promotion_allowed,
+            "progress_phase": str(deterministic_path.get("phase", "")),
+            "progress_owner_ready": progress_owner_ready,
             "safety_gates_clear": safety_gates_clear,
-            "failed_safety_gates": [name for name in safety_gate_names if not bool(gates.get(name))],
+            "failed_safety_gates": [name for name in effective_safety_gate_names if not bool(gates.get(name))],
+            "promotion_only_failed_safety_gates": [
+                name
+                for name in safety_gate_names
+                if name not in effective_safety_gate_names and not bool(gates.get(name))
+            ],
         },
     }
 
@@ -6630,6 +7589,17 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
     """
     ensure_research_state(root)
     timestamp = int(time.time())
+    progress_preflight = progress_memory_preflight(root, recent_rows=max(120, int(recent_rows)))
+    progress = (
+        progress_preflight.get("progress_memory", {})
+        if isinstance(progress_preflight.get("progress_memory"), dict)
+        else {}
+    )
+    deterministic_path = (
+        progress_preflight.get("deterministic_path", {})
+        if isinstance(progress_preflight.get("deterministic_path"), dict)
+        else {}
+    )
     quality = latest_json_artifact(root, "quality-review-*.json")
     frontier = latest_json_artifact(root, "frontier-system-eval-*.json")
     autonomy = latest_json_artifact(root, "frontier-autonomy-score-*.json")
@@ -6648,6 +7618,9 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
     ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
     deterministic_ready = [task for task in ready if is_deterministic_research_task(task)]
     deterministic_ready_ids = [str(task.get("id", "")) for task in deterministic_ready[:8]]
+    progress_owner_id = str(deterministic_path.get("owner_task_id", ""))
+    progress_owner_next_action = str(deterministic_path.get("owner_next_action", ""))
+    progress_owner_ready = bool(deterministic_path.get("owner_ready"))
     exhausted = list(canonical.get("exhausted_lanes", []))
     decode_mean = canonical.get("decode_mean_tps")
     if decode_mean is None:
@@ -6667,6 +7640,9 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
         "handoff_clean": bool(handoff.get("ok")) and float(handoff.get("score") or 0) >= 90.0,
         "autonomy_clean": not autonomy.get("hard_gate_failures"),
         "measurement_clean": not bool(measurement.get("artifact_suspected")),
+        "progress_memory_present": bool(progress_preflight.get("ok")),
+        "progress_docs_present": bool(progress_preflight.get("docs_present")),
+        "progress_owner_ready_or_repairable": bool(progress_owner_ready or progress_owner_next_action or deterministic_ready_ids),
     }
     stable_enough = all(
         gates[key]
@@ -6693,11 +7669,18 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
             "question": "What would a human prober challenge before letting this run unattended?",
             "evidence": {
                 "ready_tasks": deterministic_ready_ids,
+                "progress_owner": progress_owner_id,
+                "progress_owner_next_action": progress_owner_next_action,
+                "progress_phase": deterministic_path.get("phase", ""),
                 "exhausted_lanes": exhausted,
                 "quality_score": quality_score,
                 "scorecard_overall": scorecard_overall,
             },
-            "answer": "run the deterministic prerequisite before inventing another lane"
+            "answer": "run the progress-memory owner before inventing another lane"
+            if progress_owner_ready
+            else "repair/reseed the progress-memory owner before synthesis"
+            if progress_owner_next_action
+            else "run the deterministic prerequisite before inventing another lane"
             if deterministic_ready_ids
             else "create a bounded frontier-deliberation task if gates are clean",
         },
@@ -6717,12 +7700,23 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
             else "verify no UX or stability regression before further speed work"
         ),
         "next_leverage": (
-            deterministic_ready_ids[0]
+            progress_owner_id
+            if progress_owner_ready
+            else progress_owner_next_action
+            if progress_owner_next_action
+            else deterministic_ready_ids[0]
             if deterministic_ready_ids
             else "frontier-deliberation"
             if stable_enough
             else "repair quality/stability gates first"
         ),
+        "progress_memory_lane": {
+            "phase": deterministic_path.get("phase", ""),
+            "owner_task_id": progress_owner_id,
+            "owner_next_action": progress_owner_next_action,
+            "bottleneck_state": deterministic_path.get("bottleneck_state", ""),
+            "bottleneck_next_step": deterministic_path.get("bottleneck_next_step", ""),
+        },
     }
     skeptic = {
         "role": "skeptic",
@@ -6739,7 +7733,16 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
             "handoff_clean": gates["handoff_clean"],
         },
     }
-    if not stable_enough:
+    if not gates["progress_memory_present"] or not gates["progress_docs_present"]:
+        decision = "repair"
+        next_action = "refresh progress memory lane before any synthesis or research task"
+    elif progress_owner_ready:
+        decision = "continue"
+        next_action = f"run progress-memory owner {progress_owner_id}: {progress_owner_next_action}"
+    elif progress_owner_next_action:
+        decision = "repair"
+        next_action = f"repair missing progress-memory owner before synthesis: {progress_owner_next_action}"
+    elif not stable_enough:
         decision = "repair"
         next_action = "run autonomous repair before any new research or patch promotion"
     elif deterministic_ready_ids:
@@ -6807,6 +7810,8 @@ def review_council_report(root: Path, *, recent_rows: int = 120, target_tps: flo
             "gatekeeper": gatekeeper,
         },
         "gates": gates,
+        "progress_memory": progress,
+        "deterministic_path": deterministic_path,
         "canonical_state": canonical,
         "task_contract": {
             "ok": contract.get("ok", True),
@@ -8425,6 +9430,18 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
         seeded_canary_task = upsert_tasks(
             root,
             [drafter_calibration_canary_task(timestamp, task_id=f"drafter-calibration-canary-{timestamp}")],
+        )
+    if traces and not seeded_canary_task and should_seed_quant_safe_drafter_canary(root, recent_rows=240):
+        seeded_canary_task = upsert_tasks(
+            root,
+            [
+                drafter_calibration_canary_task(
+                    timestamp,
+                    task_id=unique_task_id(root, "adapter-drafter-calibration-canary-current"),
+                    priority=99,
+                    calibration_mode_value=CALIBRATION_ADAPTER_MODE,
+                )
+            ],
         )
     report["seeded_canary_task"] = seeded_canary_task
     path = root / "benchmarks" / f"drafter-trace-prerequisite-{timestamp}.json"

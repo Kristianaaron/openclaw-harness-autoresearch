@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,9 @@ from openclaw_speed_research_core import (
     complete_task_from_evidence,
     cycle_quality,
     ensure_research_state,
+    block_operational_strategy_ready_tasks,
     mark_lane_exhausted,
+    operational_strategy_memory,
     paired_profile_plan,
     promotion_decision,
     read_jsonl,
@@ -154,6 +157,76 @@ INTERRUPT_CONTEXT: dict[str, object] = {
     "lock": None,
     "selected_task": None,
 }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def installed_helper_freshness_report(args: argparse.Namespace) -> dict[str, object]:
+    """Fail closed when installed helper scripts drift from the repo source."""
+
+    repo = Path(os.environ.get("OPENCLAW_HARNESS_REPO", DEFAULT_REPO)).expanduser()
+    source = repo / "openclaw"
+    helper_bin = Path(str(getattr(args, "research_helper_bin", WORKSPACE / "missing-helper"))).expanduser()
+    autopilot_bin = Path(__file__).resolve()
+    mappings = [
+        ("openclaw-speed-research", source / "openclaw-speed-research.py", helper_bin),
+        ("openclaw-speed-research-autopilot", source / "openclaw-speed-research-autopilot.py", autopilot_bin),
+        (
+            "openclaw_speed_research_core.py",
+            source / "openclaw_speed_research_core.py",
+            helper_bin.with_name("openclaw_speed_research_core.py"),
+        ),
+        (
+            "openclaw_self_improvement.py",
+            source / "openclaw_self_improvement.py",
+            helper_bin.with_name("openclaw_self_improvement.py"),
+        ),
+    ]
+    entries = []
+    stale = []
+    missing = []
+    for name, source_path, installed_path in mappings:
+        source_exists = source_path.exists()
+        installed_exists = installed_path.exists()
+        entry: dict[str, object] = {
+            "name": name,
+            "source": str(source_path),
+            "installed": str(installed_path),
+            "source_exists": source_exists,
+            "installed_exists": installed_exists,
+        }
+        if source_exists and installed_exists:
+            source_hash = file_sha256(source_path)
+            installed_hash = file_sha256(installed_path)
+            entry["source_sha256"] = source_hash
+            entry["installed_sha256"] = installed_hash
+            entry["fresh"] = source_hash == installed_hash
+            if source_hash != installed_hash:
+                stale.append(name)
+        else:
+            entry["fresh"] = False
+            missing.append(name)
+        entries.append(entry)
+    ok = not stale and not missing
+    return {
+        "ok": ok,
+        "repo": str(repo),
+        "source_dir": str(source),
+        "stale": stale,
+        "missing": missing,
+        "entries": entries,
+        "next": (
+            "rerun via the OpenClaw wrapper so it syncs helpers from the repo"
+            if not ok
+            else "installed helpers match repo"
+        ),
+    }
 
 
 def log(message: str) -> None:
@@ -438,6 +511,7 @@ def durable_progress(before: dict[str, object], after: dict[str, object]) -> lis
 
 def ensure_task_queue() -> None:
     ensure_research_state(WORKSPACE)
+    operational_strategy_memory(WORKSPACE)
 
 
 def next_task_summary(limit: int = 3) -> str:
@@ -5195,6 +5269,12 @@ def main() -> int:
         default=os.environ.get("OPENCLAW_SPEED_RESEARCH_HELPER", "/Users/kristian/.openclaw/bin/openclaw-speed-research"),
     )
     parser.add_argument(
+        "--allow-stale-installed-helpers",
+        action="store_true",
+        default=os.environ.get("OPENCLAW_SPEED_RESEARCH_ALLOW_STALE_HELPERS", "0") == "1",
+        help="debug only: allow autoresearch to run when installed helper scripts differ from the repo",
+    )
+    parser.add_argument(
         "--drafter-fit-bin",
         default=os.environ.get("OPENCLAW_DRAFTER_FIT_HELPER", "/Users/kristian/.openclaw/bin/openclaw-drafter-fit"),
     )
@@ -5520,6 +5600,24 @@ def main() -> int:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ensure_task_queue()
+    freshness = installed_helper_freshness_report(args)
+    if not freshness["ok"] and not args.allow_stale_installed_helpers:
+        append_result(
+            WORKSPACE,
+            run_id=f"installed-helper-drift-{int(time.time())}",
+            status="blocked",
+            target="autoresearch-installed-helper-freshness",
+            hypothesis="autoresearch must run the same helper code that passed the repo test suite",
+            commit=current_commit(),
+            notes=clean_tsv(json.dumps(freshness, sort_keys=True)),
+        )
+        log(
+            "installed helper drift detected; refusing to start autoresearch. "
+            f"stale={','.join(freshness.get('stale', [])) or 'none'} "
+            f"missing={','.join(freshness.get('missing', [])) or 'none'} "
+            f"next={freshness.get('next')}"
+        )
+        return 2
     autopilot_lock = acquire_autopilot_lock(args.session)
     if autopilot_lock is None:
         log(f"autopilot refused duplicate workspace run lock={AUTOPILOT_LOCK}")
@@ -5543,6 +5641,9 @@ def main() -> int:
         f"autopilot start session={args.session} cycles={args.cycles} max_hours={args.max_hours} "
         f"auto_extend_cycles={args.auto_extend_cycles} extension_size={extension_size} log={log_file}"
     )
+    startup_operational_blocked = block_operational_strategy_ready_tasks(WORKSPACE)
+    if startup_operational_blocked:
+        log(f"startup quarantined operational-memory tasks count={startup_operational_blocked}")
     run_supervisor_compaction(args, log_file)
     run_supervisor_environment_snapshot(args, log_file, "autopilot-start")
     self_improve_ok, self_improve_issue = run_supervisor_self_improvement(
@@ -5624,6 +5725,9 @@ def main() -> int:
         stale_lane_blocked = block_stale_hard_blocked_lane_tasks()
         if stale_lane_blocked:
             log(f"supervisor quarantined stale hard-blocked lane tasks count={stale_lane_blocked}")
+        operational_blocked = block_operational_strategy_ready_tasks(WORKSPACE)
+        if operational_blocked:
+            log(f"supervisor quarantined operational-memory tasks count={operational_blocked}")
         stale_causal_blocked = block_stale_model_bound_causal_tasks()
         if stale_causal_blocked:
             log(f"supervisor quarantined stale model-bound causal tasks count={stale_causal_blocked}")

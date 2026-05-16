@@ -25,7 +25,7 @@ RESULTS_HEADER = (
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
 ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 BENCHMARK_MANIFEST_VERSION = 1
-RESEARCH_PROFILE_VERSION = 2
+RESEARCH_PROFILE_VERSION = 3
 EVALUATOR_POLICY_VERSION = 1
 GEPA_POLICY_TARGETS = (
     "program.md",
@@ -164,6 +164,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "autoresearch_quality_delta",
             "source_evidence_count",
             "frontier_deliberation_contract",
+            "quant_safe_drafter_candidate_gate",
         ],
     },
     "implementation_contract": {
@@ -443,6 +444,15 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return default
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
@@ -586,6 +596,22 @@ def ensure_research_state(root: Path) -> None:
     exhausted = root / "exhausted-approaches.jsonl"
     if not exhausted.exists():
         exhausted.write_text("", encoding="utf-8")
+    strategy_memory = root / "strategy-memory.json"
+    if not strategy_memory.exists():
+        strategy_memory.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "last_updated": "",
+                    "lanes": {},
+                    "semantic_tasks": {},
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     write_json_if_missing_or_stale(root / "benchmark-manifest.json", DEFAULT_BENCHMARK_MANIFEST, "version")
     write_json_if_missing_or_stale(root / "insight-rubric.json", DEFAULT_INSIGHT_RUBRIC, "version")
     profile_path = root / "research-profile.json"
@@ -1110,6 +1136,384 @@ def mark_lane_exhausted(root: Path, *, lane: str, reason: str, evidence: dict[st
         },
     )
     return True
+
+
+def normalize_strategy_token(value: object) -> str:
+    token = str(value or "").lower()
+    token = re.sub(r"\b20\d{6,}\b", "", token)
+    token = re.sub(r"\b1[6-9]\d{8,}\b", "", token)
+    token = re.sub(r"\bcycle-\d+\b", "cycle", token)
+    token = re.sub(r"\b\d+\b", "", token)
+    token = re.sub(r"[^a-z0-9]+", "-", token).strip("-")
+    return token[:96] or "unknown"
+
+
+def semantic_task_key(task: dict[str, Any]) -> str:
+    """Collapse dynamically named tasks into the operation they actually perform."""
+    task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    benchmark = str(task.get("benchmark_mode", ""))
+    target = str(task.get("target", ""))
+    metric = str(task.get("metric", ""))
+    next_action = str(task.get("next_action", ""))
+    lane = lane_key_for_task(task)
+    text = f"{task_id} {action} {benchmark} {target} {metric} {next_action}".lower()
+
+    if benchmark == "decode-sample" or "benchmark --mode decode-sample" in text:
+        return "production-mtp:decode-sample:decode_tps"
+    if action == "mtp-report" or "mtp-report" in text or "mtp-acceptance-yield" in text:
+        return "production-mtp:mtp-report:mean_accept"
+    if action == "source-scout" or "source-scout" in text:
+        return "frontier-deliberation:source-scout:source_evidence_count"
+    if "quant-safe-drafter-candidate" in text:
+        return "frontier-expansion:quant-safe-drafter-candidate:contract"
+    if action == "runtime-overhead-map" or "runtime-overhead-map" in text:
+        return "runtime-overhead:runtime-overhead-map:server_wall_decode_gap"
+    if action == "drafter-trace-gate" or "drafter-trace-gate" in text:
+        return "drafter-alignment:drafter-trace-gate:trace_data"
+    if action == "drafter-calibration-memory-stage" or "drafter-calibration-memory-stage" in text:
+        stage = normalize_strategy_token(task.get("stage") or "unknown-stage")
+        mode = normalize_strategy_token(task.get("calibration_mode") or "")
+        return f"drafter-alignment:drafter-calibration-memory-stage:{stage}:{mode}"
+    if action == "drafter-calibration-canary" or "drafter-calibration-canary" in text:
+        return "drafter-alignment:drafter-calibration-canary:acceptance_lift"
+    if action == "calibration-memory-report" or "calibration-memory-report" in text:
+        return "drafter-alignment:calibration-memory-report:calibration_memory_root_cause"
+    if action == "implementation-bridge" or "implementation-bridge" in text:
+        return "implementation-gate:implementation-bridge:deterministic_handoff"
+    if action == "dflash-compatibility-gate" or "dflash-compatibility" in text:
+        return "frontier-dflash:dflash-compatibility:compatibility"
+    if "synthesize --kind frontier" in text or task_id == "synthesize-speed-ideas":
+        return "frontier-expansion:synthesis-frontier:ranked_ideas"
+    return ":".join(
+        [
+            normalize_strategy_token(lane),
+            normalize_strategy_token(action or benchmark or target or task_id),
+            normalize_strategy_token(metric or target),
+        ]
+    )
+
+
+def semantic_result_key(row: dict[str, str]) -> str:
+    run_id = row.get("run_id", "")
+    target = row.get("target", "")
+    notes = row.get("notes", "")
+    text = f"{run_id} {target} {notes}".lower()
+    if target == "decode-sample" or run_id.startswith("benchmark-") and "decode-sample" in target:
+        return "production-mtp:decode-sample:decode_tps"
+    if target == "mtp-acceptance-report" or run_id.startswith("mtp-report-") or "mean_accept=" in text:
+        return "production-mtp:mtp-report:mean_accept"
+    if target == "frontier-source-scout" or run_id.startswith("source-scout-"):
+        return "frontier-deliberation:source-scout:source_evidence_count"
+    if "quant-safe-drafter-candidate" in text:
+        return "frontier-expansion:quant-safe-drafter-candidate:contract"
+    if target == "runtime-overhead-map" or run_id.startswith("runtime-overhead-map-"):
+        return "runtime-overhead:runtime-overhead-map:server_wall_decode_gap"
+    if target == "janq-drafter-calibration-canary" or run_id.startswith("drafter-calibration-canary-"):
+        return "drafter-alignment:drafter-calibration-canary:acceptance_lift"
+    if target == "janq-drafter-fit-trace-data" or run_id.startswith("drafter-trace-gate-"):
+        return "drafter-alignment:drafter-trace-gate:trace_data"
+    if target == "calibration-memory-report" or run_id.startswith("calibration-memory-report-"):
+        return "drafter-alignment:calibration-memory-report:calibration_memory_root_cause"
+    if target == "synthesis" or run_id.startswith("synthesis-"):
+        return "frontier-expansion:synthesis-frontier:ranked_ideas"
+    return ":".join(
+        [
+            normalize_strategy_token(target),
+            normalize_strategy_token(run_id),
+            normalize_strategy_token(parse_note_fields(notes).get("metric", "")),
+        ]
+    )
+
+
+def latest_result_position(rows: list[dict[str, str]], key: str) -> int:
+    for index in range(len(rows) - 1, -1, -1):
+        if semantic_result_key(rows[index]) == key:
+            return index
+    return -1
+
+
+def operational_strategy_memory(root: Path, *, recent_rows: int = 240) -> dict[str, Any]:
+    """Materialize strategy memory as scheduler state, not just historical notes."""
+    ensure_research_state(root)
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    memory: dict[str, Any] = {
+        "version": 1,
+        "last_updated": now,
+        "lanes": {
+            lane: {
+                "state": "exhausted",
+                "reason": str(data.get("reason", "")),
+                "evidence": data.get("evidence", {}),
+            }
+            for lane, data in exhausted_lanes(root).items()
+        },
+        "semantic_tasks": {},
+    }
+    semantic: dict[str, Any] = memory["semantic_tasks"]
+
+    latest_decode = latest_result_position(rows, "production-mtp:decode-sample:decode_tps")
+    mtp_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode and semantic_result_key(row) == "production-mtp:mtp-report:mean_accept"
+    ]
+    if len(mtp_after_decode) >= 2:
+        semantic["production-mtp:mtp-report:mean_accept"] = {
+            "state": "waiting_for_prerequisite",
+            "reason": "repeated MTP acceptance reports without a fresh decode benchmark",
+            "required_evidence": "production-mtp:decode-sample:decode_tps",
+            "recent_count": len(mtp_after_decode),
+            "last_result_id": mtp_after_decode[-1].get("run_id", ""),
+        }
+
+    synth_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode and semantic_result_key(row) == "frontier-expansion:synthesis-frontier:ranked_ideas"
+    ]
+    non_synthesis_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and semantic_result_key(row)
+        not in {
+            "frontier-expansion:synthesis-frontier:ranked_ideas",
+            "production-mtp:mtp-report:mean_accept",
+        }
+    ]
+    if len(synth_after_decode) >= 3 and not non_synthesis_after_decode:
+        semantic["frontier-expansion:synthesis-frontier:ranked_ideas"] = {
+            "state": "waiting_for_prerequisite",
+            "reason": "repeated synthesis produced no non-report evidence after the latest decode benchmark",
+            "required_evidence": "non_synthesis_result_or_candidate_change",
+            "recent_count": len(synth_after_decode),
+            "last_result_id": synth_after_decode[-1].get("run_id", ""),
+        }
+
+    source_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and semantic_result_key(row) == "frontier-deliberation:source-scout:source_evidence_count"
+    ]
+    candidate_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and semantic_result_key(row) == "frontier-expansion:quant-safe-drafter-candidate:contract"
+    ]
+    if len(source_after_decode) >= 2 and len(mtp_after_decode) >= 2 and not candidate_after_decode:
+        blocker = {
+            "state": "waiting_for_prerequisite",
+            "reason": "repeated source-scout/MTP escape loop needs a quantization-safe drafter candidate",
+            "required_evidence": "frontier-expansion:quant-safe-drafter-candidate:contract",
+            "source_scout_count": len(source_after_decode),
+            "mtp_report_count": len(mtp_after_decode),
+            "last_result_id": source_after_decode[-1].get("run_id", ""),
+        }
+        semantic["frontier-deliberation:source-scout:source_evidence_count"] = blocker
+        semantic["production-mtp:mtp-report:mean_accept"] = blocker
+
+    quantized_gradient_rows = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and CALIBRATION_QUANTIZED_GRADIENT_BLOCKER
+        in " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+    ]
+    adapter_or_candidate_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and any(
+            token
+            in " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+            for token in (
+                "quant-safe-drafter-candidate",
+                "adapter-method",
+                "adapter/logit",
+                "adapter-logit",
+                "logit-distillation",
+            )
+        )
+    ]
+    if quantized_gradient_rows and not adapter_or_candidate_after_decode:
+        blocker = {
+            "state": "waiting_for_prerequisite",
+            "reason": "terminal quantized-gradient blocker requires adapter/logit or quant-safe drafter candidate work, not source-scout/MTP reseeding",
+            "required_evidence": "adapter_or_quant_safe_candidate",
+            "recent_count": len(quantized_gradient_rows),
+            "last_result_id": quantized_gradient_rows[-1].get("run_id", ""),
+        }
+        semantic["frontier-deliberation:source-scout:source_evidence_count"] = blocker
+        semantic["production-mtp:mtp-report:mean_accept"] = blocker
+
+    adapter_memory_block_rows = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and any(
+            token
+            in " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+            for token in (
+                "adapter_calibration_memory_blocked",
+                "calibration-memory-after-load",
+            )
+        )
+    ]
+    memory_fix_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode
+        and any(
+            token
+            in " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+            for token in (
+                "memory-fix",
+                "memory root-cause",
+                "adapter-memory",
+                "crash-safe-calibration",
+            )
+        )
+    ]
+    if adapter_memory_block_rows and not memory_fix_after_decode:
+        blocker = {
+            "state": "waiting_for_prerequisite",
+            "reason": "adapter calibration memory blocker requires a bounded memory fix or route change, not source-scout/MTP reseeding",
+            "required_evidence": "adapter_memory_fix_or_route_change",
+            "recent_count": len(adapter_memory_block_rows),
+            "last_result_id": adapter_memory_block_rows[-1].get("run_id", ""),
+        }
+        semantic["frontier-deliberation:source-scout:source_evidence_count"] = blocker
+        semantic["production-mtp:mtp-report:mean_accept"] = blocker
+
+    calibration_reports_after_decode = [
+        row
+        for index, row in enumerate(rows)
+        if index > latest_decode and semantic_result_key(row) == "drafter-alignment:calibration-memory-report:calibration_memory_root_cause"
+    ]
+    drafter_candidate_after_report = [
+        row
+        for row in rows[latest_result_position(rows, "drafter-alignment:calibration-memory-report:calibration_memory_root_cause") + 1 :]
+        if semantic_result_key(row)
+        in {
+            "frontier-expansion:quant-safe-drafter-candidate:contract",
+            "drafter-alignment:drafter-calibration-canary:acceptance_lift",
+            "drafter-alignment:drafter-trace-gate:trace_data",
+        }
+    ]
+    exhausted = set(memory.get("lanes", {}))
+    if (
+        calibration_reports_after_decode
+        and not drafter_candidate_after_report
+        and {"drafter-calibration-gradient", "drafter-calibration-memory"}.intersection(exhausted)
+    ):
+        blocker = {
+            "state": "waiting_for_prerequisite",
+            "reason": "recent calibration-memory report plus exhausted drafter lanes requires a drafter candidate/canary, not source-scout/MTP reseeding",
+            "required_evidence": "drafter_candidate_or_calibration_canary",
+            "recent_count": len(calibration_reports_after_decode),
+            "last_result_id": calibration_reports_after_decode[-1].get("run_id", ""),
+        }
+        semantic["frontier-deliberation:source-scout:source_evidence_count"] = blocker
+        semantic["production-mtp:mtp-report:mean_accept"] = blocker
+
+    memory_path = root / "strategy-memory.json"
+    memory_path.write_text(json.dumps(memory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return memory
+
+
+def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[str, Any] | None = None) -> str:
+    memory = memory if memory is not None else operational_strategy_memory(root)
+    lane = lane_key_for_task(task)
+    lane_state = memory.get("lanes", {}).get(lane, {}) if isinstance(memory.get("lanes"), dict) else {}
+    if lane_state.get("state") == "exhausted" and lane != "exhaustion-report":
+        return f"lane is exhausted: {lane}"
+    key = semantic_task_key(task)
+    semantic = memory.get("semantic_tasks", {}) if isinstance(memory.get("semantic_tasks"), dict) else {}
+    state = semantic.get(key, {}) if isinstance(semantic.get(key), dict) else {}
+    if state.get("state") == "waiting_for_prerequisite":
+        return str(state.get("reason") or f"semantic task is waiting for prerequisite: {key}")
+    progress_path = root / "progress-memory.json"
+    if progress_path.exists() and key in {
+        "frontier-deliberation:source-scout:source_evidence_count",
+        "production-mtp:mtp-report:mean_accept",
+    }:
+        progress = read_json(progress_path, {})
+        bottleneck = progress.get("current_bottleneck", {}) if isinstance(progress, dict) else {}
+        not_progress = progress.get("not_progress", []) if isinstance(progress, dict) else []
+        next_step = str(bottleneck.get("next_step", ""))
+        stale_escape_named = any("source-scout or MTP reports" in str(item) for item in not_progress)
+        if next_step == "seed_frontier_deliberation_escape" and stale_escape_named:
+            return "progress memory requires a quant-safe drafter candidate, not source-scout/MTP reseeding"
+    return ""
+
+
+def filter_operational_strategy_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply semantic memory before tasks enter or leave the ready queue."""
+    memory = operational_strategy_memory(root)
+    active_keys = {
+        semantic_task_key(task)
+        for task in read_jsonl(root / "tasks.jsonl")
+        if task.get("status", "ready") in {"ready", "rework"}
+    }
+    filtered: list[dict[str, Any]] = []
+    for task in tasks:
+        key = semantic_task_key(task)
+        if key in active_keys:
+            continue
+        if task_operational_blocker(root, task, memory=memory):
+            continue
+        filtered.append(task)
+        active_keys.add(key)
+    return filtered
+
+
+def block_operational_strategy_ready_tasks(root: Path) -> int:
+    """Quarantine ready tasks that violate the current operational memory."""
+    memory = operational_strategy_memory(root)
+    tasks = read_jsonl(root / "tasks.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    seen_keys: set[str] = set()
+    blocked = 0
+    for task in tasks:
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        key = semantic_task_key(task)
+        reason = ""
+        if key in seen_keys:
+            reason = f"duplicate semantic task already ready: {key}"
+        else:
+            reason = task_operational_blocker(root, task, memory=memory)
+        if not reason:
+            seen_keys.add(key)
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = reason
+        task["semantic_task_key"] = key
+        task["supervisor_summary"] = {
+            **(task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}),
+            "reason": "blocked_by_operational_strategy_memory",
+            "semantic_task_key": key,
+            "next": "wait_for_required_evidence_or_route_to_different_lane",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(root / "tasks.jsonl", tasks)
+        append_jsonl(
+            root / "findings.jsonl",
+            {
+                "timestamp": now,
+                "task_id": "operational-strategy-memory-block",
+                "finding": "scheduler quarantined redundant or prerequisite-blocked ready tasks before selection",
+                "blocked_tasks": blocked,
+                "next": "select_next_ready_task_or_synthesize_frontier_path",
+            },
+        )
+    return blocked
 
 
 def slugify(value: object) -> str:

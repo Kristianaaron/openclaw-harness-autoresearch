@@ -11,6 +11,8 @@ local runtime_deps_guard="$HOME/.openclaw/bin/openclaw-runtime-deps-guard"
 local speed_research="$HOME/.openclaw/bin/openclaw-speed-research"
 local speed_research_autopilot="$HOME/.openclaw/bin/openclaw-speed-research-autopilot"
 local speed_research_watchdog="$HOME/.openclaw/bin/openclaw-autoresearch-watchdog"
+local openclaw_harness_repo="${OPENCLAW_HARNESS_REPO:-/Users/kristian/Documents/openclaw-harness-autoresearch}"
+local openclaw_harness_src="$openclaw_harness_repo/openclaw"
 local model_env_override="$HOME/.openclaw/runtime/model-env.override.json"
 local model_label="local.openclaw-model-server"
 local model_plist="$HOME/Library/LaunchAgents/${model_label}.plist"
@@ -111,6 +113,50 @@ _openclaw_guard_runtime_deps() {
     echo "OpenClaw plugin runtime dependency repair failed; refusing to start a broken agent loop."
     return 1
   }
+}
+
+_openclaw_sync_file_if_changed() {
+  local source="$1"
+  local target="$2"
+  local mode="${3:-644}"
+  [[ -f "$source" ]] || return 1
+  /bin/mkdir -p "${target:h}" || return $?
+  if [[ -f "$target" ]] && /usr/bin/cmp -s "$source" "$target"; then
+    return 0
+  fi
+  /bin/cp "$source" "$target" || return $?
+  /bin/chmod "$mode" "$target" || return $?
+  return 2
+}
+
+_openclaw_sync_speed_research_helpers() {
+  [[ "${OPENCLAW_SPEED_RESEARCH_HELPER_AUTO_SYNC:-1}" == "1" ]] || return 0
+  if [[ ! -d "$openclaw_harness_src" ]]; then
+    echo "OpenClaw speed research helper source is missing: $openclaw_harness_src"
+    echo "Set OPENCLAW_HARNESS_REPO to the openclaw-harness-autoresearch repo before running research."
+    return 1
+  fi
+  local changed=0
+  local rc
+  _openclaw_sync_file_if_changed "$openclaw_harness_src/openclaw-speed-research.py" "$speed_research" 755
+  rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  [[ "$rc" -eq 2 ]] && changed=1
+  _openclaw_sync_file_if_changed "$openclaw_harness_src/openclaw-speed-research-autopilot.py" "$speed_research_autopilot" 755
+  rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  [[ "$rc" -eq 2 ]] && changed=1
+  _openclaw_sync_file_if_changed "$openclaw_harness_src/openclaw_speed_research_core.py" "$HOME/.openclaw/bin/openclaw_speed_research_core.py" 644
+  rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  [[ "$rc" -eq 2 ]] && changed=1
+  _openclaw_sync_file_if_changed "$openclaw_harness_src/openclaw_self_improvement.py" "$HOME/.openclaw/bin/openclaw_self_improvement.py" 644
+  rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  [[ "$rc" -eq 2 ]] && changed=1
+  if [[ "$changed" == "1" ]]; then
+    echo "OpenClaw speed research helpers synced from $openclaw_harness_src"
+  fi
 }
 
 _openclaw_clear_model_env_override() {
@@ -356,15 +402,18 @@ case "${1:-}" in
     return $?
     ;;
   speed-research-setup|research-speed-setup)
+    _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" setup
     return $?
     ;;
   speed-research-prompt|research-speed-prompt)
+    _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" prompt
     return $?
     ;;
   speed-research-benchmark|research-speed-benchmark)
     shift
+    _openclaw_sync_speed_research_helpers || return $?
     if ! _openclaw_has_arg_prefix "--help" "$@" && ! _openclaw_has_arg_prefix "-h" "$@"; then
       export OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-local-dev-token}"
       _openclaw_clear_model_env_override
@@ -376,11 +425,13 @@ case "${1:-}" in
     ;;
   speed-research-add-source|research-speed-add-source)
     shift
+    _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" add-source "$@"
     return $?
     ;;
   speed-research-self-improve|research-speed-self-improve)
     shift
+    _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" self-improve "$@"
     return $?
     ;;
@@ -390,6 +441,7 @@ case "${1:-}" in
     return $?
     ;;
   speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
+    _openclaw_sync_speed_research_helpers || return $?
     case "${2:-}" in
       setup|prompt|benchmark|record|synthesize|compact|self-improve)
         local speed_research_subcommand="${2:-}"
