@@ -23,6 +23,7 @@ RESULTS_HEADER = (
     "wall_s\tmemory_gb\tcommit\tnotes\n"
 )
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
+CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
 ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 BENCHMARK_MANIFEST_VERSION = 1
 RESEARCH_PROFILE_VERSION = 3
@@ -1214,6 +1215,14 @@ def semantic_result_key(row: dict[str, str]) -> str:
         return "runtime-overhead:runtime-overhead-map:server_wall_decode_gap"
     if target == "janq-drafter-calibration-canary" or run_id.startswith("drafter-calibration-canary-"):
         return "drafter-alignment:drafter-calibration-canary:acceptance_lift"
+    if target == "janq-drafter-calibration-evaluation" or run_id.startswith("drafter-calibration-evaluation-"):
+        fields = parse_note_fields(notes)
+        mode = normalize_strategy_token(fields.get("calibration_mode", "bounded"))
+        return f"drafter-alignment:drafter-calibration-evaluation:{mode or 'bounded'}"
+    if run_id.startswith("supervisor-drafter-calibration-run-"):
+        fields = parse_note_fields(notes)
+        mode = normalize_strategy_token(fields.get("calibration_mode", "bounded"))
+        return f"drafter-alignment:drafter-calibration-run:{mode or 'bounded'}"
     if target == "janq-drafter-fit-trace-data" or run_id.startswith("drafter-trace-gate-"):
         return "drafter-alignment:drafter-trace-gate:trace_data"
     if target == "calibration-memory-report" or run_id.startswith("calibration-memory-report-"):
@@ -1234,6 +1243,44 @@ def latest_result_position(rows: list[dict[str, str]], key: str) -> int:
         if semantic_result_key(rows[index]) == key:
             return index
     return -1
+
+
+def calibration_mode_from_value(value: object) -> str:
+    text = str(value or "")
+    return text if text else "bounded"
+
+
+def recent_calibration_rejected_no_lift(
+    root: Path,
+    *,
+    recent_rows: int = 240,
+    calibration_mode_filter: str | None = None,
+) -> bool:
+    mode_filter = calibration_mode_from_value(calibration_mode_filter) if calibration_mode_filter else ""
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    last_reject_index = -1
+    for index, row in enumerate(rows):
+        if row.get("target") != "janq-drafter-calibration-evaluation":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("decision") != "reject-no-lift":
+            continue
+        if mode_filter and calibration_mode_from_value(fields.get("calibration_mode")) != mode_filter:
+            continue
+        last_reject_index = index
+    if last_reject_index < 0:
+        return False
+    later_text = "\n".join(
+        " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        for row in rows[last_reject_index + 1 :]
+    )
+    new_candidate_tokens = (
+        "quant-safe-drafter-candidate",
+        "janq-dflash-drafter-fit-plan",
+        "candidate-ready-for-paired-benchmark",
+        "new-drafter-candidate",
+    )
+    return not any(token in later_text for token in new_candidate_tokens)
 
 
 def operational_strategy_memory(root: Path, *, recent_rows: int = 240) -> dict[str, Any]:
@@ -1447,6 +1494,15 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         return "bounded drafter calibration run is already ready; execute it before advisory deliberation"
     if is_calibration_canary_task(task) and active_task_prefix_exists(root, "drafter-calibration-run-"):
         return "bounded drafter calibration run is already ready; do not reseed calibration canary"
+    if (
+        recent_calibration_rejected_no_lift(
+            root,
+            recent_rows=240,
+            calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+        )
+        and (is_calibration_canary_task(task) or is_calibration_run_task(task))
+    ):
+        return "recent bounded adapter calibration produced no acceptance lift; route to a new drafter candidate or paired evaluation, not another canary"
     key = semantic_task_key(task)
     semantic = memory.get("semantic_tasks", {}) if isinstance(memory.get("semantic_tasks"), dict) else {}
     state = semantic.get(key, {}) if isinstance(semantic.get(key), dict) else {}
@@ -2474,6 +2530,13 @@ def gepa_decision_score(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     if is_calibration_run_task(task):
         score += 140
         reasons.append("bounded drafter calibration is the current breakthrough gate")
+    if recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=240,
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    ) and (is_calibration_canary_task(task) or is_calibration_run_task(task)):
+        score -= 260
+        reasons.append("recent adapter calibration was rejected for no acceptance lift")
     if is_calibration_canary_task(task) and active_task_prefix_exists(root, "drafter-calibration-run-"):
         score -= 180
         reasons.append("calibration run already exists; canary reseed would be noise")

@@ -3811,6 +3811,39 @@ def recent_result_has_prefix(root: Path, prefix: str, *, recent_rows: int = 80) 
     return any(row.get("run_id", "").startswith(prefix) for row in result_rows(root)[-recent_rows:])
 
 
+def recent_calibration_rejected_no_lift(
+    root: Path,
+    *,
+    recent_rows: int = 240,
+    calibration_mode_filter: str | None = None,
+) -> bool:
+    mode_filter = calibration_mode(calibration_mode_filter) if calibration_mode_filter else ""
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    last_reject_index = -1
+    for index, row in enumerate(rows):
+        if row.get("target") != "janq-drafter-calibration-evaluation":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("decision") != "reject-no-lift":
+            continue
+        if mode_filter and calibration_mode(fields.get("calibration_mode")) != mode_filter:
+            continue
+        last_reject_index = index
+    if last_reject_index < 0:
+        return False
+    later_text = "\n".join(
+        " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        for row in rows[last_reject_index + 1 :]
+    )
+    new_candidate_tokens = (
+        "quant-safe-drafter-candidate",
+        "janq-dflash-drafter-fit-plan",
+        "candidate-ready-for-paired-benchmark",
+        "new-drafter-candidate",
+    )
+    return not any(token in later_text for token in new_candidate_tokens)
+
+
 def recent_keep_result_has_prefix(root: Path, prefix: str, *, recent_rows: int = 240) -> bool:
     return any(
         row.get("status") == "keep" and row.get("run_id", "").startswith(prefix)
@@ -4886,6 +4919,12 @@ def should_seed_drafter_calibration_canary(root: Path, *, recent_rows: int = 120
         return False
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows) in CALIBRATION_CANARY_TERMINAL_BLOCKERS:
         return False
+    if recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=max(240, recent_rows),
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    ):
+        return False
     if active_drafter_bottleneck_route(root):
         return False
     return recent_drafter_trace_ready(root, recent_rows=recent_rows) and should_seed_action(
@@ -4899,6 +4938,12 @@ def should_seed_quant_safe_drafter_canary(root: Path, *, recent_rows: int = 240)
     """Advance the post-deliberation JANQ route instead of falling back to scout loops."""
 
     state = drafter_bottleneck_state(root, recent_rows=recent_rows)
+    if recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=max(240, recent_rows),
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    ):
+        return False
     quant_safe_active = active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-")
     if not quant_safe_active and state.get("state") not in {"quant_safe_candidate_ready", "adapter_logit_loop_exhausted"}:
         return False
@@ -4913,6 +4958,12 @@ def should_seed_quant_safe_drafter_canary(root: Path, *, recent_rows: int = 240)
 
 def should_seed_drafter_calibration_run(root: Path, *, recent_rows: int = 120) -> bool:
     if recent_calibration_run_hard_blocker(root, recent_rows=recent_rows):
+        return False
+    if recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=max(240, recent_rows),
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    ):
         return False
     return should_seed_action(
         root,
@@ -5637,6 +5688,11 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     dflash_blocked = "frontier-dflash" in exhausted or dflash_lane_is_blocked(root, recent_rows=240)
     runtime_clean_exhausted = runtime_overhead_repeated_clean(root, recent_rows=160)
     calibration_blocker = recent_calibration_run_hard_blocker(root, recent_rows=240)
+    calibration_no_lift = recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=240,
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    )
     adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
     bottleneck_state = drafter_bottleneck_state(root, recent_rows=240)
     active_calibration_stages = {
@@ -5691,6 +5747,12 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             if task_id.startswith("trace-distillation-gradient-repair-"):
                 calibration_blocked_action = False
         if calibration_blocker and calibration_blocked_action:
+            continue
+        if calibration_no_lift and (
+            action in {"drafter-calibration-canary", "drafter-calibration-run"}
+            or "drafter-calibration-canary" in task_id
+            or "drafter-calibration-run" in task_id
+        ):
             continue
         seedable.append(task)
     return seedable

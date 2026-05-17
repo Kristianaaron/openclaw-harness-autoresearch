@@ -192,6 +192,14 @@ def check_prompt_and_routing_guards(helper) -> None:
     assert helper.is_supervisor_calibration_memory_report_task(
         {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research calibration-memory-report"}
     )
+    calibration_output = (
+        '{"baseline_first_draft_acceptance": 0.25, '
+        '"best_first_draft_acceptance": 0.5, '
+        '"adapter_file": "openclaw-logit-bias-adapter.npz"}'
+    )
+    assert helper.calibration_float_metric(calibration_output, "baseline_first_draft_acceptance") == 0.25
+    assert helper.calibration_float_metric(calibration_output, "best_first_draft_acceptance") == 0.5
+    assert helper.calibration_string_metric(calibration_output, "adapter_file") == "openclaw-logit-bias-adapter.npz"
     assert helper.is_supervisor_source_scout_task(
         {"next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic frontier-decode-speed"}
     )

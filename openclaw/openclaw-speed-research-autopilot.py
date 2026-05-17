@@ -400,6 +400,21 @@ def calibration_memory_gate_issue(output: str) -> str:
     return ""
 
 
+def calibration_float_metric(output: str, key: str) -> float | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*([-+]?\d+(?:\.\d+)?)', output)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def calibration_string_metric(output: str, key: str) -> str:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', output)
+    return match.group(1) if match else ""
+
+
 def is_memory_or_crash_issue(text: object) -> bool:
     lower = str(text).lower()
     return any(term in lower for term in MEMORY_OR_CRASH_TERMS)
@@ -3941,6 +3956,15 @@ def run_supervisor_drafter_calibration_run_task(
             },
         )
     calibration_mode = str(task.get("calibration_mode", ""))
+    baseline_acceptance = calibration_float_metric(result.stdout, "baseline_first_draft_acceptance")
+    best_acceptance = calibration_float_metric(result.stdout, "best_first_draft_acceptance")
+    acceptance_lift = None
+    if baseline_acceptance is not None and best_acceptance is not None:
+        acceptance_lift = round(best_acceptance - baseline_acceptance, 6)
+    adapter_file = calibration_string_metric(result.stdout, "adapter_file")
+    evaluation_decision = "blocked"
+    if status == "keep":
+        evaluation_decision = "candidate-ready-for-paired-benchmark" if (acceptance_lift or 0.0) > 0 else "reject-no-lift"
     append_result(
         WORKSPACE,
         run_id=f"supervisor-drafter-calibration-run-{cycle}",
@@ -3953,6 +3977,22 @@ def run_supervisor_drafter_calibration_run_task(
             f"blocker={gradient_issue or ''} output_tail={result.stdout[-500:]}"
         ),
     )
+    if status == "keep":
+        append_result(
+            WORKSPACE,
+            run_id=f"drafter-calibration-evaluation-{cycle}",
+            status="keep" if evaluation_decision == "candidate-ready-for-paired-benchmark" else "discard",
+            target="janq-drafter-calibration-evaluation",
+            hypothesis="bounded JANQ drafter calibration must show acceptance lift before another canary or promotion",
+            commit=current_commit(),
+            notes=clean_tsv(
+                f"decision={evaluation_decision} calibration_mode={calibration_mode} "
+                f"baseline_acceptance={baseline_acceptance if baseline_acceptance is not None else ''} "
+                f"best_acceptance={best_acceptance if best_acceptance is not None else ''} "
+                f"acceptance_lift={acceptance_lift if acceptance_lift is not None else ''} "
+                f"adapter_file={adapter_file}"
+            ),
+        )
     complete_supervisor_task(
         task,
         status=status,
@@ -3964,6 +4004,11 @@ def run_supervisor_drafter_calibration_run_task(
             "gradient_issue": gradient_issue,
             "calibration_mode": calibration_mode,
             "trace_distillation": bool(task.get("trace_distillation")),
+            "baseline_acceptance": baseline_acceptance,
+            "best_acceptance": best_acceptance,
+            "acceptance_lift": acceptance_lift,
+            "evaluation_decision": evaluation_decision,
+            "adapter_file": adapter_file,
             "output_tail": result.stdout[-1200:],
             "command": command,
         },

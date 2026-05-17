@@ -1879,6 +1879,56 @@ def main() -> int:
                             not str(task.get("id", "")).startswith("deliberate-drafter-fit-plan-")
                             for task in synthesized_route
                         )
+                        no_lift_root = Path(tmp) / "adapter-calibration-no-lift-root"
+                        helper.ensure_research_state(no_lift_root)
+                        helper.append_result(
+                            no_lift_root,
+                            run_id="drafter-calibration-evaluation-unit",
+                            status="discard",
+                            target="janq-drafter-calibration-evaluation",
+                            hypothesis="unit no-lift adapter calibration",
+                            commit="abc123",
+                            notes=(
+                                "decision=reject-no-lift calibration_mode=adapter-logit-distillation "
+                                "baseline_acceptance=1.0 best_acceptance=1.0 acceptance_lift=0.0"
+                            ),
+                        )
+                        assert helper.recent_calibration_rejected_no_lift(
+                            no_lift_root,
+                            calibration_mode_filter="adapter-logit-distillation",
+                        )
+                        assert not helper.should_seed_drafter_calibration_canary(no_lift_root)
+                        assert not helper.should_seed_quant_safe_drafter_canary(no_lift_root)
+                        assert not helper.should_seed_drafter_calibration_run(no_lift_root)
+                        assert helper.filter_seedable_tasks(
+                            no_lift_root,
+                            [
+                                helper.drafter_calibration_canary_task(
+                                    123467,
+                                    task_id="adapter-drafter-calibration-canary-current",
+                                    calibration_mode_value="adapter-logit-distillation",
+                                ),
+                                helper.drafter_calibration_run_task(
+                                    123468,
+                                    task_id="drafter-calibration-run-123468",
+                                    bounded_command=["python3", "calibrate.py"],
+                                    calibration_mode_value="adapter-logit-distillation",
+                                ),
+                            ],
+                        ) == []
+                        helper.append_result(
+                            no_lift_root,
+                            run_id="agent-deliberation-quant-safe-drafter-candidate-unit",
+                            status="keep",
+                            target="frontier-quant-safe-drafter-candidate",
+                            hypothesis="new quant-safe-drafter-candidate after no-lift",
+                            commit="abc123",
+                            notes="new-drafter-candidate path=/tmp/candidate",
+                        )
+                        assert not helper.recent_calibration_rejected_no_lift(
+                            no_lift_root,
+                            calibration_mode_filter="adapter-logit-distillation",
+                        )
                         old_bridge_row = [
                             {
                                 "timestamp": "2026-05-10T00:00:00+0000",
