@@ -39,6 +39,7 @@ from openclaw_speed_research_core import (
     exhausted_lanes,
     gepa_escalation_report,
     gepa_policy_promotion_report,
+    gepa_decision_score,
     latest_decode_mean,
     mark_lane_exhausted,
     measurement_artifact_analysis,
@@ -52,6 +53,7 @@ from openclaw_speed_research_core import (
     score_insight,
     semantic_task_key,
     seed_gepa_canary_task,
+    select_next_task,
     suppress_stale_gepa_policy_canaries,
     task_operational_blocker,
     task_contract_issues,
@@ -8841,9 +8843,11 @@ def frontier_autonomy_score_report(
         not crabbox_required
         or bool(crabbox_evidence and crabbox_evidence.get("_valid_for_architectural_promotion"))
     )
+    scorecard_gate_ok = scorecard_overall >= scorecard_threshold
     hard_gates = {
         "quality_score_at_least_99": quality_score >= float(thresholds.get("quality_score", 99)),
-        "scorecard_at_least_99": scorecard_overall >= scorecard_threshold,
+        "scorecard_at_least_continue_threshold": scorecard_gate_ok,
+        "scorecard_at_least_99_for_promotion": (not promotion) or scorecard_overall >= float(thresholds.get("scorecard_overall", 99)),
         "frontier_at_least_9_8": frontier_overall >= float(thresholds.get("frontier_overall", 9.8)),
         "handoff_is_100": handoff_score >= float(thresholds.get("handoff_score", 100)),
         "stability_burn_in_pass": bool(burn_in.get("ok")),
@@ -8860,7 +8864,7 @@ def frontier_autonomy_score_report(
         hard_gates["no_forbidden_domains"] = not any(fragment in touched.lower() for fragment in DENIED_PATCH_FRAGMENTS)
     components = {
         "stability": 30 if all(hard_gates[key] for key in ("stability_burn_in_pass", "canonical_clean", "zero_active_noise", "no_bad_behavior_rows")) else 0,
-        "research_quality": 20 if hard_gates["quality_score_at_least_99"] and hard_gates["scorecard_at_least_99"] else 0,
+        "research_quality": 20 if hard_gates["quality_score_at_least_99"] and hard_gates["scorecard_at_least_continue_threshold"] else 0,
         "implementation_safety": 20 if hard_gates["patch_classification_allowed"] and hard_gates["patch_tests_complete"] and hard_gates.get("no_forbidden_domains", True) else 0,
         "frontier_harness_health": 15 if hard_gates["frontier_at_least_9_8"] and hard_gates["handoff_is_100"] else 0,
         "speed_progress": 15 if latest_decode_mean(root, recent_rows=recent_rows) is not None or not promotion else 0,
@@ -8891,6 +8895,8 @@ def frontier_autonomy_score_report(
                 "artifact": quality.get("_artifact_path", ""),
                 "quality_score": quality_score,
                 "scorecard_overall": scorecard_overall,
+                "scorecard_threshold": scorecard_threshold,
+                "scorecard_threshold_mode": "promotion_strict" if promotion else "research_continue",
                 "verdict": quality.get("verdict", ""),
             },
             "frontier": {

@@ -1179,6 +1179,9 @@ def semantic_task_key(task: dict[str, Any]) -> str:
         return "drafter-alignment:drafter-calibration-canary:acceptance_lift"
     if action == "calibration-memory-report" or "calibration-memory-report" in text:
         return "drafter-alignment:calibration-memory-report:calibration_memory_root_cause"
+    if action == "drafter-calibration-run" or task_id.startswith("drafter-calibration-run-") or "openclaw-mtp-drafter-calibrate.py" in next_action:
+        mode = normalize_strategy_token(task.get("calibration_mode") or "")
+        return f"drafter-alignment:drafter-calibration-run:{mode or 'bounded'}"
     if action == "implementation-bridge" or "implementation-bridge" in text:
         return "implementation-gate:implementation-bridge:deterministic_handoff"
     if action == "dflash-compatibility-gate" or "dflash-compatibility" in text:
@@ -1442,6 +1445,8 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         "drafter-calibration-run-",
     ):
         return "bounded drafter calibration run is already ready; execute it before advisory deliberation"
+    if is_calibration_canary_task(task) and active_task_prefix_exists(root, "drafter-calibration-run-"):
+        return "bounded drafter calibration run is already ready; do not reseed calibration canary"
     key = semantic_task_key(task)
     semantic = memory.get("semantic_tasks", {}) if isinstance(memory.get("semantic_tasks"), dict) else {}
     state = semantic.get(key, {}) if isinstance(semantic.get(key), dict) else {}
@@ -2404,12 +2409,87 @@ def is_calibration_memory_stage_task(task: dict[str, Any]) -> bool:
     )
 
 
+def is_calibration_run_task(task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id", ""))
+    next_action = str(task.get("next_action", ""))
+    return (
+        task.get("supervisor_action") == "drafter-calibration-run"
+        or task_id.startswith("drafter-calibration-run-")
+        or "openclaw-mtp-drafter-calibrate.py" in next_action
+    )
+
+
 def has_active_calibration_memory_stage(root: Path) -> bool:
     return any(
         is_calibration_memory_stage_task(task)
         for task in read_jsonl(root / "tasks.jsonl")
         if task.get("status", "ready") in {"ready", "rework"}
     )
+
+
+def gepa_decision_score(root: Path, task: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic GEPA-style pre-selection score.
+
+    GEPA remains canary-only for policy mutation, but its core idea belongs in
+    scheduling too: use trajectory evidence, explicit side information, and
+    Pareto tradeoffs before choosing the next action. This score is deliberately
+    deterministic so safety-critical routing does not depend on free-form model
+    reasoning.
+    """
+
+    score = 0.0
+    reasons: list[str] = []
+    task_id = str(task.get("id", ""))
+    lane = lane_key_for_task(task)
+    key = semantic_task_key(task)
+    text = " ".join(
+        str(task.get(field, ""))
+        for field in ("id", "lane", "target", "hypothesis", "metric", "supervisor_action", "next_action")
+    ).lower()
+    progress = read_json(root / "progress-memory.json", {})
+    current_owner = progress.get("current_owner", {}) if isinstance(progress, dict) else {}
+    owner_task_id = str(current_owner.get("task_id", ""))
+    owner_action = str(current_owner.get("next_action", ""))
+    owner_ready = bool(owner_task_id) and active_task_prefix_exists(root, owner_task_id)
+    if owner_task_id and task_id == owner_task_id:
+        score += 160
+        reasons.append("progress-memory owner is the next best action")
+    elif owner_action and owner_action == str(task.get("next_action", "")):
+        score += 120
+        reasons.append("task matches progress-memory owner action")
+    elif owner_ready and lane in {"frontier-deliberation", "frontier-expansion", "policy-optimization"}:
+        score -= 70
+        reasons.append("advisory work waits while concrete progress owner is ready")
+
+    not_progress = [str(item).lower() for item in progress.get("not_progress", [])] if isinstance(progress, dict) else []
+    if key in {
+        "frontier-deliberation:source-scout:source_evidence_count",
+        "production-mtp:mtp-report:mean_accept",
+    } and any("source-scout or mtp reports" in item for item in not_progress):
+        score -= 150
+        reasons.append("progress memory says source-scout/MTP reseeding is not progress")
+    if key == "frontier-expansion:synthesis-frontier:ranked_ideas" and owner_ready:
+        score -= 120
+        reasons.append("synthesis is blocked while an executable owner is ready")
+    if is_calibration_run_task(task):
+        score += 140
+        reasons.append("bounded drafter calibration is the current breakthrough gate")
+    if is_calibration_canary_task(task) and active_task_prefix_exists(root, "drafter-calibration-run-"):
+        score -= 180
+        reasons.append("calibration run already exists; canary reseed would be noise")
+    if str(task.get("supervisor_action", "")) == "gepa-policy-canary":
+        score -= 20
+        reasons.append("GEPA policy mutation remains canary-only and secondary to concrete speed work")
+    if lane in exhausted_lanes(root) and lane != "exhaustion-report":
+        score -= 200
+        reasons.append(f"lane is exhausted: {lane}")
+    if any(token in text for token in ("tool loop", "malformed", "reasoning leak", "thought thought")):
+        score -= 200
+        reasons.append("bad-behavior signal is fail-closed")
+    if any(token in text for token in ("decode_tps", "mean_accept", "acceptance_delta", "drafter", "calibration")):
+        score += 12
+        reasons.append("task is aligned to decode-speed objective")
+    return {"score": round(score, 3), "reasons": reasons[:8]}
 
 
 def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
@@ -2444,6 +2524,9 @@ def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     if is_calibration_memory_stage_task(task):
         score += 80
         reasons.append("calibration stage is the next prerequisite after a passing canary")
+    elif is_calibration_run_task(task):
+        score += 90
+        reasons.append("bounded calibration run advances the drafter-fit lane")
     elif is_calibration_canary_task(task) and has_active_calibration_memory_stage(root):
         score -= 90
         reasons.append("calibration canary is suppressed while a memory-stage task is ready")
@@ -2486,10 +2569,14 @@ def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
         if decode_mean is not None and decode_mean < 20:
             score += 25
             reasons.append("baseline exists; acceptance diagnosis should precede more tuning")
+    gepa = gepa_decision_score(root, task)
+    score += float(gepa["score"])
+    reasons.extend(f"gepa: {reason}" for reason in gepa["reasons"])
 
     return {
         "task_id": str(task.get("id", "")),
         "score": round(score, 3),
+        "gepa_decision_score": gepa["score"],
         "base_priority": base,
         "lane": lane,
         "risk": risk,

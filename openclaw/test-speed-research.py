@@ -3231,6 +3231,70 @@ def main() -> int:
                 )
                 import openclaw_speed_research_core as core
 
+                run_task = next(
+                    task
+                    for task in core.read_jsonl(canary_root / "tasks.jsonl")
+                    if str(task.get("id", "")).startswith("drafter-calibration-run-")
+                    and task.get("status") == "ready"
+                )
+                (canary_root / "progress-memory.json").write_text(
+                    json.dumps(
+                        {
+                            "current_owner": {
+                                "task_id": run_task["id"],
+                                "next_action": run_task["next_action"],
+                            },
+                            "not_progress": [
+                                "Repeating source-scout or MTP reports after calibration-memory reports."
+                            ],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                high_priority_canary = helper.drafter_calibration_canary_task(
+                    123464,
+                    task_id="adapter-drafter-calibration-canary-should-lose",
+                )
+                high_priority_canary["priority"] = 300
+                source_scout = {
+                    "id": "source-scout-should-lose",
+                    "status": "ready",
+                    "priority": 290,
+                    "lane": "frontier-deliberation",
+                    "task_type": "supervisor",
+                    "supervisor_action": "source-scout",
+                    "target": "Rapid-MLX",
+                    "metric": "source_evidence_count",
+                    "guard_checks": ["no_model_load"],
+                    "acceptance": "source note exists",
+                    "rollback": "read-only",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --limit 1",
+                }
+                synthesis_task = {
+                    "id": "synthesis-should-lose",
+                    "status": "ready",
+                    "priority": 280,
+                    "lane": "frontier-expansion",
+                    "task_type": "supervisor",
+                    "supervisor_action": "implementation-bridge",
+                    "target": "tasks.jsonl/results.tsv",
+                    "metric": "deterministic_handoff",
+                    "guard_checks": ["no_model_load"],
+                    "acceptance": "unit",
+                    "rollback": "unit",
+                    "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+                }
+                core.write_jsonl(
+                    canary_root / "tasks.jsonl",
+                    [*core.read_jsonl(canary_root / "tasks.jsonl"), high_priority_canary, source_scout, synthesis_task],
+                )
+                ranked = {item["task_id"]: item for item in core.rank_tasks(canary_root, limit=10)}
+                assert ranked[run_task["id"]]["gepa_decision_score"] > 0
+                assert ranked["adapter-drafter-calibration-canary-should-lose"]["gepa_decision_score"] < 0
+                assert ranked["source-scout-should-lose"]["gepa_decision_score"] < 0
+                assert core.select_next_task(canary_root)["id"] == run_task["id"]
+
                 helper.upsert_tasks(
                     canary_root,
                     [
@@ -3288,7 +3352,7 @@ def main() -> int:
             assert report["total_score"] == 100
             promotion_report = helper.frontier_autonomy_score_report(autonomy_root, promotion=True)
             assert promotion_report["ok"] is False
-            assert "scorecard_at_least_99" in promotion_report["hard_gate_failures"]
+            assert "scorecard_at_least_99_for_promotion" in promotion_report["hard_gate_failures"]
     return 0
 
 
