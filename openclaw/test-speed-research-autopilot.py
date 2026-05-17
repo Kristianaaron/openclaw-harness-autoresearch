@@ -981,8 +981,40 @@ def main() -> int:
         quick_after = helper.durable_snapshot()
         quality = helper.cycle_quality(helper.WORKSPACE, quick_before, quick_after, ["results row"], "")
         assert quality["status"] == "noise"
+        helper.RESULTS.write_text(
+            helper.RESULTS_HEADER
+            + (
+                "2026-05-05T00:00:01+0000\tdrafter-calibration-canary-old\tkeep\t"
+                "janq-drafter-calibration-canary\th\t\t\t\t\t\tc\t"
+                "decision=ready-for-bounded-calibration calibration_mode=adapter-logit-distillation "
+                "seeded_stage_task=0 seeded_run_task=1\n"
+            ),
+            encoding="utf-8",
+        )
+        repeat_before = helper.durable_snapshot()
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            file.write(
+                "2026-05-05T00:00:02+0000\tdrafter-calibration-canary-new\tkeep\t"
+                "janq-drafter-calibration-canary\th\t\t\t\t\t\tc\t"
+                "decision=ready-for-bounded-calibration calibration_mode=adapter-logit-distillation "
+                "seeded_stage_task=0 seeded_run_task=1\n"
+            )
+        repeat_after = helper.durable_snapshot()
+        quality = helper.cycle_quality(helper.WORKSPACE, repeat_before, repeat_after, ["results row", "benchmark artifact"], "")
+        assert quality["status"] == "noise"
+        assert "repeated semantic action" in quality["reason"]
+        with helper.RESULTS.open("a", encoding="utf-8") as file:
+            file.write(
+                "2026-05-05T00:00:03+0000\tdrafter-calibration-evaluation-unit\tkeep\t"
+                "janq-drafter-calibration-evaluation\th\t\t\t\t\t\tc\t"
+                "decision=reject-no-lift calibration_mode=adapter-logit-distillation "
+                "baseline_acceptance=1.0 best_acceptance=1.0 acceptance_lift=0.0\n"
+            )
+        evaluation_after = helper.durable_snapshot()
+        quality = helper.cycle_quality(helper.WORKSPACE, repeat_after, evaluation_after, ["results row"], "")
+        assert quality["status"] != "noise"
         malformed_before = dict(quick_after)
-        malformed_before["results_lines"] = 2
+        malformed_before["results_lines"] = helper.results_line_count()
         with helper.RESULTS.open("a", encoding="utf-8") as file:
             file.write("bad\trow\n")
         malformed_after = helper.durable_snapshot()

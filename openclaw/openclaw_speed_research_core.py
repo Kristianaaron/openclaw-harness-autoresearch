@@ -25,6 +25,11 @@ RESULTS_HEADER = (
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
 CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
 ADAPTER_LOGIT_LOOP_THRESHOLD = 2
+REPEAT_PRONE_SEMANTIC_KEYS = {
+    "drafter-alignment:drafter-calibration-canary:acceptance_lift",
+    "frontier-expansion:synthesis-frontier:ranked_ideas",
+    "production-mtp:mtp-report:mean_accept",
+}
 BENCHMARK_MANIFEST_VERSION = 1
 RESEARCH_PROFILE_VERSION = 3
 EVALUATOR_POLICY_VERSION = 1
@@ -1236,6 +1241,71 @@ def semantic_result_key(row: dict[str, str]) -> str:
             normalize_strategy_token(parse_note_fields(notes).get("metric", "")),
         ]
     )
+
+
+def semantic_result_signature(row: dict[str, str]) -> str:
+    fields = parse_note_fields(row.get("notes", ""))
+    key = semantic_result_key(row)
+    detail_keys = (
+        "decision",
+        "calibration_mode",
+        "stage",
+        "blocker",
+        "seeded_stage_task",
+        "seeded_run_task",
+        "winner_block",
+        "mean_accept",
+    )
+    details = [f"{name}={fields.get(name, '')}" for name in detail_keys if fields.get(name, "") != ""]
+    return key + ("|" + "|".join(details) if details else "")
+
+
+def result_row_has_material_transition(row: dict[str, str]) -> bool:
+    fields = parse_note_fields(row.get("notes", ""))
+    key = semantic_result_key(row)
+    if row.get("target") == "decode-sample" and parse_float(row.get("decode_tps")) is not None:
+        return True
+    if key.startswith("drafter-alignment:drafter-calibration-evaluation:"):
+        return fields.get("decision", "") in {"candidate-ready-for-paired-benchmark", "reject-no-lift"}
+    if key == "frontier-expansion:quant-safe-drafter-candidate:contract":
+        return True
+    if row.get("run_id", "").startswith(("patch-executor-", "supervisor-focused-test-")):
+        return True
+    return False
+
+
+def repeated_semantic_nonprogress(
+    root: Path,
+    new_rows: list[dict[str, str]],
+    *,
+    before_line_count: int,
+    recent_rows: int = 120,
+) -> str:
+    """Detect artifact churn that repeats the same semantic step.
+
+    A frontier score must not pass just because the loop wrote fresh JSON or
+    markdown. If the new rows only repeat high-risk semantic actions already
+    seen in the recent window, and no row closes or advances the state, the
+    cycle is noise.
+    """
+
+    material = [row for row in new_rows if row.get("status") == "keep"]
+    if not material:
+        return ""
+    if any(result_row_has_material_transition(row) for row in material):
+        return ""
+    keys = {semantic_result_key(row) for row in material}
+    if not keys:
+        return ""
+    repeat_keys = {key for key in keys if key in REPEAT_PRONE_SEMANTIC_KEYS or key.startswith("drafter-alignment:drafter-calibration-run:")}
+    if repeat_keys != keys:
+        return ""
+    previous_rows = all_result_rows(root)[: max(0, before_line_count - 1)][-max(1, recent_rows) :]
+    previous_signatures = {semantic_result_signature(row) for row in previous_rows}
+    repeated = [semantic_result_signature(row) for row in material if semantic_result_signature(row) in previous_signatures]
+    if len(repeated) == len(material):
+        return "repeated semantic action without material transition: " + ",".join(sorted(keys))
+    return ""
 
 
 def latest_result_position(rows: list[dict[str, str]], key: str) -> int:
@@ -3252,6 +3322,13 @@ def cycle_quality(
     if malformed_rows:
         return {"score": 0, "status": "blocked", "reason": f"malformed results.tsv rows={malformed_rows}"}
     rows = result_rows_since(root, int(before.get("results_lines", 0)))
+    semantic_noise = repeated_semantic_nonprogress(
+        root,
+        rows,
+        before_line_count=int(before.get("results_lines", 0)),
+    )
+    if semantic_noise:
+        return {"score": 0, "status": "noise", "reason": semantic_noise}
     targets = {row.get("target", "") for row in rows}
     if targets and targets <= {"quick-benchmark", "quick-health"} and len(progress_reasons) <= 2:
         return {"score": 1, "status": "noise", "reason": "quick health benchmark without comparison or synthesis"}
