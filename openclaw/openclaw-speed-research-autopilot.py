@@ -415,6 +415,140 @@ def calibration_string_metric(output: str, key: str) -> str:
     return match.group(1) if match else ""
 
 
+def parse_note_fields(notes: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for token in notes.replace(",", " ").split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key] = value
+    return fields
+
+
+def calibration_fingerprint_fields(mode: str, text: str = "") -> dict[str, str]:
+    mode = mode if mode else "direct-pre-projection"
+    fields: dict[str, str] = {"mode": mode, "training_mode": mode}
+    if mode == "adapter-logit-distillation":
+        fields.update(
+            {
+                "trainable": "bias",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "target-logit-distillation",
+            }
+        )
+    for key in ("training_mode", "target_trace_policy", "target_gradient_policy"):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', text)
+        if match:
+            fields[key] = match.group(1)
+    for key in ("adapter_rank", "adapter_scale", "positions_per_prompt", "steps", "train_samples", "eval_samples"):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*([-+]?\d+(?:\.\d+)?)', text)
+        if match:
+            fields[key] = match.group(1)
+    trainable = re.search(r'"trainable"\s*:\s*\[([^\]]*)\]', text, re.S)
+    if trainable:
+        names = re.findall(r'"([^"]+)"', trainable.group(1))
+        if names:
+            fields["trainable"] = ",".join(sorted(names))
+    return fields
+
+
+def calibration_fingerprint_id(fields: dict[str, str]) -> str:
+    keys = (
+        "mode",
+        "training_mode",
+        "trainable",
+        "adapter_rank",
+        "adapter_scale",
+        "positions_per_prompt",
+        "target_trace_policy",
+        "target_gradient_policy",
+        "loss",
+    )
+    return "|".join(f"{key}={fields.get(key, '')}" for key in keys)
+
+
+def calibration_task_fingerprint(task: dict[str, object]) -> str:
+    existing = task.get("calibration_fingerprint")
+    if isinstance(existing, str) and existing:
+        return existing
+    if isinstance(existing, dict):
+        return calibration_fingerprint_id({str(key): str(value) for key, value in existing.items()})
+    mode = str(task.get("calibration_mode") or "direct-pre-projection")
+    return calibration_fingerprint_id(calibration_fingerprint_fields(mode))
+
+
+def exhausted_calibration_fingerprints(recent_rows: int = 600) -> set[str]:
+    rows = all_result_rows(WORKSPACE)[-max(1, recent_rows) :]
+    exhausted: set[str] = set()
+    for index, row in enumerate(rows):
+        if row.get("target") != "janq-drafter-calibration-evaluation":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("decision") != "reject-no-lift":
+            continue
+        mode = fields.get("calibration_mode", "direct-pre-projection")
+        text = row.get("notes", "")
+        for previous in reversed(rows[max(0, index - 8) : index]):
+            if previous.get("run_id", "").startswith("supervisor-drafter-calibration-run-"):
+                text += " " + previous.get("notes", "")
+                break
+        exhausted.add(calibration_fingerprint_id(calibration_fingerprint_fields(mode, text)))
+    for task in read_jsonl(TASKS):
+        summary = task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}
+        if summary.get("evaluation_decision") != "reject-no-lift":
+            continue
+        mode = str(summary.get("calibration_mode") or task.get("calibration_mode") or "direct-pre-projection")
+        exhausted.add(calibration_fingerprint_id(calibration_fingerprint_fields(mode, json.dumps(summary, sort_keys=True))))
+    return exhausted
+
+
+def suppress_exhausted_calibration_task(task: dict[str, object], cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
+    fingerprint = calibration_task_fingerprint(task)
+    if fingerprint not in exhausted_calibration_fingerprints():
+        return False, ""
+    reason = f"exhausted calibration candidate fingerprint: {fingerprint}"
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} suppressed exhausted calibration task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write(reason + "\n")
+    append_result(
+        WORKSPACE,
+        run_id=f"calibration-fingerprint-suppression-{cycle}",
+        status="keep",
+        target="janq-drafter-candidate-fingerprint",
+        hypothesis="No-lift drafter candidates must be retired until a material method change exists.",
+        commit=current_commit(),
+        notes=f"task={clean_tsv(task.get('id', 'unknown'))} fingerprint={clean_tsv(fingerprint)}",
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "calibration-fingerprint-suppression",
+            "finding": "suppressed a repeated no-lift drafter calibration candidate before execution",
+            "task": task.get("id", "unknown"),
+            "fingerprint": fingerprint,
+            "next": "require a changed trainable surface, loss, trace shape, adapter type, or drafter architecture",
+        },
+    )
+    complete_supervisor_task(
+        task,
+        status="keep",
+        summary={
+            "reason": reason,
+            "fingerprint": fingerprint,
+            "next": "material_candidate_change_required",
+        },
+        commit=current_commit(),
+    )
+    return True, reason
+
+
 def is_memory_or_crash_issue(text: object) -> bool:
     lower = str(text).lower()
     return any(term in lower for term in MEMORY_OR_CRASH_TERMS)
@@ -6111,11 +6245,23 @@ def main() -> int:
         elif is_supervisor_drafter_trace_collect_task(selected_task):
             code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_canary_task(selected_task):
-            code, issue = run_supervisor_drafter_calibration_canary_task(args, cycle, current_session, selected_task, log_file)
+            suppressed, suppress_issue = suppress_exhausted_calibration_task(selected_task, cycle, current_session, log_file)
+            if suppressed:
+                code, issue = 0, suppress_issue
+            else:
+                code, issue = run_supervisor_drafter_calibration_canary_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_memory_stage_task(selected_task):
-            code, issue = run_supervisor_drafter_calibration_memory_stage_task(args, cycle, current_session, selected_task, log_file)
+            suppressed, suppress_issue = suppress_exhausted_calibration_task(selected_task, cycle, current_session, log_file)
+            if suppressed:
+                code, issue = 0, suppress_issue
+            else:
+                code, issue = run_supervisor_drafter_calibration_memory_stage_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_run_task(selected_task):
-            code, issue = run_supervisor_drafter_calibration_run_task(args, cycle, current_session, selected_task, log_file)
+            suppressed, suppress_issue = suppress_exhausted_calibration_task(selected_task, cycle, current_session, log_file)
+            if suppressed:
+                code, issue = 0, suppress_issue
+            else:
+                code, issue = run_supervisor_drafter_calibration_run_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_dflash_compatibility_task(selected_task):
             code, issue = run_supervisor_dflash_compatibility_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_sweep_task(selected_task):

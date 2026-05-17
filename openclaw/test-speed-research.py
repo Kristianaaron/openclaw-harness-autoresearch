@@ -1916,6 +1916,16 @@ def main() -> int:
                                 ),
                             ],
                         ) == []
+                        exhausted = helper.exhausted_calibration_fingerprints(no_lift_root)
+                        stage_task = helper.drafter_calibration_memory_stage_task(
+                            123469,
+                            stage="micro-step",
+                            task_id="drafter-calibration-memory-stage-micro-step-123469",
+                            bounded_command=["python3", "calibrate.py"],
+                            calibration_mode_value="adapter-logit-distillation",
+                        )
+                        assert helper.calibration_task_fingerprint(stage_task) in exhausted
+                        assert helper.filter_seedable_tasks(no_lift_root, [stage_task]) == []
                         helper.append_result(
                             no_lift_root,
                             run_id="agent-deliberation-quant-safe-drafter-candidate-unit",
@@ -2587,6 +2597,42 @@ def main() -> int:
                 commit="unit-test",
                 notes="malformed hidden/tool output",
             )
+            helper.append_result(
+                root,
+                run_id="autopilot-cycle-repeated-semantic-unit",
+                status="blocked",
+                target="autopilot",
+                hypothesis="pre-fix repeated semantic watchdog rows should be resolved by later material routing",
+                commit="unit-test",
+                notes="issue=repeated semantic action without material transition: drafter-alignment:drafter-calibration-run:adapter-logit-distillation",
+            )
+            helper.append_result(
+                root,
+                run_id="drafter-bottleneck-review-seed-zero-unit",
+                status="blocked",
+                target="janq-drafter-bottleneck",
+                hypothesis="pre-fix seed-zero bottleneck rows should be resolved by later material routing",
+                commit="unit-test",
+                notes="state=adapter_method_implementation_done next_step=seed_adapter_calibration_canary seeded_tasks=0",
+            )
+            helper.append_result(
+                root,
+                run_id="quality-review-needs-repair-unit",
+                status="blocked",
+                target="autoresearch-quality",
+                hypothesis="pre-fix needs-repair review rows should be resolved by later material routing",
+                commit="unit-test",
+                notes="verdict=needs-repair score=74",
+            )
+            helper.append_result(
+                root,
+                run_id="drafter-bottleneck-review-routed-unit",
+                status="keep",
+                target="janq-drafter-bottleneck",
+                hypothesis="later material routing resolves seed-zero drafter bottleneck debt",
+                commit="unit-test",
+                notes="state=adapter_calibration_no_lift next_step=seed_quant_safe_drafter_candidate seeded_tasks=1",
+            )
             canonical_with_external = helper.canonical_autoresearch_state(root, recent_rows=120)
             assert canonical_with_external["noise"]["unresolved_blocked_rows"] == 0
             assert canonical_with_external["noise"]["memory_blocks"] == 0
@@ -3241,6 +3287,34 @@ def main() -> int:
             )
             assert len(no_lift_tasks) == 1
             assert no_lift_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-")
+            assert helper.exhausted_calibration_fingerprints(progress_root)
+            stale_canary = helper.drafter_calibration_canary_task(
+                1778980002,
+                task_id="adapter-drafter-calibration-canary-stale",
+                calibration_mode_value=helper.CALIBRATION_ADAPTER_MODE,
+            )
+            assert helper.filter_seedable_tasks(progress_root, [stale_canary]) == []
+
+            repeated_canary_root = Path(tmp) / "repeated-adapter-canary-route"
+            helper.ensure_research_state(repeated_canary_root)
+            helper.write_jsonl(repeated_canary_root / "tasks.jsonl", [completed])
+            helper.append_result(
+                repeated_canary_root,
+                run_id="adapter-drafter-calibration-canary-current",
+                status="keep",
+                target="janq-drafter-calibration-canary",
+                hypothesis="unit adapter canary already ran",
+                commit="abc123",
+                notes="calibration_mode=adapter-logit-distillation seeded_stage_task=1",
+            )
+            repeated_route_tasks = helper.drafter_bottleneck_next_tasks(
+                repeated_canary_root,
+                helper.result_rows(repeated_canary_root),
+                1778980003,
+                reason="unit repeated adapter canary route",
+            )
+            assert len(repeated_route_tasks) == 1
+            assert repeated_route_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-")
         with tempfile.TemporaryDirectory() as canary_tmp:
             canary_root = Path(canary_tmp) / "research" / "speed"
             canary_home = Path(canary_tmp) / "home"

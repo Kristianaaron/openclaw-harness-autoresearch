@@ -1013,6 +1013,28 @@ def main() -> int:
         evaluation_after = helper.durable_snapshot()
         quality = helper.cycle_quality(helper.WORKSPACE, repeat_after, evaluation_after, ["results row"], "")
         assert quality["status"] != "noise"
+        exhausted_task = {
+            "id": "drafter-calibration-run-exhausted-unit",
+            "status": "ready",
+            "task_type": "supervisor",
+            "supervisor_action": "drafter-calibration-run",
+            "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+            "hypothesis": "unit exhausted fingerprint",
+            "calibration_mode": "adapter-logit-distillation",
+            "next_action": "openclaw-mtp-drafter-calibrate.py --calibration-mode adapter-logit-distillation",
+        }
+        helper.write_jsonl(helper.TASKS, [exhausted_task])
+        suppressed, suppress_reason = helper.suppress_exhausted_calibration_task(
+            exhausted_task,
+            999,
+            "unit",
+            helper.LOG_DIR / "unit-suppression.log",
+        )
+        assert suppressed
+        assert "exhausted calibration candidate fingerprint" in suppress_reason
+        task_after = helper.read_jsonl(helper.TASKS)[0]
+        assert task_after["status"] == "done"
+        assert task_after["supervisor_summary"]["next"] == "material_candidate_change_required"
         malformed_before = dict(quick_after)
         malformed_before["results_lines"] = helper.results_line_count()
         with helper.RESULTS.open("a", encoding="utf-8") as file:

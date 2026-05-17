@@ -2257,6 +2257,31 @@ def unresolved_actionable_blocked_rows(rows: list[dict[str, str]]) -> list[dict[
             and "model-bound research turn deferred" in notes
         ):
             continue
+        if (
+            index < latest_progress_index
+            and target == "autopilot"
+            and "repeated semantic action without material transition" in notes
+        ):
+            continue
+        if (
+            index < latest_progress_index
+            and target == "janq-drafter-bottleneck"
+            and "next_step=seed_adapter_calibration_canary" in notes
+            and "seeded_tasks=0" in notes
+        ):
+            continue
+        if index < latest_progress_index and target in {
+            "autoresearch-quality",
+            "autoresearch-review-council",
+            "frontier-autonomy-score",
+            "autoresearch-self-improvement-alive",
+        } and (
+            "verdict=needs-repair" in notes
+            or "decision=repair" in notes
+            or "ok=False" in notes
+            or "readiness=warming" in notes
+        ):
+            continue
         if index < latest_clean_checkpoint_index and (
             row.get("target") == "autoresearch-implementation-handoff"
             or row.get("target") == "autoresearch-review-council"
@@ -3367,6 +3392,120 @@ def calibration_task_mode(task: dict[str, Any]) -> str:
     return calibration_mode(task.get("calibration_mode"))
 
 
+def calibration_fingerprint_fields(mode: str, overrides: dict[str, Any] | None = None) -> dict[str, str]:
+    """Return the material candidate identity for a drafter fit attempt.
+
+    The autoresearch loop may repair a bad run, but it must not make the same
+    failed candidate eligible again. These fields are intentionally about the
+    trainable method, not timestamps or output paths.
+    """
+
+    fields: dict[str, str] = {
+        "mode": calibration_mode(mode),
+        "training_mode": calibration_mode(mode),
+    }
+    if fields["mode"] == CALIBRATION_ADAPTER_MODE:
+        fields.update(
+            {
+                "trainable": "bias",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "target-logit-distillation",
+            }
+        )
+    if overrides:
+        for key, value in overrides.items():
+            if value is None or value == "":
+                continue
+            fields[str(key)] = str(value)
+    return fields
+
+
+def calibration_fingerprint_from_text(mode: str, text: str) -> dict[str, str]:
+    fields = calibration_fingerprint_fields(mode)
+    string_keys = ("training_mode", "target_trace_policy", "target_gradient_policy", "adapter_file")
+    numeric_keys = ("adapter_rank", "adapter_scale", "positions_per_prompt", "steps", "train_samples", "eval_samples")
+    for key in string_keys:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', text)
+        if match:
+            fields[key] = match.group(1)
+    for key in numeric_keys:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*([-+]?\d+(?:\.\d+)?)', text)
+        if match:
+            fields[key] = match.group(1)
+    trainable = re.search(r'"trainable"\s*:\s*\[([^\]]*)\]', text, re.S)
+    if trainable:
+        names = re.findall(r'"([^"]+)"', trainable.group(1))
+        if names:
+            fields["trainable"] = ",".join(sorted(names))
+    return fields
+
+
+def calibration_fingerprint_id(fields: dict[str, str]) -> str:
+    material_keys = (
+        "mode",
+        "training_mode",
+        "trainable",
+        "adapter_rank",
+        "adapter_scale",
+        "positions_per_prompt",
+        "target_trace_policy",
+        "target_gradient_policy",
+        "loss",
+    )
+    return "|".join(f"{key}={fields.get(key, '')}" for key in material_keys)
+
+
+def calibration_task_fingerprint(task: dict[str, Any]) -> str:
+    existing = task.get("calibration_fingerprint")
+    if isinstance(existing, str) and existing:
+        return existing
+    if isinstance(existing, dict):
+        return calibration_fingerprint_id({str(key): str(value) for key, value in existing.items()})
+    return calibration_fingerprint_id(calibration_fingerprint_fields(calibration_task_mode(task)))
+
+
+def exhausted_calibration_fingerprints(root: Path, *, recent_rows: int = 600) -> set[str]:
+    rows = result_rows(root)[-max(1, recent_rows) :]
+    exhausted: set[str] = set()
+    for index, row in enumerate(rows):
+        if row.get("target") != "janq-drafter-calibration-evaluation":
+            continue
+        fields = parse_note_fields(row.get("notes", ""))
+        if fields.get("decision") != "reject-no-lift":
+            continue
+        mode = calibration_mode(fields.get("calibration_mode"))
+        text = row.get("notes", "")
+        for previous in reversed(rows[max(0, index - 8) : index]):
+            if previous.get("run_id", "").startswith("supervisor-drafter-calibration-run-"):
+                text += " " + previous.get("notes", "")
+                break
+        exhausted.add(calibration_fingerprint_id(calibration_fingerprint_from_text(mode, text)))
+    for task in read_jsonl(root / "tasks.jsonl"):
+        summary = task.get("supervisor_summary") if isinstance(task.get("supervisor_summary"), dict) else {}
+        if summary.get("evaluation_decision") != "reject-no-lift":
+            continue
+        mode = calibration_mode(summary.get("calibration_mode") or task.get("calibration_mode"))
+        text = json.dumps(summary, sort_keys=True)
+        exhausted.add(calibration_fingerprint_id(calibration_fingerprint_from_text(mode, text)))
+    return exhausted
+
+
+def calibration_task_uses_exhausted_fingerprint(root: Path, task: dict[str, Any], *, recent_rows: int = 600) -> bool:
+    action = str(task.get("supervisor_action", ""))
+    task_id = str(task.get("id", ""))
+    if action not in {"drafter-calibration-canary", "drafter-calibration-memory-stage", "drafter-calibration-run"} and not (
+        "drafter-calibration-canary" in task_id
+        or "drafter-calibration-memory-stage" in task_id
+        or "drafter-calibration-run" in task_id
+    ):
+        return False
+    return calibration_task_fingerprint(task) in exhausted_calibration_fingerprints(root, recent_rows=recent_rows)
+
+
 def calibration_memory_stage_name(task: dict[str, Any]) -> str:
     if str(task.get("supervisor_action", "")) != "drafter-calibration-memory-stage":
         return ""
@@ -4091,6 +4230,7 @@ def drafter_calibration_canary_task(
     calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> dict[str, Any]:
     mode = calibration_mode(calibration_mode_value)
+    fingerprint_fields = calibration_fingerprint_fields(mode)
     return {
         "id": task_id,
         "status": "ready",
@@ -4099,6 +4239,8 @@ def drafter_calibration_canary_task(
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-canary",
         "calibration_mode": mode,
+        "calibration_fingerprint": calibration_fingerprint_id(fingerprint_fields),
+        "calibration_fingerprint_fields": fingerprint_fields,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-drafter-fit.py"],
         "hypothesis": "Once JANQ target traces exist, drafter calibration should advance through a bounded canary gate instead of repeating trace checks.",
@@ -4119,6 +4261,7 @@ def drafter_calibration_run_task(
     calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> dict[str, Any]:
     mode = calibration_mode(calibration_mode_value)
+    fingerprint_fields = calibration_fingerprint_fields(mode)
     return {
         "id": task_id,
         "status": "ready",
@@ -4127,6 +4270,8 @@ def drafter_calibration_run_task(
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-run",
         "calibration_mode": mode,
+        "calibration_fingerprint": calibration_fingerprint_id(fingerprint_fields),
+        "calibration_fingerprint_fields": fingerprint_fields,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-jang-vlm-server.py"],
         "hypothesis": "A validated JANQ trace canary should advance into exactly one bounded calibration experiment.",
@@ -4340,6 +4485,7 @@ def drafter_calibration_memory_stage_task(
     calibration_mode_value: str = CALIBRATION_DIRECT_MODE,
 ) -> dict[str, Any]:
     mode = calibration_mode(calibration_mode_value)
+    fingerprint_fields = calibration_fingerprint_fields(mode)
     return {
         "id": task_id,
         "status": "ready",
@@ -4348,6 +4494,8 @@ def drafter_calibration_memory_stage_task(
         "task_type": "supervisor",
         "supervisor_action": "drafter-calibration-memory-stage",
         "calibration_mode": mode,
+        "calibration_fingerprint": calibration_fingerprint_id(fingerprint_fields),
+        "calibration_fingerprint_fields": fingerprint_fields,
         "stage": stage,
         "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
         "source_files": ["openclaw/openclaw-mtp-drafter-calibrate.py", "openclaw/openclaw-speed-research.py"],
@@ -4599,6 +4747,7 @@ def drafter_bottleneck_state(
         recent_rows=max(240, recent_rows),
         calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
     )
+    adapter_calibration_fingerprint_exhausted = bool(exhausted_calibration_fingerprints(root, recent_rows=600))
     adapter_calibration_attempted = adapter_calibration_active or any(
         "calibration_mode=adapter-logit-distillation" in row.get("notes", "")
         or "adapter-logit-distillation" in row.get("run_id", "")
@@ -4637,13 +4786,12 @@ def drafter_bottleneck_state(
     elif adapter_calibration_active:
         state = "adapter_calibration_active"
         next_step = "wait_for_adapter_calibration"
+    elif adapter_calibration_no_lift or adapter_calibration_fingerprint_exhausted:
+        state = "adapter_calibration_no_lift"
+        next_step = "seed_quant_safe_drafter_candidate"
     elif adapter_implementation_completed:
-        if adapter_calibration_no_lift:
-            state = "adapter_calibration_no_lift"
-            next_step = "seed_quant_safe_drafter_candidate"
-        else:
-            state = "adapter_method_implementation_done"
-            next_step = "seed_adapter_calibration_canary"
+        state = "adapter_method_implementation_done"
+        next_step = "seed_adapter_calibration_canary"
     elif adapter_calibration_stage_issue == "calibration-memory-after-load":
         state = "adapter_calibration_memory_blocked"
         next_step = "seed_adapter_calibration_memory_report"
@@ -4654,12 +4802,8 @@ def drafter_bottleneck_state(
         state = "adapter_calibration_attempted"
         next_step = "wait_for_adapter_calibration_result"
     elif adapter_implementation_attempted:
-        if adapter_calibration_no_lift:
-            state = "adapter_calibration_no_lift"
-            next_step = "seed_quant_safe_drafter_candidate"
-        else:
-            state = "adapter_method_implementation_done"
-            next_step = "seed_adapter_calibration_canary"
+        state = "adapter_method_implementation_done"
+        next_step = "seed_adapter_calibration_canary"
     elif adapter_contract_succeeded:
         state = "adapter_method_contract_ready"
         next_step = "seed_adapter_method_implementation"
@@ -4720,6 +4864,7 @@ def drafter_bottleneck_state(
         "adapter_calibration_active": adapter_calibration_active,
         "adapter_calibration_attempted": adapter_calibration_attempted,
         "adapter_calibration_no_lift": adapter_calibration_no_lift,
+        "adapter_calibration_fingerprint_exhausted": adapter_calibration_fingerprint_exhausted,
         "adapter_calibration_stage_issue": adapter_calibration_stage_issue,
         "quant_safe_candidate_active": quant_safe_candidate_active,
         "fallback_decode_count": fallback_decode_count,
@@ -4935,9 +5080,25 @@ def drafter_bottleneck_next_tasks(
     if step == "seed_adapter_calibration_canary":
         if active_task_has_prefix(root, "adapter-drafter-calibration-canary-"):
             return []
+        if exhausted_calibration_fingerprints(root, recent_rows=600):
+            evidence = {
+                "reason": (
+                    "the current adapter-logit calibration fingerprint is already exhausted; "
+                    "a materially changed quantization-safe drafter candidate is required before another canary"
+                ),
+                "bottleneck_state": state,
+            }
+            return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
         if recent_result_has_prefix(root, "adapter-drafter-calibration-canary-", recent_rows=240):
-            return []
-        return filter_seedable_tasks(
+            evidence = {
+                "reason": (
+                    "adapter calibration canary already ran in the recent evidence window without producing a promotable "
+                    "fit; route to material candidate change instead of reseeding the same canary"
+                ),
+                "bottleneck_state": state,
+            }
+            return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
+        tasks = filter_seedable_tasks(
             root,
             [
                 drafter_calibration_canary_task(
@@ -4948,6 +5109,13 @@ def drafter_bottleneck_next_tasks(
                 )
             ],
         )
+        if tasks:
+            return tasks
+        evidence = {
+            "reason": "adapter calibration canary was not seedable; require a material candidate change instead of reporting a blocked seed",
+            "bottleneck_state": state,
+        }
+        return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
     return []
 
 
@@ -5731,6 +5899,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         recent_rows=240,
         calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
     )
+    exhausted_fingerprints = exhausted_calibration_fingerprints(root, recent_rows=600)
     adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
     bottleneck_state = drafter_bottleneck_state(root, recent_rows=240)
     active_calibration_stages = {
@@ -5785,6 +5954,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             if task_id.startswith("trace-distillation-gradient-repair-"):
                 calibration_blocked_action = False
         if calibration_blocker and calibration_blocked_action:
+            continue
+        if exhausted_fingerprints and calibration_task_fingerprint(task) in exhausted_fingerprints:
             continue
         if calibration_no_lift and (
             action in {"drafter-calibration-canary", "drafter-calibration-run"}
