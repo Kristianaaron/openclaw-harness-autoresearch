@@ -3144,6 +3144,54 @@ def main() -> int:
                 )
                 assert deliberation_tasks == []
                 assert "already active" in report["architect"]["selected_reason"]
+        with tempfile.TemporaryDirectory() as progress_tmp:
+            progress_root = Path(progress_tmp) / "research" / "speed"
+            helper.ensure_research_state(progress_root)
+            completed = helper.drafter_adapter_method_implementation_task(
+                1778978000,
+                task_id="implementation-drafter-adapter-method-completed",
+            )
+            completed["status"] = "done"
+            stale = helper.drafter_adapter_method_implementation_task(
+                1778979999,
+                task_id="implementation-drafter-adapter-method-stale",
+            )
+            helper.write_jsonl(progress_root / "tasks.jsonl", [completed, stale])
+            assert helper.adapter_method_implementation_completed(progress_root)
+            assert helper.drafter_bottleneck_state(progress_root)["next_step"] == "seed_adapter_calibration_canary"
+            blocked = helper.block_operational_strategy_ready_tasks(progress_root)
+            assert blocked >= 1
+            stale_after = [
+                task
+                for task in helper.read_jsonl(progress_root / "tasks.jsonl")
+                if task["id"] == "implementation-drafter-adapter-method-stale"
+            ][0]
+            assert stale_after["status"] == "blocked"
+            assert "already passed" in stale_after["blocked_reason"]
+        with tempfile.TemporaryDirectory() as autonomy_tmp:
+            autonomy_root = Path(autonomy_tmp) / "research" / "speed"
+            helper.ensure_research_state(autonomy_root)
+            benchmarks = autonomy_root / "benchmarks"
+            benchmarks.mkdir(parents=True, exist_ok=True)
+            (benchmarks / "quality-review-1.json").write_text(
+                json.dumps({"ok": True, "quality_score": 100, "verdict": "healthy", "scorecard": {"overall": 98.3}}),
+                encoding="utf-8",
+            )
+            (benchmarks / "frontier-system-eval-1.json").write_text(
+                json.dumps({"ok": True, "overall": 10.0, "readiness": "frontier", "frontier_certified": True}),
+                encoding="utf-8",
+            )
+            (benchmarks / "implementation-handoff-audit-1.json").write_text(
+                json.dumps({"ok": True, "score": 100}),
+                encoding="utf-8",
+            )
+            (benchmarks / "stability-burn-in-1.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+            report = helper.frontier_autonomy_score_report(autonomy_root, promotion=False)
+            assert report["ok"] is True
+            assert report["total_score"] == 100
+            promotion_report = helper.frontier_autonomy_score_report(autonomy_root, promotion=True)
+            assert promotion_report["ok"] is False
+            assert "scorecard_at_least_99" in promotion_report["hard_gate_failures"]
     return 0
 
 

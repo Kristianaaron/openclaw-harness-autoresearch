@@ -1431,6 +1431,12 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
     lane_state = memory.get("lanes", {}).get(lane, {}) if isinstance(memory.get("lanes"), dict) else {}
     if lane_state.get("state") == "exhausted" and lane != "exhaustion-report":
         return f"lane is exhausted: {lane}"
+    task_id = str(task.get("id", ""))
+    if adapter_method_implementation_completed(root) and (
+        task_id.startswith(("implementation-drafter-adapter-method-", "drafter-adapter-method-contract-"))
+        or str(task.get("supervisor_action", "")) in {"drafter-adapter-method-contract"}
+    ):
+        return "adapter method already passed; route to adapter calibration canary or candidate benchmark"
     key = semantic_task_key(task)
     semantic = memory.get("semantic_tasks", {}) if isinstance(memory.get("semantic_tasks"), dict) else {}
     state = semantic.get(key, {}) if isinstance(semantic.get(key), dict) else {}
@@ -1449,6 +1455,35 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         if next_step == "seed_frontier_deliberation_escape" and stale_escape_named:
             return "progress memory requires a quant-safe drafter candidate, not source-scout/MTP reseeding"
     return ""
+
+
+def adapter_method_implementation_completed(root: Path) -> bool:
+    """Detect the handoff-to-implementation milestone without relying on one task id.
+
+    The adapter method task is dynamically named. Its actual completion evidence
+    is either a completed task with that prefix or the focused canary test row
+    that proves the adapter/logit calibration path is in source and guarded.
+    """
+
+    for task in read_jsonl(root / "tasks.jsonl"):
+        if (
+            str(task.get("id", "")).startswith("implementation-drafter-adapter-method-")
+            and task.get("status") == "done"
+        ):
+            return True
+    for row in all_result_rows(root)[-300:]:
+        if row.get("status") != "keep":
+            continue
+        if not row.get("run_id", "").startswith("supervisor-focused-test-"):
+            continue
+        text = " ".join(str(row.get(key, "")) for key in ("target", "hypothesis", "notes")).lower()
+        if (
+            "openclaw-mtp-drafter-calibrate.py" in text
+            and ("adapter/logit" in text or "adapter-logit" in text or "logit-distillation" in text)
+            and "focused test passed" in text
+        ):
+            return True
+    return False
 
 
 def filter_operational_strategy_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
