@@ -4594,6 +4594,11 @@ def drafter_bottleneck_state(
         root,
         calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
     )
+    adapter_calibration_no_lift = recent_calibration_rejected_no_lift(
+        root,
+        recent_rows=max(240, recent_rows),
+        calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
+    )
     adapter_calibration_attempted = adapter_calibration_active or any(
         "calibration_mode=adapter-logit-distillation" in row.get("notes", "")
         or "adapter-logit-distillation" in row.get("run_id", "")
@@ -4613,6 +4618,7 @@ def drafter_bottleneck_state(
         or adapter_contract_succeeded
         or adapter_implementation_attempted
         or adapter_calibration_attempted
+        or adapter_calibration_no_lift
         or bool(adapter_calibration_stage_issue)
     )
 
@@ -4632,8 +4638,12 @@ def drafter_bottleneck_state(
         state = "adapter_calibration_active"
         next_step = "wait_for_adapter_calibration"
     elif adapter_implementation_completed:
-        state = "adapter_method_implementation_done"
-        next_step = "seed_adapter_calibration_canary"
+        if adapter_calibration_no_lift:
+            state = "adapter_calibration_no_lift"
+            next_step = "seed_quant_safe_drafter_candidate"
+        else:
+            state = "adapter_method_implementation_done"
+            next_step = "seed_adapter_calibration_canary"
     elif adapter_calibration_stage_issue == "calibration-memory-after-load":
         state = "adapter_calibration_memory_blocked"
         next_step = "seed_adapter_calibration_memory_report"
@@ -4644,8 +4654,12 @@ def drafter_bottleneck_state(
         state = "adapter_calibration_attempted"
         next_step = "wait_for_adapter_calibration_result"
     elif adapter_implementation_attempted:
-        state = "adapter_method_implementation_done"
-        next_step = "seed_adapter_calibration_canary"
+        if adapter_calibration_no_lift:
+            state = "adapter_calibration_no_lift"
+            next_step = "seed_quant_safe_drafter_candidate"
+        else:
+            state = "adapter_method_implementation_done"
+            next_step = "seed_adapter_calibration_canary"
     elif adapter_contract_succeeded:
         state = "adapter_method_contract_ready"
         next_step = "seed_adapter_method_implementation"
@@ -4705,6 +4719,7 @@ def drafter_bottleneck_state(
         "adapter_method_implementation_attempted": adapter_implementation_attempted,
         "adapter_calibration_active": adapter_calibration_active,
         "adapter_calibration_attempted": adapter_calibration_attempted,
+        "adapter_calibration_no_lift": adapter_calibration_no_lift,
         "adapter_calibration_stage_issue": adapter_calibration_stage_issue,
         "quant_safe_candidate_active": quant_safe_candidate_active,
         "fallback_decode_count": fallback_decode_count,
@@ -4894,6 +4909,17 @@ def drafter_bottleneck_next_tasks(
             return report_tasks
         evidence = {
             "reason": "adapter calibration memory report route exhausted; promote a quantization-safe drafter candidate instead of source-scout/MTP reseeding",
+            "bottleneck_state": state,
+        }
+        return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
+    if step == "seed_quant_safe_drafter_candidate":
+        if active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-"):
+            return []
+        evidence = {
+            "reason": (
+                "adapter/logit calibration produced no acceptance lift; stop repeating the same canary and "
+                "require a changed quantization-safe candidate before another fit run"
+            ),
             "bottleneck_state": state,
         }
         return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
@@ -11130,6 +11156,8 @@ def drafter_bottleneck_review(args: argparse.Namespace) -> int:
         status = "blocked"
     elif state["next_step"] == "wait_for_trace_distillation_result":
         status = "keep"
+    elif str(state["next_step"]).startswith("seed_") and seeded == 0:
+        status = "blocked"
     report = {
         "ok": status == "keep",
         "kind": "drafter-bottleneck-review",

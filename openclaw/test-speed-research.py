@@ -3218,6 +3218,29 @@ def main() -> int:
             ][0]
             assert stale_after["status"] == "blocked"
             assert "already passed" in stale_after["blocked_reason"]
+            helper.append_result(
+                progress_root,
+                run_id="drafter-calibration-evaluation-no-lift-after-adapter",
+                status="discard",
+                target="janq-drafter-calibration-evaluation",
+                hypothesis="unit no-lift after adapter method implementation",
+                commit="abc123",
+                notes=(
+                    "decision=reject-no-lift calibration_mode=adapter-logit-distillation "
+                    "baseline_acceptance=1.0 best_acceptance=1.0 acceptance_lift=0.0"
+                ),
+            )
+            no_lift_state = helper.drafter_bottleneck_state(progress_root)
+            assert no_lift_state["state"] == "adapter_calibration_no_lift"
+            assert no_lift_state["next_step"] == "seed_quant_safe_drafter_candidate"
+            no_lift_tasks = helper.drafter_bottleneck_next_tasks(
+                progress_root,
+                helper.result_rows(progress_root),
+                1778980001,
+                reason="unit adapter no-lift route",
+            )
+            assert len(no_lift_tasks) == 1
+            assert no_lift_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-")
         with tempfile.TemporaryDirectory() as canary_tmp:
             canary_root = Path(canary_tmp) / "research" / "speed"
             canary_home = Path(canary_tmp) / "home"
