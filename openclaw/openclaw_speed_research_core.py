@@ -1437,6 +1437,11 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         or str(task.get("supervisor_action", "")) in {"drafter-adapter-method-contract"}
     ):
         return "adapter method already passed; route to adapter calibration canary or candidate benchmark"
+    if task_id.startswith("review-council-frontier-deliberation-") and active_task_prefix_exists(
+        root,
+        "drafter-calibration-run-",
+    ):
+        return "bounded drafter calibration run is already ready; execute it before advisory deliberation"
     key = semantic_task_key(task)
     semantic = memory.get("semantic_tasks", {}) if isinstance(memory.get("semantic_tasks"), dict) else {}
     state = semantic.get(key, {}) if isinstance(semantic.get(key), dict) else {}
@@ -1484,6 +1489,13 @@ def adapter_method_implementation_completed(root: Path) -> bool:
         ):
             return True
     return False
+
+
+def active_task_prefix_exists(root: Path, prefix: str) -> bool:
+    return any(
+        str(task.get("id", "")).startswith(prefix) and task.get("status", "ready") in {"ready", "rework"}
+        for task in read_jsonl(root / "tasks.jsonl")
+    )
 
 
 def filter_operational_strategy_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:

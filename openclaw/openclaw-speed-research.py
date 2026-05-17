@@ -9792,6 +9792,7 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         "timestamp": timestamp,
     }
     seeded_stage_task = 0
+    seeded_run_task = 0
     if status == "keep":
         stage = first_seedable_calibration_memory_stage(root, calibration_mode_filter=mode)
     else:
@@ -9818,7 +9819,20 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
                 )
             ],
         )
+    elif status == "keep" and not stage and should_seed_drafter_calibration_run(root, recent_rows=240):
+        seeded_run_task = upsert_tasks(
+            root,
+            [
+                drafter_calibration_run_task(
+                    timestamp,
+                    task_id=f"drafter-calibration-run-{timestamp}",
+                    bounded_command=bounded_command,
+                    calibration_mode_value=mode,
+                )
+            ],
+        )
     report["seeded_stage_task"] = seeded_stage_task
+    report["seeded_run_task"] = seeded_run_task
     artifact = root / "benchmarks" / f"drafter-calibration-canary-{timestamp}.json"
     artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     append_jsonl(
@@ -9830,6 +9844,10 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
             "evidence": report,
             "next": (
                 "advance through staged calibration memory gates before full calibration"
+                if seeded_stage_task
+                else "run bounded calibration task"
+                if seeded_run_task
+                else "close calibration route or record explicit blocker"
                 if status == "keep"
                 else "repair calibration canary prerequisites"
             ),
@@ -9845,7 +9863,8 @@ def drafter_calibration_canary(args: argparse.Namespace) -> int:
         notes=(
             f"decision={report['decision']} trace_rows={len(trace_rows)} "
             f"calibration_mode={mode} "
-            f"test_ok={test_result.get('ok')} failures={len(failures)} seeded_stage_task={seeded_stage_task}"
+            f"test_ok={test_result.get('ok')} failures={len(failures)} "
+            f"seeded_stage_task={seeded_stage_task} seeded_run_task={seeded_run_task}"
         ),
     )
     print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))

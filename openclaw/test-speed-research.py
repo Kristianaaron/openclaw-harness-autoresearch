@@ -3168,6 +3168,103 @@ def main() -> int:
             ][0]
             assert stale_after["status"] == "blocked"
             assert "already passed" in stale_after["blocked_reason"]
+        with tempfile.TemporaryDirectory() as canary_tmp:
+            canary_root = Path(canary_tmp) / "research" / "speed"
+            canary_home = Path(canary_tmp) / "home"
+            trace_dir = canary_home / "drafter-fit"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_path = trace_dir / "target-generated-traces.jsonl"
+            trace_path.write_text(
+                "\n".join(
+                    json.dumps({"prompt": f"prompt {index}", "completion": "ok", "completion_tokens": 2})
+                    for index in range(4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            plan_path = trace_dir / "gemma4-janq-dflash-fit-plan.json"
+            plan_path.write_text(
+                json.dumps({"decision": "ready-for-target-generated-trace-data", "target_path": "/tmp/janq"})
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"OPENCLAW_SPEED_RESEARCH_DIR": str(canary_root), "OPENCLAW_HOME": str(canary_home)},
+                clear=False,
+            ):
+                helper.ensure_research_state(canary_root)
+                for stage in helper.CALIBRATION_MEMORY_STAGES:
+                    helper.append_result(
+                        canary_root,
+                        run_id=f"drafter-calibration-memory-stage-{stage}-unit",
+                        status="keep",
+                        target="janq-drafter-calibration-memory-stage",
+                        hypothesis="unit complete stage",
+                        commit="unit",
+                        notes=f"stage={stage} decision=advance failures=none calibration_mode={helper.CALIBRATION_ADAPTER_MODE}",
+                    )
+                with patch.object(helper, "calibration_runtime_import_issue", return_value=""):
+                    assert helper.drafter_calibration_canary(
+                        Namespace(
+                            plan=str(plan_path),
+                            trace_data=str(trace_path),
+                            output_dir=str(trace_dir),
+                            min_traces=4,
+                            max_prompts=4,
+                            test_timeout=1.0,
+                            skip_test=True,
+                            calibration_mode=helper.CALIBRATION_ADAPTER_MODE,
+                        )
+                    ) == 0
+                canary_report = json.loads(
+                    sorted((canary_root / "benchmarks").glob("drafter-calibration-canary-*.json"))[-1].read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert canary_report["seeded_stage_task"] == 0
+                assert canary_report["seeded_run_task"] == 1
+                assert any(
+                    str(task.get("id", "")).startswith("drafter-calibration-run-")
+                    and task.get("status") == "ready"
+                    for task in helper.read_jsonl(canary_root / "tasks.jsonl")
+                )
+                import openclaw_speed_research_core as core
+
+                helper.upsert_tasks(
+                    canary_root,
+                    [
+                        {
+                            "id": "review-council-frontier-deliberation-stale",
+                            "status": "ready",
+                            "priority": 101,
+                            "lane": "frontier-deliberation",
+                            "task_type": "supervisor",
+                            "supervisor_action": "frontier-deliberation",
+                            "target": "tasks.jsonl/results.tsv",
+                            "hypothesis": "stale advisory task should not outrank concrete calibration",
+                            "metric": "review_council_autonomy",
+                            "guard_checks": ["no_model_load"],
+                            "acceptance": "unit",
+                            "rollback": "unit",
+                            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research frontier-deliberation --allow-empty",
+                        }
+                    ],
+                )
+                assert core.block_operational_strategy_ready_tasks(canary_root) >= 1
+                task_status = {
+                    str(task.get("id", "")): task
+                    for task in core.read_jsonl(canary_root / "tasks.jsonl")
+                }
+                assert task_status["review-council-frontier-deliberation-stale"]["status"] == "blocked"
+                assert "calibration run is already ready" in task_status[
+                    "review-council-frontier-deliberation-stale"
+                ]["blocked_reason"]
+                assert any(
+                    str(task.get("id", "")).startswith("drafter-calibration-run-")
+                    and task.get("status") == "ready"
+                    for task in task_status.values()
+                )
         with tempfile.TemporaryDirectory() as autonomy_tmp:
             autonomy_root = Path(autonomy_tmp) / "research" / "speed"
             helper.ensure_research_state(autonomy_root)
