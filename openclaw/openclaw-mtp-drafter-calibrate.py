@@ -157,6 +157,23 @@ def copy_metadata(source: Path, destination: Path) -> None:
             shutil.copy2(src, destination / name)
 
 
+def link_adapter_base_weights(source: Path, destination: Path) -> list[str]:
+    """Expose base drafter weights beside adapter-only calibration output."""
+    destination.mkdir(parents=True, exist_ok=True)
+    linked: list[str] = []
+    for name in ("model.safetensors", "model.safetensors.index.json"):
+        src = source / name
+        dst = destination / name
+        if not src.exists() or dst.exists():
+            continue
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+        linked.append(name)
+    return linked
+
+
 def load_target(target_path: str) -> tuple[Any, Any]:
     from jang_tools.loader import load_jang_vlm_model
 
@@ -316,6 +333,28 @@ def blocks_quantized_drafter_training(args: argparse.Namespace, trainable: dict[
     return bool(quantized_trainable_parameter_names(trainable))
 
 
+def parameter_names(parameters: Any) -> list[str]:
+    """Return stable parameter names for MLX dict/list parameter trees."""
+    if isinstance(parameters, dict):
+        return sorted(str(name) for name, value in parameters.items() if value != {})
+    names: list[str] = []
+    for item in tree_flatten(parameters):
+        if isinstance(item, tuple) and item:
+            names.append(str(item[0]))
+        else:
+            names.append(str(len(names)))
+    return sorted(names)
+
+
+def adapter_save_parameters(adapter: Any) -> dict[str, Any]:
+    """Return only standalone adapter tensors, never frozen base modules."""
+    if isinstance(adapter, LogitBiasAdapter):
+        return {"bias": adapter.bias}
+    if isinstance(adapter, (LowRankHiddenLogitAdapter, LowRankPreProjectionAdapter)):
+        return {"down": adapter.down, "up": adapter.up}
+    return dict(adapter.parameters())
+
+
 class LogitBiasAdapter(nn.Module):
     """Small canary adapter that trains outside the frozen quantized drafter."""
 
@@ -327,6 +366,39 @@ class LogitBiasAdapter(nn.Module):
         return logits + self.bias
 
 
+class LowRankHiddenLogitAdapter(nn.Module):
+    """Trainable hidden-state adapter for stronger JANQ drafter alignment."""
+
+    def __init__(self, hidden_size: int, vocab_size: int, rank: int, scale: float):
+        super().__init__()
+        self.down = mx.random.normal((hidden_size, rank)) * 0.01
+        self.up = mx.zeros((rank, vocab_size))
+        self.scale = scale
+
+    def __call__(self, hidden: Any, logits: Any) -> Any:
+        update = mx.matmul(mx.matmul(hidden, self.down), self.up) * self.scale
+        return logits + update
+
+
+class LowRankPreProjectionAdapter(nn.Module):
+    """Low-overhead adapter on the drafter pre-projection path."""
+
+    def __init__(self, base: Any, input_size: int, hidden_size: int, rank: int, scale: float):
+        super().__init__()
+        self.base = base
+        try:
+            self.base.freeze()
+        except Exception:
+            pass
+        self.down = mx.random.normal((input_size, rank)) * 0.01
+        self.up = mx.zeros((rank, hidden_size))
+        self.scale = scale
+
+    def __call__(self, inputs_embeds: Any) -> Any:
+        update = mx.matmul(mx.matmul(inputs_embeds, self.down), self.up) * self.scale
+        return self.base(inputs_embeds) + update
+
+
 def build_traces(model: Any, processor: Any, prompts: list[str], positions_per_prompt: int) -> list[dict[str, Any]]:
     traces: list[dict[str, Any]] = []
     for prompt in prompts:
@@ -334,31 +406,56 @@ def build_traces(model: Any, processor: Any, prompts: list[str], positions_per_p
     return traces
 
 
-def drafter_logits(drafter: Any, trace: dict[str, Any]) -> Any:
+def drafter_forward(drafter: Any, trace: dict[str, Any]) -> tuple[Any, Any]:
     tok = trace["first_bonus"][:, None]
     tok_embed = drafter._input_embed(tok) * drafter._input_embed_scale
     inputs_embeds = mx.concatenate([tok_embed, trace["hidden"]], axis=-1)
     position_ids = mx.array([[trace["kv_offset"]]])
-    _hidden, logits = drafter(inputs_embeds, trace["shared_kv"], position_ids)
-    return logits[:, -1, :]
+    hidden, logits = drafter(inputs_embeds, trace["shared_kv"], position_ids)
+    return hidden[:, -1, :], logits[:, -1, :]
+
+
+def drafter_logits(drafter: Any, trace: dict[str, Any]) -> Any:
+    _hidden, logits = drafter_forward(drafter, trace)
+    return logits
 
 
 def acceptance(drafter: Any, traces: list[dict[str, Any]]) -> float:
     return acceptance_with_adapter(drafter, None, traces)
 
 
-def acceptance_with_adapter(drafter: Any, adapter: LogitBiasAdapter | None, traces: list[dict[str, Any]]) -> float:
+def adapter_logits(drafter: Any, adapter: Any, trace: dict[str, Any]) -> Any:
+    if isinstance(adapter, LowRankPreProjectionAdapter):
+        return drafter_logits(drafter, trace)
+    hidden, logits = drafter_forward(drafter, trace)
+    if isinstance(adapter, LowRankHiddenLogitAdapter):
+        return adapter(hidden, logits)
+    return adapter(logits)
+
+
+def acceptance_with_adapter(drafter: Any, adapter: Any | None, traces: list[dict[str, Any]]) -> float:
     if not traces:
         return 0.0
     correct = 0
     for trace in traces:
         logits = drafter_logits(drafter, trace)
         if adapter is not None:
-            logits = adapter(logits)
+            logits = adapter_logits(drafter, adapter, trace)
         pred = mx.argmax(logits, axis=-1)
         mx.eval(pred)
         correct += int(pred.item() == int(trace["label"].item()))
     return correct / len(traces)
+
+
+def trace_is_accepted(drafter: Any, trace: dict[str, Any]) -> bool:
+    logits = drafter_logits(drafter, trace)
+    pred = mx.argmax(logits, axis=-1)
+    mx.eval(pred)
+    return int(pred.item()) == int(trace["label"].item())
+
+
+def baseline_mismatches(drafter: Any, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [trace for trace in traces if not trace_is_accepted(drafter, trace)]
 
 
 def train(args: argparse.Namespace) -> int:
@@ -409,10 +506,13 @@ def train(args: argparse.Namespace) -> int:
     require_memory_safe(args, phase="after-train-traces")
     eval_traces = build_traces(model, processor, eval_prompts, args.positions_per_prompt)
     require_memory_safe(args, phase="after-eval-traces")
+    train_mismatches = baseline_mismatches(drafter, train_traces)
+    if args.train_mismatches_first and train_mismatches:
+        train_traces = train_mismatches + train_traces
     baseline = acceptance(drafter, eval_traces)
     log(f"baseline first-draft acceptance={baseline:.3f}")
 
-    adapter: LogitBiasAdapter | None = None
+    adapter: Any | None = None
     train_target: Any = drafter
     if calibration_mode == "adapter-logit-distillation":
         vocab_size = int(getattr(drafter.config, "vocab_size", 0) or model.config.text_config.vocab_size)
@@ -422,6 +522,38 @@ def train(args: argparse.Namespace) -> int:
         def loss_fn(adapter_model: LogitBiasAdapter, trace: dict[str, Any]) -> Any:
             logits = mx.stop_gradient(drafter_logits(drafter, trace))
             return nn.losses.cross_entropy(adapter_model(logits), trace["label"], reduction="mean")
+
+    elif calibration_mode == "adapter-low-rank-hidden":
+        vocab_size = int(getattr(drafter.config, "vocab_size", 0) or model.config.text_config.vocab_size)
+        hidden_size = int(getattr(drafter.config, "backbone_hidden_size", 0) or model.config.text_config.hidden_size)
+        adapter = LowRankHiddenLogitAdapter(hidden_size, vocab_size, args.adapter_rank, args.adapter_scale)
+        train_target = adapter
+
+        def loss_fn(adapter_model: LowRankHiddenLogitAdapter, trace: dict[str, Any]) -> Any:
+            hidden, logits = drafter_forward(drafter, trace)
+            return nn.losses.cross_entropy(
+                adapter_model(mx.stop_gradient(hidden), mx.stop_gradient(logits)),
+                trace["label"],
+                reduction="mean",
+            )
+
+    elif calibration_mode == "adapter-pre-projection-low-rank":
+        backbone_hidden = int(getattr(drafter.config, "backbone_hidden_size", 0) or model.config.text_config.hidden_size)
+        draft_hidden = int(getattr(drafter.config.text_config, "hidden_size", 0) or 1024)
+        adapter = LowRankPreProjectionAdapter(
+            drafter.pre_projection,
+            input_size=2 * backbone_hidden,
+            hidden_size=draft_hidden,
+            rank=args.adapter_rank,
+            scale=args.adapter_scale,
+        )
+        drafter.pre_projection = adapter
+        train_target = adapter
+
+        def loss_fn(adapter_model: LowRankPreProjectionAdapter, trace: dict[str, Any]) -> Any:
+            _ = adapter_model
+            logits = drafter_logits(drafter, trace)
+            return nn.losses.cross_entropy(logits, trace["label"], reduction="mean")
 
     else:
 
@@ -455,8 +587,20 @@ def train(args: argparse.Namespace) -> int:
         from mlx_vlm.utils import save_weights
 
         save_weights(output, drafter)
+        linked_weight_files: list[str] = []
     else:
-        mx.savez(str(output / "openclaw-logit-bias-adapter.npz"), **adapter.parameters())
+        linked_weight_files = link_adapter_base_weights(source, output)
+        adapter_file = "openclaw-logit-bias-adapter.npz"
+        mx.savez(str(output / adapter_file), **adapter_save_parameters(adapter))
+        adapter_config = {
+            "adapter_type": calibration_mode,
+            "rank": args.adapter_rank if calibration_mode == "adapter-low-rank-hidden" else 0,
+            "scale": args.adapter_scale if calibration_mode == "adapter-low-rank-hidden" else 1.0,
+        }
+        if calibration_mode == "adapter-pre-projection-low-rank":
+            adapter_config["rank"] = args.adapter_rank
+            adapter_config["scale"] = args.adapter_scale
+        (output / "openclaw-adapter-config.json").write_text(json.dumps(adapter_config, indent=2) + "\n")
     metrics = {
         "baseline_first_draft_acceptance": baseline,
         "best_first_draft_acceptance": best_acceptance,
@@ -467,10 +611,17 @@ def train(args: argparse.Namespace) -> int:
         "learning_rate": args.learning_rate,
         "train_samples": len(train_traces),
         "eval_samples": len(eval_traces),
+        "baseline_train_mismatches": len(train_mismatches),
+        "train_mismatches_first": bool(args.train_mismatches_first),
         "positions_per_prompt": args.positions_per_prompt,
         "elapsed_seconds": time.monotonic() - start,
-        "trainable": list(tree_flatten(train_target.trainable_parameters()).keys()),
+        "trainable": parameter_names(train_target.trainable_parameters()),
         "frozen_quantized_trainables": quantized_trainables,
+        "source_drafter_path": str(source),
+        "adapter_file": adapter_file if adapter is not None else "",
+        "linked_weight_files": linked_weight_files,
+        "adapter_rank": args.adapter_rank if adapter is not None else 0,
+        "adapter_scale": args.adapter_scale if adapter is not None else 0.0,
     }
     (output / "openclaw-calibration.json").write_text(json.dumps(metrics, indent=2) + "\n")
     log(f"saved calibrated drafter to {output}")
@@ -603,13 +754,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mlx-cache-gb", type=float, default=8.0)
     parser.add_argument(
         "--calibration-mode",
-        choices=["direct-pre-projection", "adapter-logit-distillation"],
+        choices=[
+            "direct-pre-projection",
+            "adapter-logit-distillation",
+            "adapter-low-rank-hidden",
+            "adapter-pre-projection-low-rank",
+        ],
         default="direct-pre-projection",
         help=(
             "direct-pre-projection tunes existing drafter projection weights; "
-            "adapter-logit-distillation freezes target/drafter weights and trains only a small logit adapter"
+            "adapter-logit-distillation freezes target/drafter weights and trains only a small logit adapter; "
+            "adapter-low-rank-hidden trains a frozen-safe low-rank hidden-to-logit adapter; "
+            "adapter-pre-projection-low-rank trains a cheaper adapter before drafter transformer layers"
         ),
     )
+    parser.add_argument("--adapter-rank", type=int, default=8)
+    parser.add_argument("--adapter-scale", type=float, default=1.0)
+    parser.add_argument("--train-mismatches-first", action="store_true")
     parser.add_argument("--target-trace-policy", choices=["stop-gradient"], default="stop-gradient")
     parser.add_argument(
         "--allow-quantized-drafter-training",

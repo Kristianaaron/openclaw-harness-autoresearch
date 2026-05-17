@@ -126,12 +126,163 @@ def load_model(model_path: str) -> None:
             from mlx_vlm.speculative.drafters import load_drafter
 
             DRAFT_MODEL = load_drafter(draft_path, kind=draft_kind)
+            DRAFT_MODEL = maybe_wrap_logit_bias_adapter(DRAFT_MODEL, Path(draft_path).expanduser())
             DRAFT_BACKEND = "mtp"
         block = getattr(getattr(DRAFT_MODEL, "config", None), "block_size", "?")
         log(
             "loaded Gemma drafter "
             f"backend={DRAFT_BACKEND or draft_kind} block={block} in {time.monotonic() - draft_start:.2f}s: {draft_path}"
         )
+
+
+class LogitBiasDraftWrapper:
+    """Apply an OpenClaw-trained adapter to an MTP drafter."""
+
+    def __init__(
+        self,
+        draft_model: Any,
+        *,
+        bias: Any | None = None,
+        down: Any | None = None,
+        up: Any | None = None,
+        scale: float = 1.0,
+    ):
+        self._draft_model = draft_model
+        self._bias = bias
+        self._down = down
+        self._up = up
+        self._scale = scale
+        self.config = getattr(draft_model, "config", None)
+
+    @property
+    def accept_lens(self) -> Any:
+        return getattr(self._draft_model, "accept_lens", [])
+
+    @accept_lens.setter
+    def accept_lens(self, value: Any) -> None:
+        setattr(self._draft_model, "accept_lens", value)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._draft_model, name)
+
+    def reset(self, target_model: Any) -> Any:
+        return self._draft_model.reset(target_model)
+
+    def set_shared_kv(self, shared_kv_states: dict, kv_offset: Any, position: Any = None) -> None:
+        return self._draft_model.set_shared_kv(shared_kv_states, kv_offset, position=position)
+
+    def __call__(self, inputs_embeds: Any, shared_kv_states: dict, position_ids: Any, cache: Any = None) -> Any:
+        hidden, logits = self._draft_model(inputs_embeds, shared_kv_states, position_ids, cache=cache)
+        if self._bias is not None:
+            logits = logits + self._bias.astype(logits.dtype)
+        if self._down is not None and self._up is not None:
+            update = self._scale * ((hidden @ self._down.astype(hidden.dtype)) @ self._up.astype(logits.dtype))
+            logits = logits + update
+        return hidden, logits
+
+    def draft_block(
+        self,
+        last_bonus: Any,
+        hidden: Any,
+        cache: Any,
+        block_size: int,
+        sampler: Any,
+        token_dtype: Any = None,
+    ) -> Any:
+        import mlx.core as mx
+
+        del cache
+        shared_kv = getattr(self._draft_model, "_shared_kv", None)
+        if shared_kv is None:
+            raise RuntimeError("set_shared_kv() must be called before draft_block().")
+        input_embed = getattr(self._draft_model, "_input_embed", None)
+        if input_embed is None:
+            raise RuntimeError("bind(target_model) must be called before draft_block().")
+        position = getattr(self._draft_model, "_position", 0)
+        if isinstance(position, int):
+            position_ids = mx.array([[position]])
+        else:
+            position_ids = position[:, None]
+        if token_dtype is None:
+            token_dtype = mx.int32
+        if isinstance(last_bonus, int):
+            tok = mx.array([[last_bonus]], dtype=token_dtype)
+        else:
+            tok = last_bonus[:, None].astype(token_dtype)
+        h_prev = hidden
+        tokens: list[Any] = []
+        scale = float(getattr(self._draft_model, "_input_embed_scale", 1.0))
+        for _ in range(block_size - 1):
+            tok_embed = input_embed(tok) * scale
+            inputs_embeds = mx.concatenate([tok_embed, h_prev], axis=-1)
+            h_prev, logits = self(inputs_embeds, shared_kv, position_ids)
+            tok = sampler(logits)
+            tokens.append(tok)
+        return mx.concatenate(tokens, axis=1)
+
+
+class PreProjectionAdapter:
+    """Inference wrapper for a low-rank drafter pre-projection adapter."""
+
+    def __init__(self, base: Any, down: Any, up: Any, scale: float):
+        self._base = base
+        self._down = down
+        self._up = up
+        self._scale = scale
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def __call__(self, inputs_embeds: Any) -> Any:
+        update = self._scale * ((inputs_embeds @ self._down.astype(inputs_embeds.dtype)) @ self._up.astype(inputs_embeds.dtype))
+        return self._base(inputs_embeds) + update
+
+
+def maybe_wrap_logit_bias_adapter(draft_model: Any, draft_path: Path) -> Any:
+    adapter_path = draft_path / "openclaw-logit-bias-adapter.npz"
+    if not adapter_path.exists():
+        return draft_model
+    import mlx.core as mx
+
+    weights = mx.load(str(adapter_path))
+    config_path = draft_path / "openclaw-adapter-config.json"
+    adapter_type = "adapter-logit-distillation"
+    adapter_scale = 1.0
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        adapter_type = str(config.get("adapter_type") or adapter_type)
+        adapter_scale = float(config.get("scale") or adapter_scale)
+    vocab_size = int(getattr(getattr(draft_model, "config", None), "vocab_size", 0) or 0)
+    text_cfg = getattr(getattr(draft_model, "config", None), "text_config", None)
+    if not vocab_size and text_cfg is not None:
+        vocab_size = int(getattr(text_cfg, "vocab_size", 0) or 0)
+    bias = weights.get("bias") if isinstance(weights, dict) else None
+    down = weights.get("down") if isinstance(weights, dict) else None
+    up = weights.get("up") if isinstance(weights, dict) else None
+    if adapter_type == "adapter-pre-projection-low-rank":
+        if down is None or up is None:
+            raise RuntimeError(f"pre-projection adapter is missing down/up tensors: {adapter_path}")
+        base = getattr(draft_model, "pre_projection", None)
+        if base is None:
+            raise RuntimeError("pre-projection adapter requires drafter.pre_projection")
+        draft_model.pre_projection = PreProjectionAdapter(base, down, up, adapter_scale)
+        wrapped = draft_model
+    elif adapter_type == "adapter-low-rank-hidden":
+        if down is None or up is None:
+            raise RuntimeError(f"low-rank adapter is missing down/up tensors: {adapter_path}")
+        if vocab_size and int(up.shape[-1]) != vocab_size:
+            raise RuntimeError(f"low-rank adapter vocab mismatch: up={up.shape[-1]} drafter={vocab_size}")
+        wrapped = LogitBiasDraftWrapper(draft_model, down=down, up=up, scale=adapter_scale)
+    else:
+        if bias is None:
+            raise RuntimeError(f"logit-bias adapter is missing bias tensor: {adapter_path}")
+        if vocab_size and int(bias.shape[-1]) != vocab_size:
+            raise RuntimeError(
+                f"logit-bias adapter vocab mismatch: bias={bias.shape[-1]} drafter={vocab_size}"
+            )
+        wrapped = LogitBiasDraftWrapper(draft_model, bias=bias)
+    log(f"loaded OpenClaw drafter adapter type={adapter_type}: {adapter_path}")
+    return wrapped
 
 
 def model_worker(model_path: str) -> None:

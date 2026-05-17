@@ -6,8 +6,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import tempfile
 from types import SimpleNamespace
 from pathlib import Path
+
+import mlx.core as mx
 
 
 SERVER_PATH = Path(__file__).with_name("openclaw-jang-vlm-server.py")
@@ -147,9 +150,83 @@ def test_dflash_adapter_and_kwargs() -> None:
                 os.environ[key] = value
 
 
+def test_logit_bias_draft_wrapper() -> None:
+    class FakeConfig:
+        vocab_size = 4
+
+    class FakeDraft:
+        def __init__(self) -> None:
+            self.config = FakeConfig()
+            self.accept_lens = [1]
+            self.calls = []
+
+        def __call__(self, inputs_embeds, shared_kv_states, position_ids, cache=None):
+            self.calls.append((inputs_embeds, shared_kv_states, position_ids, cache))
+            return mx.ones((1, 1, 6)), mx.array([[[0.0, 1.0, 2.0, 3.0]]])
+
+    draft = FakeDraft()
+    wrapper = server.LogitBiasDraftWrapper(draft, bias=mx.array([0.0, 0.5, 0.0, -1.0]))
+    hidden, logits = wrapper("embeds", {"kv": "state"}, "pos")
+    mx.eval(logits)
+    assert tuple(hidden.shape) == (1, 1, 6)
+    assert logits.tolist() == [[[0.0, 1.5, 2.0, 2.0]]]
+    assert wrapper.accept_lens == [1]
+    wrapper.accept_lens = [2]
+    assert draft.accept_lens == [2]
+    low_rank = server.LogitBiasDraftWrapper(
+        draft,
+        down=mx.ones((6, 2)),
+        up=mx.ones((2, 4)),
+        scale=0.0,
+    )
+    _hidden, low_rank_logits = low_rank(mx.zeros((1, 1, 1)), {}, mx.array([[0]]))
+    mx.eval(low_rank_logits)
+    assert low_rank_logits.tolist() == [[[0.0, 1.0, 2.0, 3.0]]]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp)
+        mx.savez(str(path / "openclaw-logit-bias-adapter.npz"), bias=mx.zeros((4,)))
+        wrapped = server.maybe_wrap_logit_bias_adapter(draft, path)
+        assert isinstance(wrapped, server.LogitBiasDraftWrapper)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp)
+        mx.savez(str(path / "openclaw-logit-bias-adapter.npz"), down=mx.zeros((6, 2)), up=mx.zeros((2, 4)))
+        (path / "openclaw-adapter-config.json").write_text(
+            json.dumps({"adapter_type": "adapter-low-rank-hidden", "rank": 2, "scale": 1.0})
+        )
+        wrapped = server.maybe_wrap_logit_bias_adapter(draft, path)
+        assert isinstance(wrapped, server.LogitBiasDraftWrapper)
+    with tempfile.TemporaryDirectory() as tmp:
+        class FakeProjection:
+            def __call__(self, inputs):
+                return mx.zeros((1, 1, 4))
+
+        path = Path(tmp)
+        draft.pre_projection = FakeProjection()
+        mx.savez(str(path / "openclaw-logit-bias-adapter.npz"), down=mx.ones((6, 2)), up=mx.ones((2, 4)))
+        (path / "openclaw-adapter-config.json").write_text(
+            json.dumps({"adapter_type": "adapter-pre-projection-low-rank", "rank": 2, "scale": 0.0})
+        )
+        wrapped = server.maybe_wrap_logit_bias_adapter(draft, path)
+        assert wrapped is draft
+        projected = draft.pre_projection(mx.zeros((1, 1, 6)))
+        mx.eval(projected)
+        assert projected.tolist() == [[[0.0, 0.0, 0.0, 0.0]]]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp)
+        mx.savez(str(path / "openclaw-logit-bias-adapter.npz"), bias=mx.zeros((3,)))
+        try:
+            server.maybe_wrap_logit_bias_adapter(draft, path)
+        except RuntimeError as error:
+            assert "vocab mismatch" in str(error)
+        else:
+            raise AssertionError("adapter vocab mismatch should fail")
+
+
 if __name__ == "__main__":
     test_native_gemma_tool_call()
     test_json_tool_call()
     test_reasoning_and_loop_guards()
     test_dflash_adapter_and_kwargs()
+    test_logit_bias_draft_wrapper()
     print("ok")

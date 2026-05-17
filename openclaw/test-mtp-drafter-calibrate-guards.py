@@ -28,6 +28,8 @@ def args(**overrides):
         "max_swap_mb": 1024,
         "gpu_memory_utilization": 0.72,
         "mlx_cache_gb": 8.0,
+        "adapter_rank": 8,
+        "adapter_scale": 1.0,
     }
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -80,6 +82,19 @@ def main() -> int:
     shifted = adapter(logits)
     helper.mx.eval(shifted)
     assert tuple(shifted.shape) == (1, 8)
+    assert helper.parameter_names(adapter.trainable_parameters()) == ["bias"]
+    assert helper.parameter_names([object()]) == ["0"]
+    low_rank = helper.LowRankHiddenLogitAdapter(hidden_size=4, vocab_size=8, rank=2, scale=0.5)
+    adapted = low_rank(helper.mx.zeros((1, 4)), helper.mx.zeros((1, 8)))
+    helper.mx.eval(adapted)
+    assert tuple(adapted.shape) == (1, 8)
+    assert helper.parameter_names(low_rank.trainable_parameters()) == ["down", "up"]
+    base = helper.nn.Linear(6, 4, bias=False)
+    pre = helper.LowRankPreProjectionAdapter(base, input_size=6, hidden_size=4, rank=2, scale=0.5)
+    projected = pre(helper.mx.zeros((1, 1, 6)))
+    helper.mx.eval(projected)
+    assert tuple(projected.shape) == (1, 1, 4)
+    assert helper.parameter_names(pre.trainable_parameters()) == ["down", "up"]
     assert helper.parse_args(
         [
             "--target-path",
@@ -91,9 +106,21 @@ def main() -> int:
             "--min-free-mb",
             "16000",
             "--calibration-mode",
-            "adapter-logit-distillation",
+            "adapter-low-rank-hidden",
+            "--adapter-rank",
+            "4",
         ]
-    ).calibration_mode == "adapter-logit-distillation"
+    ).adapter_rank == 4
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "source"
+        destination = Path(tmp) / "destination"
+        source.mkdir()
+        (source / "model.safetensors").write_text("weights")
+        (source / "model.safetensors.index.json").write_text("{}")
+        linked = helper.link_adapter_base_weights(source, destination)
+        assert linked == ["model.safetensors", "model.safetensors.index.json"]
+        assert (destination / "model.safetensors").exists()
+        assert (destination / "model.safetensors.index.json").exists()
     with tempfile.TemporaryDirectory() as tmp:
         with patch.object(helper, "memory_snapshot", return_value=low_free):
             code = helper.main_with_args_for_test(
