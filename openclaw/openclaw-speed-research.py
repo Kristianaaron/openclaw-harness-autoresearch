@@ -2337,6 +2337,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
                 "implementation-drafter-adapter-method",
                 "calibration-memory-report",
                 "exhaustion",
+                "synthesis-timeout-recovery",
             )
         )
     ]
@@ -2380,9 +2381,19 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
         )
         autonomous_repair_timeout_routed = (
             target == "autoresearch-autonomous-repair"
-            and "supervisor synthesis timeout" in notes
+            and ("supervisor synthesis timeout" in notes or "supervisor quality/frontier review timeout" in notes)
             and "deterministic_ready=" in notes
             and not is_memory_block
+        )
+        synthesis_timeout_routed = (
+            target in {"autopilot", "autoresearch-autonomous-repair", "autoresearch-quality"}
+            and ("supervisor synthesis timeout" in notes or "supervisor quality/frontier review timeout" in notes)
+            and not is_memory_block
+            and (
+                bool(repair_ready or deterministic_ids or breakthrough_lanes)
+                or any_task_has_prefix(root, "synthesis-timeout-recovery-")
+                or recent_result_has_prefix(root, "synthesis-timeout-recovery-", recent_rows=160)
+            )
         )
         advisory_repair_routed = (
             target in {"autoresearch-review-council", "frontier-autonomy-score"}
@@ -2396,6 +2407,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             or dflash_compatibility_routed
             or implementation_model_guard_routed
             or autonomous_repair_timeout_routed
+            or synthesis_timeout_routed
             or advisory_repair_routed
             or external_blocker_routed
         ):

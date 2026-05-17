@@ -4416,6 +4416,75 @@ def run_deterministic_fallback(
     return code == 0, issue
 
 
+def active_task_has_prefix(prefix: str) -> bool:
+    return any(
+        str(task.get("id", "")).startswith(prefix)
+        and task.get("status", "ready") in {"ready", "rework"}
+        for task in read_jsonl(TASKS)
+    )
+
+
+def seed_synthesis_timeout_recovery_task(cycle: int, session: str, reason: str) -> tuple[bool, str]:
+    """Route synthesis failure to concrete work instead of retrying synthesis.
+
+    Synthesis is the refill mechanism. If that mechanism times out, calling it
+    again is not recovery; it is a loop. The recovery task deliberately points
+    at the JANQ drafter bottleneck, which is the current speed frontier, and
+    runs through an existing deterministic supervisor command.
+    """
+
+    prefix = "synthesis-timeout-recovery-"
+    if active_task_has_prefix(prefix):
+        return False, "existing synthesis-timeout recovery task is already ready"
+    timestamp = int(time.time())
+    task_id = f"{prefix}{cycle}-{timestamp}"
+    task = {
+        "id": task_id,
+        "status": "ready",
+        "priority": 99,
+        "lane": "drafter-alignment",
+        "task_type": "supervisor",
+        "supervisor_action": "drafter-bottleneck-review",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "hypothesis": (
+            "Supervisor synthesis timed out, so bypass generic idea generation and "
+            "route directly to the JANQ drafter bottleneck decision path."
+        ),
+        "metric": "decode_tps_delta",
+        "guard_checks": ["no_model_turn_required", "no_live_profile_change", "no_opencode_changes"],
+        "acceptance": "A drafter bottleneck artifact records the next concrete JANQ drafter action or terminal blocker.",
+        "rollback": "No runtime rollback needed; this is a read-only supervisor decision artifact.",
+        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-bottleneck-review --recent-rows 120",
+        "created_at": timestamp,
+        "session": session,
+    }
+    tasks = read_jsonl(TASKS)
+    write_jsonl(TASKS, tasks + [task])
+    append_result(
+        WORKSPACE,
+        run_id=f"synthesis-timeout-recovery-{cycle}-{timestamp}",
+        status="keep",
+        target="autoresearch-synthesis-timeout-recovery",
+        hypothesis="synthesis timeout should route to deterministic drafter work, not repeat generic synthesis",
+        commit=current_commit(),
+        notes=f"session={session} seeded_task={task_id} reason={clean_tsv(reason)}",
+    )
+    append_jsonl(
+        FINDINGS,
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "synthesis-timeout-recovery",
+            "finding": "supervisor synthesis timed out and was converted into a concrete drafter bottleneck task",
+            "session": session,
+            "cycle": cycle,
+            "seeded_task": task_id,
+            "reason": reason,
+            "next": task["next_action"],
+        },
+    )
+    return True, task_id
+
+
 def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str, log_file: Path) -> tuple[bool, str]:
     """Create ranked ideas without spending a model turn.
 
@@ -4438,7 +4507,16 @@ def run_supervisor_synthesis(args: argparse.Namespace, cycle: int, session: str,
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return False, "supervisor synthesis timeout"
+            seeded, seeded_task = seed_synthesis_timeout_recovery_task(
+                cycle,
+                session,
+                "supervisor synthesis timeout",
+            )
+            if seeded:
+                file.write(f"SUPERVISOR SYNTHESIS TIMEOUT ROUTED task={seeded_task}\n")
+                return True, "supervisor synthesis timeout routed to deterministic recovery"
+            file.write(f"SUPERVISOR SYNTHESIS TIMEOUT ROUTE EXISTS reason={seeded_task}\n")
+            return True, f"supervisor synthesis timeout routed: {seeded_task}"
     if result.returncode != 0:
         if result.returncode == 2:
             return False, "supervisor synthesis terminal no-work"

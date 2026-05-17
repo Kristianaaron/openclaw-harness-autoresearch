@@ -1652,6 +1652,28 @@ def main() -> int:
         assert ok
         assert issue == ""
         assert synth_marker.read_text(encoding="utf-8") == "synthesize --kind frontier"
+        timeout_helper = Path(tmp) / "synthesize-timeout-helper.py"
+        timeout_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(2)\n",
+            encoding="utf-8",
+        )
+        timeout_helper.chmod(0o700)
+        timeout_args = Namespace(research_helper_bin=str(timeout_helper), synthesis_timeout_seconds=0.05)
+        ok, issue = helper.run_supervisor_synthesis(timeout_args, 9, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert "synthesis timeout" in issue
+        tasks = helper.read_jsonl(helper.TASKS)
+        recovery = [task for task in tasks if str(task.get("id", "")).startswith("synthesis-timeout-recovery-")]
+        assert len(recovery) == 1
+        assert recovery[0]["supervisor_action"] == "drafter-bottleneck-review"
+        assert "autoresearch-synthesis-timeout-recovery" in helper.RESULTS.read_text(encoding="utf-8")
+        before_task_count = len(tasks)
+        ok, issue = helper.run_supervisor_synthesis(timeout_args, 10, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert "existing synthesis-timeout recovery task" in issue
+        assert len(helper.read_jsonl(helper.TASKS)) == before_task_count
         review_helper = Path(tmp) / "review-helper.py"
         review_marker = Path(tmp) / "review-marker.txt"
         review_helper.write_text(
