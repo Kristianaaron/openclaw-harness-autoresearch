@@ -3565,6 +3565,71 @@ def main() -> int:
                 assert material_report["status"] == "keep"
                 assert material_report["selected_calibration_mode"] == helper.CALIBRATION_LOW_RANK_HIDDEN_MODE
                 assert material_report["seeded_canary_task"] == 1
+        with tempfile.TemporaryDirectory() as exhausted_tmp:
+            exhausted_root = Path(exhausted_tmp) / "research" / "speed"
+            exhausted_home = Path(exhausted_tmp) / "home"
+            trace_dir = exhausted_home / "drafter-fit"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            (trace_dir / "target-generated-traces.jsonl").write_text(
+                "\n".join(json.dumps({"prompt": f"prompt {index}", "completion": "ok"}) for index in range(4))
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"OPENCLAW_SPEED_RESEARCH_DIR": str(exhausted_root), "OPENCLAW_HOME": str(exhausted_home)},
+                clear=False,
+            ):
+                helper.ensure_research_state(exhausted_root)
+                for mode in (
+                    helper.CALIBRATION_ADAPTER_MODE,
+                    helper.CALIBRATION_LOW_RANK_HIDDEN_MODE,
+                    helper.CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE,
+                ):
+                    helper.append_result(
+                        exhausted_root,
+                        run_id=f"drafter-calibration-evaluation-{mode}",
+                        status="discard",
+                        target="janq-drafter-calibration-evaluation",
+                        hypothesis="unit exhausted material candidate",
+                        commit="abc123",
+                        notes=(
+                            f"decision=reject-no-lift calibration_mode={mode} "
+                            "baseline_acceptance=1.0 best_acceptance=1.0 acceptance_lift=0.0"
+                        ),
+                    )
+                assert helper.material_drafter_candidates_exhausted(exhausted_root)
+                state = helper.drafter_bottleneck_state(exhausted_root)
+                assert state["state"] == "material_drafter_candidates_exhausted"
+                assert state["next_step"] == "seed_frontier_expansion_after_material_exhaustion"
+                import openclaw_speed_research_core as core
+
+                helper.append_result(
+                    exhausted_root,
+                    run_id="drafter-material-candidate-unit-exhausted",
+                    status="blocked",
+                    target="janq-drafter-material-candidate",
+                    hypothesis="unit all material candidates exhausted before lane marker exists",
+                    commit="abc123",
+                    notes="decision=all-material-drafter-candidates-exhausted",
+                )
+                stale_task = helper.quant_safe_drafter_candidate_task(1779000001, evidence={"reason": "unit stale"})
+                assert core.recent_material_drafter_candidates_exhausted(exhausted_root)
+                assert core.task_operational_blocker(exhausted_root, stale_task)
+                assert helper.drafter_material_candidate(Namespace(recent_rows=600)) == 2
+                next_tasks = helper.drafter_bottleneck_next_tasks(
+                    exhausted_root,
+                    helper.result_rows(exhausted_root),
+                    1779000002,
+                    reason="unit material exhaustion",
+                )
+                assert next_tasks
+                assert all("drafter-material-candidate" not in str(task.get("next_action", "")) for task in next_tasks)
+                helper.write_jsonl(exhausted_root / "tasks.jsonl", next_tasks)
+                canonical = helper.canonical_autoresearch_state(exhausted_root, recent_rows=120)
+                assert canonical["clean"]
+                assert canonical["noise"]["unresolved_blocked_rows"] == 0
+                assert canonical["resolved_debt"]["routed_blocked_rows"] >= 1
     return 0
 
 

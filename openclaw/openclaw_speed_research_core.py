@@ -1363,6 +1363,18 @@ def recent_calibration_rejected_no_lift(
     return not any(token in later_text for token in new_candidate_tokens)
 
 
+def recent_material_drafter_candidates_exhausted(root: Path, *, recent_rows: int = 240) -> bool:
+    rows = all_result_rows(root)[-max(1, recent_rows) :]
+    for row in reversed(rows):
+        text = " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        if (
+            row.get("target") == "janq-drafter-material-candidate"
+            and "all-material-drafter-candidates-exhausted" in text
+        ):
+            return True
+    return False
+
+
 def operational_strategy_memory(root: Path, *, recent_rows: int = 240) -> dict[str, Any]:
     """Materialize strategy memory as scheduler state, not just historical notes."""
     ensure_research_state(root)
@@ -1561,10 +1573,21 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
     lane_state = memory.get("lanes", {}).get(lane, {}) if isinstance(memory.get("lanes"), dict) else {}
     if lane_state.get("state") == "exhausted" and lane != "exhaustion-report":
         return f"lane is exhausted: {lane}"
+    exhausted = memory.get("lanes", {}) if isinstance(memory.get("lanes"), dict) else {}
     task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    material_candidates_exhausted = (
+        "drafter-material-candidate" in exhausted or recent_material_drafter_candidates_exhausted(root)
+    )
+    if material_candidates_exhausted and (
+        action == "drafter-material-candidate"
+        or "drafter-material-candidate" in str(task.get("next_action", ""))
+        or task_id.startswith("agent-deliberation-quant-safe-drafter-candidate-")
+    ):
+        return "all material drafter candidates are exhausted; route to frontier expansion or external candidate-family search"
     if adapter_method_implementation_completed(root) and (
         task_id.startswith(("implementation-drafter-adapter-method-", "drafter-adapter-method-contract-"))
-        or str(task.get("supervisor_action", "")) in {"drafter-adapter-method-contract"}
+        or action in {"drafter-adapter-method-contract"}
     ):
         return "adapter method already passed; route to adapter calibration canary or candidate benchmark"
     if task_id.startswith("review-council-frontier-deliberation-") and active_task_prefix_exists(

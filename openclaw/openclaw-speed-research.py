@@ -2436,6 +2436,23 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             and ("decision=repair" in notes or "decision=block-promotion" in notes)
             and not is_memory_block
         )
+        material_exhaustion_routed = (
+            (
+                target == "janq-drafter-material-candidate"
+                and "all-material-drafter-candidates-exhausted" in notes
+            )
+            or (
+                target == "janq-drafter-bottleneck"
+                and "state=material_drafter_candidates_exhausted" in notes
+                and "next_step=seed_frontier_expansion_after_material_exhaustion" in notes
+            )
+        ) and bool(
+            repair_ready
+            or breakthrough_lanes
+            or deterministic_ids
+            or any_task_has_prefix(root, "frontier-expansion-drafter-family-search-")
+            or recent_result_has_prefix(root, "frontier-expansion-drafter-family-search-", recent_rows=160)
+        )
         if not is_memory_block and (
             deterministic_routed
             or dflash_exhausted
@@ -2445,6 +2462,7 @@ def canonical_autoresearch_state(root: Path, *, recent_rows: int = 120, target_t
             or autonomous_repair_timeout_routed
             or synthesis_timeout_routed
             or advisory_repair_routed
+            or material_exhaustion_routed
             or external_blocker_routed
         ):
             routed_blockers.append(row)
@@ -3527,6 +3545,22 @@ def exhausted_calibration_fingerprints(root: Path, *, recent_rows: int = 600) ->
         text = json.dumps(summary, sort_keys=True)
         exhausted.add(calibration_fingerprint_id(calibration_fingerprint_from_text(mode, text)))
     return exhausted
+
+
+def material_drafter_candidate_modes(root: Path, *, recent_rows: int = 600) -> list[tuple[str, dict[str, str], str]]:
+    exhausted = exhausted_calibration_fingerprints(root, recent_rows=recent_rows)
+    candidates: list[tuple[str, dict[str, str], str]] = []
+    for mode in CALIBRATION_MATERIAL_CANDIDATE_MODES:
+        fields = calibration_fingerprint_fields(mode)
+        fingerprint = calibration_fingerprint_id(fields)
+        if fingerprint in exhausted:
+            continue
+        candidates.append((mode, fields, fingerprint))
+    return candidates
+
+
+def material_drafter_candidates_exhausted(root: Path, *, recent_rows: int = 600) -> bool:
+    return not material_drafter_candidate_modes(root, recent_rows=recent_rows)
 
 
 def calibration_task_uses_exhausted_fingerprint(root: Path, task: dict[str, Any], *, recent_rows: int = 600) -> bool:
@@ -4783,6 +4817,10 @@ def drafter_bottleneck_state(
         calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
     )
     adapter_calibration_fingerprint_exhausted = bool(exhausted_calibration_fingerprints(root, recent_rows=600))
+    material_candidates_exhausted = (
+        adapter_calibration_fingerprint_exhausted
+        and material_drafter_candidates_exhausted(root, recent_rows=600)
+    )
     adapter_calibration_attempted = adapter_calibration_active or any(
         "calibration_mode=adapter-logit-distillation" in row.get("notes", "")
         or "adapter-logit-distillation" in row.get("run_id", "")
@@ -4809,6 +4847,9 @@ def drafter_bottleneck_state(
     if not historical_bottleneck:
         state = "no_terminal_quantized_blocker"
         next_step = "continue_current_lane_contract"
+    elif material_candidates_exhausted:
+        state = "material_drafter_candidates_exhausted"
+        next_step = "seed_frontier_expansion_after_material_exhaustion"
     elif quant_safe_candidate_active:
         state = "quant_safe_candidate_ready"
         next_step = "run_quant_safe_candidate_gate"
@@ -4900,6 +4941,7 @@ def drafter_bottleneck_state(
         "adapter_calibration_attempted": adapter_calibration_attempted,
         "adapter_calibration_no_lift": adapter_calibration_no_lift,
         "adapter_calibration_fingerprint_exhausted": adapter_calibration_fingerprint_exhausted,
+        "material_candidates_exhausted": material_candidates_exhausted,
         "adapter_calibration_stage_issue": adapter_calibration_stage_issue,
         "quant_safe_candidate_active": quant_safe_candidate_active,
         "fallback_decode_count": fallback_decode_count,
@@ -5093,6 +5135,11 @@ def drafter_bottleneck_next_tasks(
         }
         return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
     if step == "seed_quant_safe_drafter_candidate":
+        if material_drafter_candidates_exhausted(root, recent_rows=600):
+            expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
+            if expansion_tasks:
+                return expansion_tasks
+            return filter_seedable_tasks(root, [source_scout_task(timestamp, evidence={"reason": "all material drafter candidates exhausted", "bottleneck_state": state})])
         if active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-"):
             return []
         evidence = {
@@ -5103,6 +5150,11 @@ def drafter_bottleneck_next_tasks(
             "bottleneck_state": state,
         }
         return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
+    if step == "seed_frontier_expansion_after_material_exhaustion":
+        expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
+        if expansion_tasks:
+            return expansion_tasks
+        return filter_seedable_tasks(root, [source_scout_task(timestamp, evidence={"reason": "material drafter candidates exhausted; external candidate family evidence required", "bottleneck_state": state})])
     if step == "seed_frontier_deliberation_escape":
         candidate_tasks = frontier_escape_candidate_tasks(root, rows if rows is not None else result_rows(root), timestamp)
         if candidate_tasks:
@@ -6402,9 +6454,33 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
         "clean_runtime_maps": len(clean_runtime_maps),
         "decode_mean_tps": decode_mean,
         "block_sweep_settled": block_sweep_settled,
+        "material_candidates_exhausted": material_drafter_candidates_exhausted(root, recent_rows=600),
     }
 
     candidates: list[tuple[str, dict[str, Any]]] = []
+    if evidence["material_candidates_exhausted"]:
+        candidates.append(
+            (
+                "frontier-expansion-drafter-family-search-",
+                frontier_expansion_task(
+                    timestamp,
+                    slug="drafter-family-search",
+                    priority=100,
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis=(
+                        "All current JANQ drafter adapter families reached no-lift; the next breakthrough path "
+                        "must identify a materially new drafter family or training objective before another "
+                        "calibration run is allowed."
+                    ),
+                    acceptance=(
+                        "The contract records the exhausted adapter-logit, low-rank-hidden, and "
+                        "pre-projection-low-rank candidates, then names one new candidate family with evidence, "
+                        "canary scope, memory class, and decode TPS promotion gates."
+                    ),
+                    evidence=evidence,
+                ),
+            )
+        )
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
         candidates.append(
             (
@@ -6622,18 +6698,6 @@ def quant_safe_drafter_candidate_task(timestamp: int, *, evidence: dict[str, Any
         "openclaw/test-speed-research.py",
     ]
     return task
-
-
-def material_drafter_candidate_modes(root: Path, *, recent_rows: int = 600) -> list[tuple[str, dict[str, str], str]]:
-    exhausted = exhausted_calibration_fingerprints(root, recent_rows=recent_rows)
-    candidates: list[tuple[str, dict[str, str], str]] = []
-    for mode in CALIBRATION_MATERIAL_CANDIDATE_MODES:
-        fields = calibration_fingerprint_fields(mode)
-        fingerprint = calibration_fingerprint_id(fields)
-        if fingerprint in exhausted:
-            continue
-        candidates.append((mode, fields, fingerprint))
-    return candidates
 
 
 def frontier_escape_candidate_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
@@ -9878,6 +9942,16 @@ def drafter_material_candidate(args: argparse.Namespace) -> int:
     elif not candidates:
         status = "blocked"
         reason = "all-material-drafter-candidates-exhausted"
+        mark_lane_exhausted(
+            root,
+            lane="drafter-material-candidate",
+            reason=reason,
+            evidence={
+                "trace_data": [str(path) for path in trace_paths],
+                "exhausted_fingerprints": sorted(exhausted_calibration_fingerprints(root, recent_rows=int(args.recent_rows))),
+                "next": "route_to_frontier_expansion_or_external_candidate_family",
+            },
+        )
     else:
         seeded_task_id = unique_task_id(root, f"material-drafter-calibration-canary-{selected_mode}")
         seedable = filter_seedable_tasks(
