@@ -3650,6 +3650,13 @@ def main() -> int:
                 assert ranked["source-scout-should-lose"]["gepa_decision_score"] < 0
                 assert core.select_next_task(canary_root)["id"] == run_task["id"]
 
+                family_scout = helper.drafter_family_source_scout_task(123465, evidence={"unit": True})
+                assert core.semantic_task_key(family_scout) == (
+                    "frontier-expansion:drafter-family-source-scout:new_candidate_family"
+                )
+                assert core.task_operational_blocker(canary_root, family_scout) == ""
+                assert helper.filter_seedable_tasks(canary_root, [family_scout])
+
                 helper.upsert_tasks(
                     canary_root,
                     [
@@ -3893,6 +3900,38 @@ def main() -> int:
                 assert canonical["clean"]
                 assert canonical["noise"]["unresolved_blocked_rows"] == 0
                 assert canonical["resolved_debt"]["routed_blocked_rows"] >= 1
+        with tempfile.TemporaryDirectory() as progress_tmp:
+            progress_root = Path(progress_tmp) / "research" / "speed"
+            helper.ensure_research_state(progress_root)
+            helper.write_jsonl(
+                progress_root / "tasks.jsonl",
+                [
+                    {
+                        "id": "frontier-expansion-support-only",
+                        "status": "ready",
+                        "priority": 100,
+                        "task_type": "supervisor",
+                        "supervisor_action": "focused-test",
+                        "lane": "frontier-expansion",
+                        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+                        "next_action": "python3 openclaw/test-speed-research.py",
+                    },
+                    {
+                        "id": "decode-benchmark-owner",
+                        "status": "ready",
+                        "priority": 90,
+                        "task_type": "supervisor",
+                        "benchmark_mode": "decode-sample",
+                        "lane": "speed-measurement",
+                        "target": "decode-sample",
+                        "metric": "decode_tps",
+                        "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research benchmark --mode decode-sample",
+                    },
+                ],
+            )
+            progress = helper.progress_memory_context(progress_root, helper.result_rows(progress_root))
+            assert progress["current_owner"]["task_id"] != "frontier-expansion-support-only", progress["current_owner"]
+            assert progress["current_owner"]["metric"] == "decode_tps", progress["current_owner"]
     return 0
 
 

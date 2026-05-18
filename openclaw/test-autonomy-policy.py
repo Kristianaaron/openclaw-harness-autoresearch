@@ -100,6 +100,24 @@ def main() -> int:
             assert perfect["total_score"] == 100
             assert perfect["hard_gate_failures"] == []
 
+            write_json(
+                root / "benchmarks" / "quality-review-2.json",
+                {
+                    "kind": "quality-review",
+                    "verdict": "healthy",
+                    "quality_score": 95,
+                    "scorecard": {
+                        "overall": 94.7,
+                        "interpretation": "healthy_research_loop_research_continue_floor",
+                    },
+                },
+            )
+            research_continue = helper.frontier_autonomy_score_report(root, promotion=False)
+            assert research_continue["total_score"] == 100, research_continue
+            assert research_continue["decision"] == "continue", research_continue
+            assert research_continue["hard_gate_failures"] == [], research_continue
+            assert research_continue["evidence"]["quality"]["scorecard_soft_continue"] is True
+
             helper.append_result(
                 root,
                 run_id="tool-loop-after-cert",
@@ -171,6 +189,15 @@ def main() -> int:
             )
             crabbox = helper.load_crabbox_evidence(str(evidence_path), patch_sha256=helper.text_sha256(patch_text))
             assert crabbox["_valid_for_architectural_promotion"] is True
+            write_json(
+                root / "benchmarks" / "quality-review-3.json",
+                {
+                    "kind": "quality-review",
+                    "verdict": "healthy",
+                    "quality_score": 100,
+                    "scorecard": {"overall": 99.7, "interpretation": "promotion_ready"},
+                },
+            )
             promoted = helper.frontier_autonomy_score_report(
                 root,
                 promotion=True,

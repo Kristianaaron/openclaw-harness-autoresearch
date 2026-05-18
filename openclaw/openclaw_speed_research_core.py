@@ -175,6 +175,7 @@ DEFAULT_RESEARCH_PROFILE: dict[str, Any] = {
             "adapter_method_contract",
             "autoresearch_quality_delta",
             "source_evidence_count",
+            "new_drafter_family_evidence",
             "frontier_deliberation_contract",
             "quant_safe_drafter_candidate_gate",
         ],
@@ -1175,6 +1176,12 @@ def semantic_task_key(task: dict[str, Any]) -> str:
         return "production-mtp:decode-sample:decode_tps"
     if action == "mtp-report" or "mtp-report" in text or "mtp-acceptance-yield" in text:
         return "production-mtp:mtp-report:mean_accept"
+    if (
+        task_id.startswith("frontier-expansion-drafter-family-source-scout-")
+        or target == "external-drafter-family-references"
+        or "source-scout --topic drafter-family" in text
+    ):
+        return "frontier-expansion:drafter-family-source-scout:new_candidate_family"
     if action == "source-scout" or "source-scout" in text:
         return "frontier-deliberation:source-scout:source_evidence_count"
     if "quant-safe-drafter-candidate" in text:
@@ -1219,6 +1226,8 @@ def semantic_result_key(row: dict[str, str]) -> str:
         return "production-mtp:decode-sample:decode_tps"
     if target == "mtp-acceptance-report" or run_id.startswith("mtp-report-") or "mean_accept=" in text:
         return "production-mtp:mtp-report:mean_accept"
+    if target == "frontier-source-scout" and "topic=drafter-family" in text:
+        return "frontier-expansion:drafter-family-source-scout:new_candidate_family"
     if target == "frontier-source-scout" or run_id.startswith("source-scout-"):
         return "frontier-deliberation:source-scout:source_evidence_count"
     if "quant-safe-drafter-candidate" in text:
