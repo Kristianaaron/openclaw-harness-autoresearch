@@ -2885,6 +2885,51 @@ def main() -> int:
                 "frontier-expansion-material-exhaustion-breakout-"
             )
             assert "source-scout" not in material_report["architect"]["selected_task_id"]
+            with tempfile.TemporaryDirectory() as material_terminal_tmp:
+                material_terminal_root = Path(material_terminal_tmp) / "research" / "speed"
+                helper.ensure_research_state(material_terminal_root)
+                helper.append_result(
+                    material_terminal_root,
+                    run_id="drafter-material-candidate-exhausted-unit",
+                    status="blocked",
+                    target="janq-drafter-material-candidate",
+                    hypothesis="unit all material candidates exhausted",
+                    commit="abc123",
+                    notes="decision=all-material-drafter-candidates-exhausted",
+                )
+                helper.append_result(
+                    material_terminal_root,
+                    run_id="supervisor-focused-test-material-exhaustion-unit",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="All current JANQ drafter material candidates are exhausted.",
+                    commit="abc123",
+                    notes="focused test passed",
+                )
+                with (
+                    patch.object(
+                        helper,
+                        "drafter_bottleneck_state",
+                        return_value={
+                            "state": "material_drafter_candidates_exhausted",
+                            "next_step": "seed_frontier_expansion_after_material_exhaustion",
+                            "material_candidates_exhausted": True,
+                        },
+                    ),
+                    patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(
+                        helper,
+                        "canonical_autoresearch_state",
+                        return_value={"clean": True, "noise": {"unresolved_blocked_rows": 0, "memory_blocks": 0}},
+                    ),
+                ):
+                    terminal_report, terminal_tasks = helper.frontier_agent_deliberation(
+                        material_terminal_root,
+                        helper.result_rows(material_terminal_root),
+                        123460,
+                    )
+                assert terminal_tasks == []
+                assert "already proved" in terminal_report["architect"]["selected_reason"]
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -3698,6 +3743,33 @@ def main() -> int:
                 )
                 assert all(task.get("supervisor_action") not in blocked_actions for task in closed_tasks)
                 assert all(not str(task.get("id", "")).startswith(blocked_prefixes) for task in closed_tasks)
+                helper.append_result(
+                    exhausted_root,
+                    run_id="supervisor-focused-test-material-exhaustion-unit",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="All current JANQ drafter material candidates are exhausted.",
+                    commit="abc123",
+                    notes="focused test passed",
+                )
+                with patch.object(
+                    helper,
+                    "drafter_bottleneck_state",
+                    return_value={
+                        "state": "adapter_calibration_no_lift",
+                        "next_step": "seed_quant_safe_drafter_candidate",
+                        "reason": "unit forced stale quant-safe route",
+                    },
+                ):
+                    assert (
+                        helper.drafter_bottleneck_next_tasks(
+                            exhausted_root,
+                            helper.result_rows(exhausted_root),
+                            1779000004,
+                            reason="unit exhausted material candidate breakout already proved",
+                        )
+                        == []
+                    )
                 helper.write_jsonl(exhausted_root / "tasks.jsonl", next_tasks)
                 canonical = helper.canonical_autoresearch_state(exhausted_root, recent_rows=120)
                 assert canonical["clean"]

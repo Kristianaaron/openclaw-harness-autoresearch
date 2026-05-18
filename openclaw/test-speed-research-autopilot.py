@@ -1717,6 +1717,25 @@ def main() -> int:
         assert len(breakouts) == 1
         assert breakouts[0]["supervisor_action"] == "focused-test"
         assert breakouts[0]["metric"] == "material_exhaustion_breakout_contract"
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="supervisor-focused-test-material-exhaustion-unit",
+            status="keep",
+            target="openclaw/openclaw-mtp-drafter-calibrate.py",
+            hypothesis="All current JANQ drafter material candidates are exhausted.",
+            commit="unit-test",
+            notes="focused test passed",
+        )
+        ok, issue = helper.run_supervisor_synthesis(timeout_args, 12, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert "material exhaustion breakout already proved" in issue
+        tasks = helper.read_jsonl(helper.TASKS)
+        breakouts_after = [
+            task for task in tasks if str(task.get("id", "")).startswith("material-exhaustion-breakout-")
+        ]
+        assert len(breakouts_after) == 1
+        assert breakouts_after[0]["status"] == "blocked"
+        assert "autoresearch-material-exhaustion-terminal" in helper.RESULTS.read_text(encoding="utf-8")
         review_helper = Path(tmp) / "review-helper.py"
         review_marker = Path(tmp) / "review-marker.txt"
         review_helper.write_text(

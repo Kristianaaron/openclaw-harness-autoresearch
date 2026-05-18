@@ -4647,6 +4647,27 @@ def recent_material_drafter_exhaustion(limit: int = 240) -> bool:
     return False
 
 
+def recent_material_exhaustion_breakout_proved(limit: int = 160) -> bool:
+    """Return true once the exhaustion breakout canary has already passed."""
+    for row in reversed(all_result_rows(WORKSPACE)[-max(1, limit) :]):
+        text = " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        if (
+            "supervisor-focused-test" in text
+            and "focused test passed" in text
+            and "all current janq drafter material candidates are exhausted" in text
+        ):
+            return True
+    return False
+
+
+def recent_material_exhaustion_terminal(limit: int = 80) -> bool:
+    """Return true when the current no-new-family terminal state was already recorded."""
+    for row in reversed(all_result_rows(WORKSPACE)[-max(1, limit) :]):
+        if str(row.get("target", "")) == "autoresearch-material-exhaustion-terminal":
+            return True
+    return False
+
+
 def material_exhaustion_breakout_task(cycle: int, session: str, reason: str) -> dict[str, object]:
     timestamp = int(time.time())
     return {
@@ -4699,19 +4720,32 @@ def block_stale_material_exhaustion_recovery_tasks() -> int:
         task_id = str(task.get("id", ""))
         if task.get("status", "ready") not in {"ready", "rework"}:
             continue
-        if not task_id.startswith("synthesis-timeout-recovery-"):
-            continue
-        if task.get("supervisor_action") != "drafter-bottleneck-review":
+        is_stale_recovery = (
+            task_id.startswith("synthesis-timeout-recovery-")
+            and task.get("supervisor_action") == "drafter-bottleneck-review"
+        )
+        is_repeated_breakout = (
+            recent_material_exhaustion_breakout_proved()
+            and task_id.startswith("material-exhaustion-breakout-")
+            and task.get("supervisor_action") == "focused-test"
+        )
+        if not (is_stale_recovery or is_repeated_breakout):
             continue
         task["status"] = "blocked"
         task["blocked_at"] = now
-        task["blocked_reason"] = (
-            "material drafter candidates are exhausted; stale synthesis-timeout recovery "
-            "would repeat drafter-bottleneck-review with seeded_tasks=0"
-        )
+        if is_repeated_breakout:
+            task["blocked_reason"] = (
+                "material exhaustion breakout canary already passed; repeating it is noise until "
+                "a materially new drafter-family candidate exists"
+            )
+        else:
+            task["blocked_reason"] = (
+                "material drafter candidates are exhausted; stale synthesis-timeout recovery "
+                "would repeat drafter-bottleneck-review with seeded_tasks=0"
+            )
         task["supervisor_summary"] = {
             "reason": "stale_material_exhaustion_recovery_suppressed",
-            "next": "route to material-exhaustion-breakout instead of bottleneck-review",
+            "next": "require materially new drafter-family evidence before another recovery task",
         }
         blocked += 1
     if blocked:
@@ -4741,6 +4775,36 @@ def seed_synthesis_timeout_recovery_task(cycle: int, session: str, reason: str) 
     prefix = "synthesis-timeout-recovery-"
     if recent_material_drafter_exhaustion():
         block_stale_material_exhaustion_recovery_tasks()
+        if recent_material_exhaustion_breakout_proved():
+            if not recent_material_exhaustion_terminal():
+                append_result(
+                    WORKSPACE,
+                    run_id=f"material-exhaustion-terminal-{cycle}-{int(time.time())}",
+                    status="discard",
+                    target="autoresearch-material-exhaustion-terminal",
+                    hypothesis="material exhaustion breakout is already proved; repeating it is not progress",
+                    commit=current_commit(),
+                    notes=(
+                        f"session={session} reason={clean_tsv(reason)} "
+                        "next=materially-new-drafter-family-required"
+                    ),
+                )
+                append_jsonl(
+                    FINDINGS,
+                    {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "task_id": "material-exhaustion-terminal",
+                        "finding": (
+                            "material-exhaustion breakout already passed; synthesis timeout is terminal "
+                            "until a materially new drafter-family candidate exists"
+                        ),
+                        "session": session,
+                        "cycle": cycle,
+                        "reason": reason,
+                        "next": "introduce new drafter-family evidence; do not repeat breakout/source/MTP churn",
+                    },
+                )
+            return False, "material exhaustion breakout already proved; materially new drafter family required"
         breakout_prefix = "material-exhaustion-breakout-"
         if active_task_has_prefix(breakout_prefix):
             return False, "existing material-exhaustion breakout task is already ready"

@@ -3563,6 +3563,25 @@ def material_drafter_candidates_exhausted(root: Path, *, recent_rows: int = 600)
     return not material_drafter_candidate_modes(root, recent_rows=recent_rows)
 
 
+def material_exhaustion_breakout_proved(
+    root: Path,
+    rows: list[dict[str, str]] | None = None,
+    *,
+    recent_rows: int = 240,
+) -> bool:
+    """Return true once the material-exhaustion canary has already passed."""
+    window = (rows if rows is not None else result_rows(root))[-max(1, recent_rows) :]
+    for row in reversed(window):
+        text = " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        if (
+            "supervisor-focused-test" in text
+            and "focused test passed" in text
+            and "all current janq drafter material candidates are exhausted" in text
+        ):
+            return True
+    return False
+
+
 def calibration_task_uses_exhausted_fingerprint(root: Path, task: dict[str, Any], *, recent_rows: int = 600) -> bool:
     action = str(task.get("supervisor_action", ""))
     task_id = str(task.get("id", ""))
@@ -5139,6 +5158,8 @@ def drafter_bottleneck_next_tasks(
             expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
             if expansion_tasks:
                 return expansion_tasks
+            if material_exhaustion_breakout_proved(root, rows, recent_rows=240):
+                return []
             evidence = {
                 "reason": (
                     "all material drafter candidates are exhausted and frontier expansion routes are already consumed; "
@@ -5162,6 +5183,8 @@ def drafter_bottleneck_next_tasks(
         expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
         if expansion_tasks:
             return expansion_tasks
+        if material_exhaustion_breakout_proved(root, rows, recent_rows=240):
+            return []
         evidence = {
             "reason": "material drafter candidates exhausted and prior frontier expansion routes are already consumed",
             "bottleneck_state": state,
@@ -6495,7 +6518,8 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
     }
 
     candidates: list[tuple[str, dict[str, Any]]] = []
-    if evidence["material_candidates_exhausted"]:
+    material_breakout_proved = material_exhaustion_breakout_proved(root, rows, recent_rows=240)
+    if evidence["material_candidates_exhausted"] and not material_breakout_proved:
         candidates.append(
             (
                 "frontier-expansion-drafter-family-search-",
@@ -6863,7 +6887,9 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_reason = "repeated source-scout/MTP escape requires a quantization-safe drafter candidate"
     elif waiting_on_bottleneck_route:
         selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
-    elif material_exhausted:
+    elif material_exhausted and material_exhaustion_breakout_proved(root, rows, recent_rows=240):
+        selected_reason = "material exhaustion breakout already proved; materially new drafter-family evidence required"
+    elif material_exhausted and not material_exhaustion_breakout_proved(root, rows, recent_rows=240):
         selected_task = material_exhaustion_breakout_task(
             timestamp,
             evidence={
@@ -6899,7 +6925,7 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_task = mtp_acceptance_yield_task(timestamp, evidence=evidence)
         selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
     if selected_task is None:
-        if not waiting_on_bottleneck_route:
+        if not material_exhausted and not waiting_on_bottleneck_route:
             selected_task = agent_deliberation_task(
                 timestamp,
                 slug="open-problem-contract",
