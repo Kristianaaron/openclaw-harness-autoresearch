@@ -440,6 +440,30 @@ def calibration_fingerprint_fields(mode: str, text: str = "") -> dict[str, str]:
                 "loss": "target-logit-distillation",
             }
         )
+    elif mode == "adapter-low-rank-hidden":
+        fields.update(
+            {
+                "trainable": "low_rank_hidden_adapter",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "hidden-to-logit-adapter-ce",
+            }
+        )
+    elif mode == "adapter-pre-projection-low-rank":
+        fields.update(
+            {
+                "trainable": "pre_projection_low_rank_adapter",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "pre-projection-adapter-ce",
+            }
+        )
     for key in ("training_mode", "target_trace_policy", "target_gradient_policy"):
         match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', text)
         if match:
@@ -1671,6 +1695,15 @@ def is_supervisor_drafter_trace_prerequisite_task(task: dict[str, object] | None
     )
 
 
+def is_supervisor_drafter_material_candidate_task(task: dict[str, object] | None) -> bool:
+    if not task:
+        return False
+    return (
+        task.get("supervisor_action") == "drafter-material-candidate"
+        or "openclaw-speed-research drafter-material-candidate" in str(task.get("next_action", ""))
+    )
+
+
 def is_supervisor_drafter_trace_collect_task(task: dict[str, object] | None) -> bool:
     if not task:
         return False
@@ -1841,6 +1874,7 @@ def task_runs_without_model(task: dict[str, object] | None) -> bool:
             is_supervisor_drafter_adapter_contract_task,
             is_supervisor_drafter_trace_gate_task,
             is_supervisor_drafter_trace_prerequisite_task,
+            is_supervisor_drafter_material_candidate_task,
             is_supervisor_drafter_trace_collect_task,
             is_supervisor_drafter_calibration_canary_task,
             is_supervisor_drafter_calibration_memory_stage_task,
@@ -3779,6 +3813,48 @@ def run_supervisor_drafter_trace_prerequisite_task(
     parsed = parse_json_object(result.stdout) or {}
     status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
     reason = str(parsed.get("reason") or f"supervisor drafter trace prerequisite exit {result.returncode}")
+    complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
+    return 0, "" if status == "keep" else reason
+
+
+def run_supervisor_drafter_material_candidate_task(
+    args: argparse.Namespace,
+    cycle: int,
+    session: str,
+    task: dict[str, object],
+    log_file: Path,
+) -> tuple[int, str]:
+    cmd = [args.research_helper_bin, "drafter-material-candidate"]
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(
+            f"\n===== cycle {cycle} session {session} supervisor drafter material candidate "
+            f"task={task.get('id', 'unknown')} =====\n"
+        )
+        file.write("$ " + " ".join(cmd) + "\n")
+        file.flush()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=45,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR DRAFTER MATERIAL CANDIDATE TIMEOUT\n")
+            complete_supervisor_task(
+                task,
+                status="blocked",
+                summary={"reason": "supervisor drafter material candidate timeout"},
+                commit=current_commit(),
+            )
+            return 124, "supervisor drafter material candidate timeout"
+        file.write(result.stdout)
+        file.flush()
+    parsed = parse_json_object(result.stdout) or {}
+    status = "keep" if result.returncode == 0 and parsed.get("status") == "keep" else "blocked"
+    reason = str(parsed.get("reason") or f"supervisor drafter material candidate exit {result.returncode}")
     complete_supervisor_task(task, status=status, summary=parsed or {"reason": reason}, commit=current_commit())
     return 0, "" if status == "keep" else reason
 
@@ -6242,6 +6318,8 @@ def main() -> int:
             code, issue = run_supervisor_drafter_trace_gate_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_trace_prerequisite_task(selected_task):
             code, issue = run_supervisor_drafter_trace_prerequisite_task(args, cycle, current_session, selected_task, log_file)
+        elif is_supervisor_drafter_material_candidate_task(selected_task):
+            code, issue = run_supervisor_drafter_material_candidate_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_trace_collect_task(selected_task):
             code, issue = run_supervisor_drafter_trace_collect_task(args, cycle, current_session, selected_task, log_file)
         elif is_supervisor_drafter_calibration_canary_task(selected_task):

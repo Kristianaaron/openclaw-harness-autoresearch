@@ -80,7 +80,18 @@ CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsuppo
 CALIBRATION_TRACE_DISTILLATION_MODE = "trace-distillation"
 CALIBRATION_DIRECT_MODE = "direct-pre-projection"
 CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
-CALIBRATION_MODES = {CALIBRATION_DIRECT_MODE, CALIBRATION_ADAPTER_MODE}
+CALIBRATION_LOW_RANK_HIDDEN_MODE = "adapter-low-rank-hidden"
+CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE = "adapter-pre-projection-low-rank"
+CALIBRATION_MATERIAL_CANDIDATE_MODES = (
+    CALIBRATION_LOW_RANK_HIDDEN_MODE,
+    CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE,
+)
+CALIBRATION_MODES = {
+    CALIBRATION_DIRECT_MODE,
+    CALIBRATION_ADAPTER_MODE,
+    CALIBRATION_LOW_RANK_HIDDEN_MODE,
+    CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE,
+}
 ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 CALIBRATION_CANARY_TERMINAL_BLOCKERS = {
     "calibration-runtime-missing-speculative",
@@ -3416,6 +3427,30 @@ def calibration_fingerprint_fields(mode: str, overrides: dict[str, Any] | None =
                 "loss": "target-logit-distillation",
             }
         )
+    elif fields["mode"] == CALIBRATION_LOW_RANK_HIDDEN_MODE:
+        fields.update(
+            {
+                "trainable": "low_rank_hidden_adapter",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "hidden-to-logit-adapter-ce",
+            }
+        )
+    elif fields["mode"] == CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE:
+        fields.update(
+            {
+                "trainable": "pre_projection_low_rank_adapter",
+                "adapter_rank": "8",
+                "adapter_scale": "1.0",
+                "positions_per_prompt": "1",
+                "target_trace_policy": "stop-gradient",
+                "target_gradient_policy": "stop-gradient",
+                "loss": "pre-projection-adapter-ce",
+            }
+        )
     if overrides:
         for key, value in overrides.items():
             if value is None or value == "":
@@ -5934,15 +5969,18 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
             action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
         ):
             continue
+        task_mode = calibration_task_mode(task)
+        is_material_candidate_mode = task_mode in CALIBRATION_MATERIAL_CANDIDATE_MODES
         calibration_blocked_action = action == "drafter-calibration-run" or "drafter-calibration-run" in task_id
         if (
             calibration_blocker in CALIBRATION_CANARY_TERMINAL_BLOCKERS
-            and calibration_task_mode(task) != CALIBRATION_ADAPTER_MODE
+            and task_mode != CALIBRATION_ADAPTER_MODE
+            and not is_material_candidate_mode
         ):
             calibration_blocked_action = calibration_blocked_action or (
                 action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id
             )
-        if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
+        if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER and not is_material_candidate_mode:
             if is_generic_frontier_escape_task(task):
                 continue
             calibration_blocked_action = calibration_blocked_action or (
@@ -5958,9 +5996,12 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         if exhausted_fingerprints and calibration_task_fingerprint(task) in exhausted_fingerprints:
             continue
         if calibration_no_lift and (
-            action in {"drafter-calibration-canary", "drafter-calibration-run"}
-            or "drafter-calibration-canary" in task_id
-            or "drafter-calibration-run" in task_id
+            task_mode == CALIBRATION_ADAPTER_MODE
+            and (
+                action in {"drafter-calibration-canary", "drafter-calibration-run"}
+                or "drafter-calibration-canary" in task_id
+                or "drafter-calibration-run" in task_id
+            )
         ):
             continue
         seedable.append(task)
@@ -6572,14 +6613,27 @@ def quant_safe_drafter_candidate_task(timestamp: int, *, evidence: dict[str, Any
         ),
         evidence=evidence,
     )
+    task["supervisor_action"] = "drafter-material-candidate"
     task["metric"] = "quant_safe_drafter_candidate_gate"
-    task["next_action"] = "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-trace-prerequisite"
+    task["next_action"] = "/Users/kristian/.openclaw/bin/openclaw-speed-research drafter-material-candidate"
     task["source_files"] = [
         "openclaw/openclaw-mtp-drafter-calibrate.py",
         "openclaw/test-mtp-drafter-calibrate-guards.py",
         "openclaw/test-speed-research.py",
     ]
     return task
+
+
+def material_drafter_candidate_modes(root: Path, *, recent_rows: int = 600) -> list[tuple[str, dict[str, str], str]]:
+    exhausted = exhausted_calibration_fingerprints(root, recent_rows=recent_rows)
+    candidates: list[tuple[str, dict[str, str], str]] = []
+    for mode in CALIBRATION_MATERIAL_CANDIDATE_MODES:
+        fields = calibration_fingerprint_fields(mode)
+        fingerprint = calibration_fingerprint_id(fields)
+        if fingerprint in exhausted:
+            continue
+        candidates.append((mode, fields, fingerprint))
+    return candidates
 
 
 def frontier_escape_candidate_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
@@ -9801,6 +9855,103 @@ def drafter_trace_prerequisite(args: argparse.Namespace) -> int:
     return 0
 
 
+def drafter_material_candidate(args: argparse.Namespace) -> int:
+    root = workspace_root()
+    ensure_research_state(root)
+    timestamp = int(time.time())
+    trace_paths = existing_drafter_trace_paths()
+    candidates = material_drafter_candidate_modes(root, recent_rows=int(args.recent_rows))
+    traces_present = bool(trace_paths)
+    selected_mode = candidates[0][0] if candidates and traces_present else ""
+    selected_fields = candidates[0][1] if candidates and traces_present else {}
+    selected_fingerprint = candidates[0][2] if candidates and traces_present else ""
+    seeded_canary_task = 0
+    seeded_collect_task = 0
+    seeded_task_id = ""
+    if not traces_present:
+        seeded_collect_task = upsert_tasks(
+            root,
+            [drafter_trace_collect_task(timestamp, task_id=f"drafter-material-candidate-trace-collect-{timestamp}")],
+        )
+        status = "blocked"
+        reason = "target-generated-trace-data-missing"
+    elif not candidates:
+        status = "blocked"
+        reason = "all-material-drafter-candidates-exhausted"
+    else:
+        seeded_task_id = unique_task_id(root, f"material-drafter-calibration-canary-{selected_mode}")
+        seedable = filter_seedable_tasks(
+            root,
+            [
+                drafter_calibration_canary_task(
+                    timestamp,
+                    task_id=seeded_task_id,
+                    priority=100,
+                    calibration_mode_value=selected_mode,
+                )
+            ],
+        )
+        seeded_canary_task = upsert_tasks(root, seedable) if seedable else 0
+        status = "keep" if seeded_canary_task else "blocked"
+        reason = "material-candidate-seeded" if seeded_canary_task else "material-candidate-not-seedable"
+    report = {
+        "ok": status == "keep",
+        "kind": "drafter-material-candidate",
+        "status": status,
+        "reason": reason,
+        "trace_data": [str(path) for path in trace_paths],
+        "candidate_modes_remaining": [mode for mode, _, _ in candidates],
+        "selected_calibration_mode": selected_mode,
+        "selected_fingerprint": selected_fingerprint,
+        "selected_fingerprint_fields": selected_fields,
+        "seeded_canary_task": seeded_canary_task,
+        "seeded_collect_task": seeded_collect_task,
+        "seeded_task_id": seeded_task_id if seeded_canary_task else "",
+        "next_action": (
+            "run_material_candidate_calibration_canary"
+            if seeded_canary_task
+            else "collect_target_generated_trace_data"
+            if seeded_collect_task
+            else "surface_new_candidate_family"
+        ),
+        "timestamp": timestamp,
+    }
+    artifact = root / "benchmarks" / f"drafter-material-candidate-{timestamp}.json"
+    artifact.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "drafter-material-candidate",
+            "finding": (
+                "routed exhausted adapter-logit drafter work to a materially different quant-safe candidate"
+                if seeded_canary_task
+                else "material drafter candidate gate blocked fail-closed"
+            ),
+            "evidence": report,
+            "next": report["next_action"],
+        },
+    )
+    append_result(
+        root,
+        run_id=f"drafter-material-candidate-{timestamp}",
+        status=status,
+        target="janq-drafter-material-candidate",
+        hypothesis=(
+            "Adapter-logit no-lift should route to a materially different frozen-safe drafter adapter "
+            "before any further calibration work runs."
+        ),
+        commit=current_commit(repo_root()),
+        notes=(
+            f"decision={reason} selected_calibration_mode={selected_mode} "
+            f"selected_fingerprint={selected_fingerprint} seeded_canary_task={seeded_canary_task} "
+            f"seeded_collect_task={seeded_collect_task} material_change={str(bool(selected_mode)).lower()}"
+        ),
+    )
+    print(json.dumps({"path": str(artifact), **report}, indent=2, sort_keys=True))
+    return 0 if status == "keep" or seeded_collect_task else 2
+
+
 def drafter_trace_collect(args: argparse.Namespace) -> int:
     root = workspace_root()
     ensure_research_state(root)
@@ -12925,6 +13076,10 @@ def main() -> int:
 
     trace_prereq = sub.add_parser("drafter-trace-prerequisite")
     trace_prereq.set_defaults(func=drafter_trace_prerequisite)
+
+    material_candidate = sub.add_parser("drafter-material-candidate")
+    material_candidate.add_argument("--recent-rows", type=int, default=600)
+    material_candidate.set_defaults(func=drafter_material_candidate)
 
     trace_collect = sub.add_parser("drafter-trace-collect")
     trace_collect.add_argument("--base-url", default=os.environ.get("OPENCLAW_SPEED_RESEARCH_MODEL_URL", DEFAULT_MODEL_URL))

@@ -24,6 +24,12 @@ RESULTS_HEADER = (
 )
 CALIBRATION_QUANTIZED_GRADIENT_BLOCKER = "calibration-quantized-gradient-unsupported"
 CALIBRATION_ADAPTER_MODE = "adapter-logit-distillation"
+CALIBRATION_LOW_RANK_HIDDEN_MODE = "adapter-low-rank-hidden"
+CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE = "adapter-pre-projection-low-rank"
+CALIBRATION_MATERIAL_CANDIDATE_MODES = {
+    CALIBRATION_LOW_RANK_HIDDEN_MODE,
+    CALIBRATION_PRE_PROJECTION_LOW_RANK_MODE,
+}
 ADAPTER_LOGIT_LOOP_THRESHOLD = 2
 REPEAT_PRONE_SEMANTIC_KEYS = {
     "drafter-alignment:drafter-calibration-canary:acceptance_lift",
@@ -1320,6 +1326,10 @@ def calibration_mode_from_value(value: object) -> str:
     return text if text else "bounded"
 
 
+def task_calibration_mode(task: dict[str, Any]) -> str:
+    return calibration_mode_from_value(task.get("calibration_mode"))
+
+
 def recent_calibration_rejected_no_lift(
     root: Path,
     *,
@@ -1570,6 +1580,7 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
             recent_rows=240,
             calibration_mode_filter=CALIBRATION_ADAPTER_MODE,
         )
+        and task_calibration_mode(task) == CALIBRATION_ADAPTER_MODE
         and (is_calibration_canary_task(task) or is_calibration_run_task(task))
     ):
         return "recent bounded adapter calibration produced no acceptance lift; route to a new drafter candidate or paired evaluation, not another canary"

@@ -296,7 +296,9 @@ def main() -> int:
             )
             assert len(direct_escape) == 1
             assert direct_escape[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-")
-            assert "drafter-trace-prerequisite" in direct_escape[0]["next_action"]
+            assert direct_escape[0]["supervisor_action"] == "drafter-material-candidate"
+            assert "drafter-material-candidate" in direct_escape[0]["next_action"]
+            assert "drafter-trace-prerequisite" not in direct_escape[0]["next_action"]
             helper.upsert_tasks(loop_root, direct_escape)
             active_candidate_state = helper.drafter_bottleneck_state(loop_root)
             assert active_candidate_state["state"] == "quant_safe_candidate_ready"
@@ -3500,6 +3502,69 @@ def main() -> int:
             promotion_report = helper.frontier_autonomy_score_report(autonomy_root, promotion=True)
             assert promotion_report["ok"] is False
             assert "scorecard_at_least_99_for_promotion" in promotion_report["hard_gate_failures"]
+        with tempfile.TemporaryDirectory() as material_tmp:
+            material_root = Path(material_tmp) / "research" / "speed"
+            material_home = Path(material_tmp) / "home"
+            trace_dir = material_home / "drafter-fit"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_path = trace_dir / "target-generated-traces.jsonl"
+            trace_path.write_text(
+                "\n".join(
+                    json.dumps({"prompt": f"prompt {index}", "completion": "ok", "completion_tokens": 2})
+                    for index in range(4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            plan_path = trace_dir / "gemma4-janq-dflash-fit-plan.json"
+            plan_path.write_text(
+                json.dumps({"decision": "ready-for-target-generated-trace-data", "target_path": "/tmp/janq"})
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"OPENCLAW_SPEED_RESEARCH_DIR": str(material_root), "OPENCLAW_HOME": str(material_home)},
+                clear=False,
+            ):
+                helper.ensure_research_state(material_root)
+                helper.append_result(
+                    material_root,
+                    run_id="drafter-calibration-evaluation-material-unit",
+                    status="discard",
+                    target="janq-drafter-calibration-evaluation",
+                    hypothesis="unit exhausted adapter-logit candidate",
+                    commit="abc123",
+                    notes=(
+                        "decision=reject-no-lift calibration_mode=adapter-logit-distillation "
+                        "baseline_acceptance=1.0 best_acceptance=1.0 acceptance_lift=0.0"
+                    ),
+                )
+                task = helper.quant_safe_drafter_candidate_task(1779000000, evidence={"reason": "unit"})
+                assert task["supervisor_action"] == "drafter-material-candidate"
+                assert "drafter-material-candidate" in task["next_action"]
+                assert "drafter-trace-prerequisite" not in task["next_action"]
+                exhausted = helper.exhausted_calibration_fingerprints(material_root)
+                low_rank_fields = helper.calibration_fingerprint_fields(helper.CALIBRATION_LOW_RANK_HIDDEN_MODE)
+                assert helper.calibration_fingerprint_id(low_rank_fields) not in exhausted
+                assert helper.drafter_material_candidate(Namespace(recent_rows=600)) == 0
+                material_tasks = [
+                    item
+                    for item in helper.read_jsonl(material_root / "tasks.jsonl")
+                    if item.get("status") == "ready"
+                    and item.get("supervisor_action") == "drafter-calibration-canary"
+                ]
+                assert len(material_tasks) == 1
+                assert material_tasks[0]["calibration_mode"] == helper.CALIBRATION_LOW_RANK_HIDDEN_MODE
+                assert material_tasks[0]["calibration_fingerprint"] not in exhausted
+                material_report = json.loads(
+                    sorted((material_root / "benchmarks").glob("drafter-material-candidate-*.json"))[-1].read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert material_report["status"] == "keep"
+                assert material_report["selected_calibration_mode"] == helper.CALIBRATION_LOW_RANK_HIDDEN_MODE
+                assert material_report["seeded_canary_task"] == 1
     return 0
 
 
