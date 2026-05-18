@@ -1212,6 +1212,7 @@ def semantic_task_key(task: dict[str, Any]) -> str:
 def semantic_result_key(row: dict[str, str]) -> str:
     run_id = row.get("run_id", "")
     target = row.get("target", "")
+    hypothesis = row.get("hypothesis", "")
     notes = row.get("notes", "")
     text = f"{run_id} {target} {notes}".lower()
     if target == "decode-sample" or run_id.startswith("benchmark-") and "decode-sample" in target:
@@ -1238,6 +1239,9 @@ def semantic_result_key(row: dict[str, str]) -> str:
         return "drafter-alignment:drafter-trace-gate:trace_data"
     if target == "calibration-memory-report" or run_id.startswith("calibration-memory-report-"):
         return "drafter-alignment:calibration-memory-report:calibration_memory_root_cause"
+    if run_id.startswith("supervisor-focused-test-"):
+        focus = normalize_strategy_token(f"{target} {hypothesis}")[:96]
+        return f"supervisor:focused-test:{focus or 'unknown'}"
     if target == "synthesis" or run_id.startswith("synthesis-"):
         return "frontier-expansion:synthesis-frontier:ranked_ideas"
     return ":".join(
@@ -1275,7 +1279,7 @@ def result_row_has_material_transition(row: dict[str, str]) -> bool:
         return fields.get("decision", "") in {"candidate-ready-for-paired-benchmark", "reject-no-lift"}
     if key == "frontier-expansion:quant-safe-drafter-candidate:contract":
         return True
-    if row.get("run_id", "").startswith(("patch-executor-", "supervisor-focused-test-")):
+    if row.get("run_id", "").startswith("patch-executor-"):
         return True
     return False
 
@@ -1303,7 +1307,13 @@ def repeated_semantic_nonprogress(
     keys = {semantic_result_key(row) for row in material}
     if not keys:
         return ""
-    repeat_keys = {key for key in keys if key in REPEAT_PRONE_SEMANTIC_KEYS or key.startswith("drafter-alignment:drafter-calibration-run:")}
+    repeat_keys = {
+        key
+        for key in keys
+        if key in REPEAT_PRONE_SEMANTIC_KEYS
+        or key.startswith("drafter-alignment:drafter-calibration-run:")
+        or key.startswith("supervisor:focused-test:")
+    }
     if repeat_keys != keys:
         return ""
     previous_rows = all_result_rows(root)[: max(0, before_line_count - 1)][-max(1, recent_rows) :]

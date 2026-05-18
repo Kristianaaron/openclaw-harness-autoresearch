@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from argparse import Namespace
 from pathlib import Path
@@ -16,6 +17,7 @@ from unittest.mock import patch
 
 HELPER_PATH = Path(__file__).with_name("openclaw-speed-research.py")
 CALIBRATOR_PATH = Path(__file__).with_name("openclaw-mtp-drafter-calibrate.py")
+SELF_IMPROVEMENT_PATH = Path(__file__).with_name("openclaw_self_improvement.py")
 
 
 def load_helper():
@@ -36,9 +38,22 @@ def load_calibrator():
     return module
 
 
+def load_self_improvement():
+    spec = importlib.util.spec_from_file_location("openclaw_self_improvement", SELF_IMPROVEMENT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {SELF_IMPROVEMENT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> int:
     helper = load_helper()
     calibrator = load_calibrator()
+    self_improvement = load_self_improvement()
+    import openclaw_speed_research_core as core
+
     gate_args = Namespace(min_free_mb=16384, min_pressure_free_percent=20, max_compressor_mb=2048, max_swap_mb=2048)
     with patch.object(
         calibrator,
@@ -100,6 +115,71 @@ def main() -> int:
                 for task in helper.read_jsonl(runtime_root / "tasks.jsonl")
                 if task.get("id") == "unit-stale-runtime-overhead" and task.get("status", "ready") in {"ready", "rework"}
             ]
+            snapshot_root = Path(tmp) / "snapshot-bounded" / "speed"
+            helper.ensure_research_state(snapshot_root)
+            self_improvement.ensure_self_improvement_state(snapshot_root)
+            self_base = snapshot_root / "self-improvement"
+            large_rows = "".join(json.dumps({"id": f"row-{index}", "payload": "x" * 200}) + "\n" for index in range(120))
+            (self_base / "evolution-eval-cases.jsonl").write_text(large_rows, encoding="utf-8")
+            with patch.object(self_improvement, "SNAPSHOT_KEEP", 2), patch.object(
+                self_improvement, "SNAPSHOT_MAX_FILE_BYTES", 1024
+            ), patch.object(self_improvement, "SNAPSHOT_TAIL_LINES", 5):
+                first_snapshot = self_improvement.snapshot_self_improvement(snapshot_root, reason="unit-one")
+                second_snapshot = self_improvement.snapshot_self_improvement(snapshot_root, reason="unit-two")
+                third_snapshot = self_improvement.snapshot_self_improvement(snapshot_root, reason="unit-three")
+            snapshot_dirs = [path for path in (self_base / "snapshots").iterdir() if path.is_dir()]
+            assert len(snapshot_dirs) == 2
+            assert first_snapshot and not first_snapshot.exists()
+            assert second_snapshot and second_snapshot.exists()
+            assert third_snapshot and third_snapshot.exists()
+            copied_text = (third_snapshot / "evolution-eval-cases.jsonl").read_text(encoding="utf-8")
+            assert "snapshot_truncated" in copied_text
+            assert len(copied_text.splitlines()) <= 6
+            with patch.object(self_improvement, "LEDGER_MAX_ROWS", 10):
+                ledger_rows = [{"id": f"case-{index}", "payload": index} for index in range(25)]
+                self_improvement.write_jsonl(self_base / "evolution-eval-cases.jsonl", ledger_rows)
+                compacted_self = self_improvement.compact_self_improvement_ledgers(snapshot_root)
+            assert compacted_self["compacted"]["evolution-eval-cases.jsonl"] == 15
+            capped_cases = self_improvement.read_jsonl(self_base / "evolution-eval-cases.jsonl")
+            assert len(capped_cases) == 10
+            assert capped_cases[0]["id"] == "case-15"
+            rotate_root = Path(tmp) / "rotate-ledger" / "speed"
+            helper.ensure_research_state(rotate_root)
+            for index in range(12):
+                helper.append_result(
+                    rotate_root,
+                    run_id=f"rotate-unit-{index}",
+                    status="keep",
+                    target="decode-sample",
+                    hypothesis="bounded hot ledger should keep recent rows",
+                    commit="unit",
+                    decode_tps=str(index),
+                    notes="rotation unit",
+                )
+            rotation = helper.rotate_results_ledger(rotate_root, keep_rows=5, rotate_above_rows=8)
+            assert rotation["rotated"] is True
+            hot_rows = helper.result_rows(rotate_root)
+            assert len(hot_rows) == 5
+            assert hot_rows[0]["run_id"] == "rotate-unit-7"
+            assert list((rotate_root / "archive").glob("results-*.tsv.gz"))
+            task_rows = [
+                {"id": f"terminal-{index}", "status": "blocked", "target": "old"}
+                for index in range(12)
+            ]
+            task_rows.append({"id": "still-ready", "status": "ready", "target": "active"})
+            helper.write_jsonl(rotate_root / "tasks.jsonl", task_rows)
+            task_rotation = helper.rotate_jsonl_ledger(
+                rotate_root,
+                "tasks.jsonl",
+                keep_rows=5,
+                rotate_above_rows=8,
+                active_statuses={"ready", "rework", "running"},
+            )
+            assert task_rotation["rotated"] is True
+            bounded_tasks = helper.read_jsonl(rotate_root / "tasks.jsonl")
+            assert any(task.get("id") == "still-ready" for task in bounded_tasks)
+            assert len(bounded_tasks) == 6
+            assert list((rotate_root / "archive").glob("tasks-jsonl-*.jsonl.gz"))
             duplicate_task = {
                 "id": "unit-duplicate-task",
                 "status": "ready",
@@ -2928,8 +3008,48 @@ def main() -> int:
                         helper.result_rows(material_terminal_root),
                         123460,
                     )
-                assert terminal_tasks == []
-                assert "already proved" in terminal_report["architect"]["selected_reason"]
+            assert terminal_tasks == []
+            assert "already proved" in terminal_report["architect"]["selected_reason"]
+            with tempfile.TemporaryDirectory() as focused_tmp:
+                focused_root = Path(focused_tmp) / "research" / "speed"
+                helper.ensure_research_state(focused_root)
+                helper.append_result(
+                    focused_root,
+                    run_id="supervisor-focused-test-1",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="All current JANQ drafter material candidates are exhausted.",
+                    commit="abc123",
+                    notes="focused test passed",
+                )
+                before_line_count = len((focused_root / "results.tsv").read_text(encoding="utf-8").splitlines())
+                helper.append_result(
+                    focused_root,
+                    run_id="supervisor-focused-test-2",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="All current JANQ drafter material candidates are exhausted.",
+                    commit="abc123",
+                    notes="focused test passed",
+                )
+                repeated_rows = core.result_rows_since(focused_root, before_line_count)
+                assert repeated_rows
+                assert core.semantic_result_key(repeated_rows[0]).startswith("supervisor:focused-test:")
+                semantic_noise = core.repeated_semantic_nonprogress(
+                    focused_root,
+                    repeated_rows,
+                    before_line_count=before_line_count,
+                )
+                assert "repeated semantic action" in semantic_noise
+                quality = core.cycle_quality(
+                    focused_root,
+                    {"results_lines": before_line_count},
+                    {"results_lines": before_line_count + 1},
+                    ["results row"],
+                    "",
+                )
+                assert quality["score"] == 0
+                assert quality["status"] == "noise"
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -3688,8 +3808,6 @@ def main() -> int:
                 state = helper.drafter_bottleneck_state(exhausted_root)
                 assert state["state"] == "material_drafter_candidates_exhausted"
                 assert state["next_step"] == "seed_frontier_expansion_after_material_exhaustion"
-                import openclaw_speed_research_core as core
-
                 helper.append_result(
                     exhausted_root,
                     run_id="drafter-material-candidate-unit-exhausted",

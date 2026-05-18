@@ -34,6 +34,10 @@ ROLLBACKS = "evolution-rollbacks.jsonl"
 SKILLS_DIR = "skills"
 SNAPSHOTS_DIR = "snapshots"
 CANARIES_DIR = "evolution-canaries"
+SNAPSHOT_KEEP = int(os.environ.get("OPENCLAW_SELF_IMPROVEMENT_SNAPSHOT_KEEP", "6"))
+SNAPSHOT_MAX_FILE_BYTES = int(os.environ.get("OPENCLAW_SELF_IMPROVEMENT_SNAPSHOT_MAX_FILE_BYTES", str(1024 * 1024)))
+SNAPSHOT_TAIL_LINES = int(os.environ.get("OPENCLAW_SELF_IMPROVEMENT_SNAPSHOT_TAIL_LINES", "2000"))
+LEDGER_MAX_ROWS = int(os.environ.get("OPENCLAW_SELF_IMPROVEMENT_LEDGER_MAX_ROWS", "5000"))
 
 AUTHORITY_STAGES = ("canary", "shadow", "advisory", "task_seed", "supervisor_route")
 DEFAULT_MAX_EFFECTIVE_AUTHORITY = "advisory"
@@ -246,6 +250,16 @@ def dedupe_rows(rows: list[dict[str, Any]], *, kind: str) -> list[dict[str, Any]
     return [latest[key] for key in order if key in latest]
 
 
+def bounded_rows(rows: list[dict[str, Any]], *, kind: str, max_rows: int | None = None) -> list[dict[str, Any]]:
+    """Keep sidecar ledgers useful without letting repair memory become load-bearing bloat."""
+
+    deduped = dedupe_rows(rows, kind=kind)
+    limit = max(1, int(LEDGER_MAX_ROWS if max_rows is None else max_rows))
+    if len(deduped) <= limit:
+        return deduped
+    return deduped[-limit:]
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
@@ -256,15 +270,49 @@ def compact_self_improvement_ledgers(root: Path) -> dict[str, Any]:
 
     ensure_self_improvement_state(root)
     compacted: dict[str, int] = {}
-    for name in (VARIANTS, DECISIONS, SHADOW_REVIEWS, PROMOTIONS, ROLLBACKS):
+    for name in (LESSONS, TRAJECTORIES, PROPOSALS, EVAL_CASES, VARIANTS, DECISIONS, SHADOW_REVIEWS, PROMOTIONS, ROLLBACKS):
         path = self_root(root) / name
         rows = read_jsonl(path)
-        deduped = dedupe_rows(rows, kind=name)
-        removed = len(rows) - len(deduped)
+        bounded = bounded_rows(rows, kind=name)
+        removed = len(rows) - len(bounded)
         if removed > 0:
-            write_jsonl(path, deduped)
+            write_jsonl(path, bounded)
         compacted[name] = removed
     return {"ok": True, "compacted": compacted}
+
+
+def prune_self_improvement_snapshots(root: Path, *, keep: int | None = None) -> dict[str, Any]:
+    """Keep snapshot history bounded so self-improvement cannot amplify disk state."""
+
+    snapshots = self_root(root) / SNAPSHOTS_DIR
+    if not snapshots.exists():
+        return {"ok": True, "removed": 0, "kept": 0}
+    dirs = [path for path in snapshots.iterdir() if path.is_dir()]
+    dirs.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    keep = max(0, int(SNAPSHOT_KEEP if keep is None else keep))
+    removed = 0
+    for stale in dirs[keep:]:
+        shutil.rmtree(stale, ignore_errors=True)
+        removed += 1
+    return {"ok": True, "removed": removed, "kept": min(len(dirs), keep)}
+
+
+def copy_snapshot_file(source: Path, target: Path) -> dict[str, Any]:
+    size = source.stat().st_size
+    if size <= SNAPSHOT_MAX_FILE_BYTES:
+        shutil.copy2(source, target)
+        return {"name": source.name, "bytes": size, "truncated": False}
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = lines[-max(1, SNAPSHOT_TAIL_LINES) :]
+    metadata = {
+        "snapshot_truncated": True,
+        "source_name": source.name,
+        "source_bytes": size,
+        "kept_tail_lines": len(tail),
+        "reason": "bounded self-improvement snapshot",
+    }
+    target.write_text(json.dumps(metadata, sort_keys=True) + "\n" + "\n".join(tail) + "\n", encoding="utf-8")
+    return {"name": source.name, "bytes": size, "truncated": True, "kept_tail_lines": len(tail)}
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -1300,6 +1348,8 @@ def record_lessons(root: Path, lessons: list[Lesson]) -> dict[str, Any]:
 
 def snapshot_self_improvement(root: Path, reason: str = "curate") -> Path | None:
     ensure_self_improvement_state(root)
+    compact_self_improvement_ledgers(root)
+    prune_self_improvement_snapshots(root)
     base = self_root(root)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     base_name = f"{stamp}-{safe_slug(reason)}"
@@ -1330,10 +1380,11 @@ def snapshot_self_improvement(root: Path, reason: str = "curate") -> Path | None
         target = dest / source.name
         if source.is_dir():
             shutil.copytree(source, target)
+            manifest["files"].append({"name": source.name, "directory": True})
         else:
-            shutil.copy2(source, target)
-        manifest["files"].append(source.name)
+            manifest["files"].append(copy_snapshot_file(source, target))
     write_json(dest / "manifest.json", manifest)
+    prune_self_improvement_snapshots(root)
     return dest
 
 
@@ -1383,6 +1434,7 @@ def append_skill_lessons(root: Path, lessons: list[Lesson]) -> dict[str, int]:
 
 def curate(root: Path, recent_rows: int = 160) -> dict[str, Any]:
     ensure_self_improvement_state(root)
+    compact_self_improvement_ledgers(root)
     rows = parse_results(root / "results.tsv", limit=recent_rows)
     lessons = derive_lessons(root, recent_rows=recent_rows)
     snapshot = snapshot_self_improvement(root, reason="pre-curator-run")

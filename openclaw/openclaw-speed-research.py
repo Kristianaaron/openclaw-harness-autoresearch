@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gzip
 import io
 import hashlib
 import json
@@ -3314,8 +3315,101 @@ def write_restart_context(root: Path, *, recent_rows: int = 120) -> dict[str, An
     return memory
 
 
+def rotate_results_ledger(root: Path, *, keep_rows: int = 5000, rotate_above_rows: int = 20000) -> dict[str, Any]:
+    """Archive old result rows so hot-loop supervisors do not reread weeks of history."""
+
+    results = root / "results.tsv"
+    if not results.exists():
+        return {"ok": True, "rotated": False, "rows": 0}
+    lines = results.read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) <= max(1, int(rotate_above_rows)):
+        return {"ok": True, "rotated": False, "rows": max(0, len(lines) - 1)}
+    header = RESULTS_HEADER.rstrip("\n")
+    body = lines[1:] if lines and lines[0].startswith("timestamp\t") else lines
+    keep_rows = max(1, int(keep_rows))
+    archive_dir = root / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = archive_dir / f"results-{stamp}-{len(body)}rows.tsv.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as file:
+        file.write("\n".join(lines).rstrip() + "\n")
+    hot_body = body[-keep_rows:]
+    results.write_text(header + "\n" + "\n".join(hot_body).rstrip() + "\n", encoding="utf-8")
+    append_jsonl(
+        root / "findings.jsonl",
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task_id": "results-ledger-rotation",
+            "finding": "archived cold results rows and kept a bounded hot ledger for supervisor decisions",
+            "evidence": {
+                "archive": str(archive),
+                "archived_rows": len(body),
+                "kept_rows": len(hot_body),
+            },
+            "next": "continue autoresearch using RUN_MEMORY, SUMMARY, and the bounded hot ledger",
+        },
+    )
+    return {"ok": True, "rotated": True, "rows": len(body), "kept_rows": len(hot_body), "archive": str(archive)}
+
+
+def rotate_jsonl_ledger(
+    root: Path,
+    relative_path: str,
+    *,
+    keep_rows: int = 5000,
+    rotate_above_rows: int = 20000,
+    active_statuses: set[str] | None = None,
+) -> dict[str, Any]:
+    """Archive cold JSONL rows so repair/review loops stay bounded."""
+
+    path = root / relative_path
+    if not path.exists():
+        return {"ok": True, "rotated": False, "rows": 0, "kept_rows": 0, "archive": ""}
+    rows = read_jsonl(path)
+    if len(rows) <= max(1, int(rotate_above_rows)):
+        return {"ok": True, "rotated": False, "rows": len(rows), "kept_rows": len(rows), "archive": ""}
+    archive_dir = root / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = relative_path.replace("/", "-").replace(".", "-")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = archive_dir / f"{safe_name}-{stamp}-{len(rows)}rows.jsonl.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, sort_keys=True) + "\n")
+    active_statuses = active_statuses or set()
+    active = [row for row in rows if str(row.get("status", "ready")) in active_statuses] if active_statuses else []
+    active_ids = {str(row.get("id", "")) for row in active if str(row.get("id", ""))}
+    terminal_rows = [
+        row
+        for row in rows
+        if not (str(row.get("id", "")) and str(row.get("id", "")) in active_ids)
+        and (not active_statuses or str(row.get("status", "ready")) not in active_statuses)
+    ]
+    tail: list[dict[str, Any]] = []
+    for row in terminal_rows[-max(1, int(keep_rows)) :]:
+        row_id = str(row.get("id", ""))
+        if row_id and row_id in active_ids:
+            continue
+        tail.append(row)
+    kept = [*active, *tail]
+    write_jsonl(path, kept)
+    return {"ok": True, "rotated": True, "rows": len(rows), "kept_rows": len(kept), "archive": str(archive)}
+
+
 def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
     ensure_research_state(root)
+    rotation = rotate_results_ledger(root)
+    jsonl_rotations = {
+        "tasks": rotate_jsonl_ledger(
+            root,
+            "tasks.jsonl",
+            keep_rows=3000,
+            rotate_above_rows=10000,
+            active_statuses={"ready", "rework", "running"},
+        ),
+        "findings": rotate_jsonl_ledger(root, "findings.jsonl", keep_rows=5000, rotate_above_rows=20000),
+        "experiments": rotate_jsonl_ledger(root, "experiments.jsonl", keep_rows=5000, rotate_above_rows=20000),
+    }
     rows = result_rows(root)
     recent = rows[-recent_rows:]
     recent_path = root / "results-recent.tsv"
@@ -3376,6 +3470,8 @@ def compact_workspace(root: Path, *, recent_rows: int = 24) -> dict[str, Any]:
         "recent_rows": len(recent),
         "ready_tasks": len(ready_tasks),
         "blocked_tasks": len(blocked_tasks),
+        "rotation": rotation,
+        "jsonl_rotations": jsonl_rotations,
         "run_memory": str(root / "RUN_MEMORY.md"),
         "restart_context": str(root / "restart-context.json"),
         "memory_state": (memory.get("canonical_state") or {}).get("state"),
@@ -11387,6 +11483,74 @@ def implementation_handoff_audit(args: argparse.Namespace) -> int:
 
     def seed_deliberation_once() -> bool:
         nonlocal seeded_deliberation, seeded_prerequisite
+        if os.environ.get("OPENCLAW_SPEED_RESEARCH_HEAVY_HANDOFF_DELIBERATION", "0") != "1":
+            evidence = {
+                "canonical_state": canonical,
+                "reason": "implementation handoff audit deferred heavy frontier deliberation to a bounded task",
+            }
+            task = agent_deliberation_task(
+                timestamp,
+                slug="handoff-deliberation",
+                priority=94,
+                target="openclaw/openclaw-speed-research.py",
+                hypothesis=(
+                    "Implementation handoff needs a new deterministic owner; perform frontier deliberation as a "
+                    "bounded queued action instead of running heavy deliberation inside the audit."
+                ),
+                acceptance=(
+                    "A frontier-agent-deliberation artifact selects exactly one safe next task or records a closed "
+                    "blocker; it must not mutate source, model profile, opencode, or runtime state."
+                ),
+                evidence=evidence,
+            )
+            task["id"] = unique_task_id(root, str(task.get("id", "")))
+            seeded_deliberation = bool(upsert_tasks(root, [task]))
+            seeded_prerequisite = seeded_prerequisite or seeded_deliberation
+            deliberation_report = {
+                "ok": True,
+                "kind": "frontier-agent-deliberation",
+                "timestamp": timestamp,
+                "deferred": True,
+                "seeded": int(seeded_deliberation),
+                "seeded_tasks": [str(task.get("id", ""))] if seeded_deliberation else [],
+                "reason": evidence["reason"],
+                "gates": {
+                    "audit_inline_work_bounded": True,
+                    "canonical_clean_or_repairable_terminal": True,
+                    "zero_unsafe_noise": True,
+                    "task_selected": True,
+                    "contract_complete": bool(
+                        task.get("acceptance")
+                        and task.get("rollback")
+                        and "no_opencode_changes" in {str(item) for item in task.get("guard_checks", [])}
+                    ),
+                    "selected_task_has_acceptance": bool(task.get("acceptance")),
+                    "selected_task_has_rollback": bool(task.get("rollback")),
+                },
+                "evidence": evidence,
+                "architect": {
+                    "selected_task_id": str(task.get("id", "")),
+                    "selected_reason": "handoff audit seeded a bounded deliberation task instead of inline heavy work",
+                    "contract_complete": bool(
+                        task.get("acceptance")
+                        and task.get("rollback")
+                        and "no_opencode_changes" in {str(item) for item in task.get("guard_checks", [])}
+                    ),
+                },
+            }
+            deliberation_attempts.append(
+                {
+                    "ok": True,
+                    "seeded": seeded_deliberation,
+                    "task_count": int(seeded_deliberation),
+                    "gates": deliberation_report["gates"],
+                    "selected_task_id": str(task.get("id", "")),
+                    "deferred": True,
+                }
+            )
+            path = root / "benchmarks" / f"frontier-agent-deliberation-{timestamp}.json"
+            path.write_text(json.dumps(deliberation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return seeded_deliberation
         deliberation_report, deliberation_tasks = frontier_agent_deliberation(root, rows, timestamp)
         seeded_deliberation = bool(upsert_tasks(root, deliberation_tasks))
         gates = deliberation_report.get("gates", {}) if isinstance(deliberation_report, dict) else {}

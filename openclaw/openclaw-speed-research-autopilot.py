@@ -4996,9 +4996,32 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
             str(args.gepa_min_low_quality),
         ]
     )
+    deduped_commands: list[list[str]] = []
+    duplicate_commands: list[list[str]] = []
+    seen_commands: set[tuple[str, ...]] = set()
+    for cmd in commands:
+        key = tuple(cmd)
+        if key in seen_commands:
+            duplicate_commands.append(cmd)
+            continue
+        seen_commands.add(key)
+        deduped_commands.append(cmd)
+    per_command_timeout = float(getattr(args, "quality_review_timeout_seconds", 45.0) or 45.0)
+    total_timeout = float(getattr(args, "quality_review_total_timeout_seconds", 0.0) or 0.0)
+    review_started = time.monotonic()
     with log_file.open("a", encoding="utf-8") as file:
         file.write(f"\n===== cycle {cycle} session {session} supervisor quality review =====\n")
-        for cmd in commands:
+        for cmd in duplicate_commands:
+            file.write("SKIP duplicate review command: " + " ".join(cmd) + "\n")
+        for cmd in deduped_commands:
+            if total_timeout > 0:
+                remaining = total_timeout - (time.monotonic() - review_started)
+                if remaining <= 0:
+                    file.write("SUPERVISOR QUALITY REVIEW TOTAL TIMEOUT before: " + " ".join(cmd) + "\n")
+                    return False, "supervisor quality/frontier review total timeout"
+                timeout = max(0.001, min(per_command_timeout, remaining))
+            else:
+                timeout = per_command_timeout
             file.write("$ " + " ".join(cmd) + "\n")
             file.flush()
             try:
@@ -5007,11 +5030,13 @@ def run_supervisor_quality_review(args: argparse.Namespace, cycle: int, session:
                     text=True,
                     stdout=file,
                     stderr=subprocess.STDOUT,
-                    timeout=args.quality_review_timeout_seconds,
+                    timeout=timeout,
                     check=False,
                 )
             except subprocess.TimeoutExpired:
-                return False, "supervisor quality/frontier review timeout"
+                command_name = cmd[1] if len(cmd) > 1 else ""
+                file.write(f"SUPERVISOR QUALITY REVIEW TIMEOUT command={command_name} timeout={timeout:.3f}s\n")
+                return False, f"supervisor quality/frontier review timeout: {command_name}"
             if result.returncode != 0:
                 command_name = cmd[1] if len(cmd) > 1 else ""
                 issue = f"{command_name} exit {result.returncode}"
@@ -5843,6 +5868,7 @@ def main() -> int:
     parser.add_argument("--reflection-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REFLECTION_INTERVAL", "4")))
     parser.add_argument("--quality-review-interval", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_INTERVAL", "6")))
     parser.add_argument("--quality-review-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TIMEOUT", "45")))
+    parser.add_argument("--quality-review-total-timeout-seconds", type=float, default=float(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_TOTAL_TIMEOUT", "120")))
     parser.add_argument("--review-recent-rows", type=int, default=int(os.environ.get("OPENCLAW_SPEED_RESEARCH_REVIEW_RECENT_ROWS", "120")))
     parser.add_argument(
         "--self-improvement",
@@ -6181,6 +6207,7 @@ def main() -> int:
     progress_cycles = 0
     blocked_cycles = 0
     crash_cooldown_until = 0.0
+    last_crash_cooldown_log_at = 0.0
     last_autonomy_watchdog_at = time.monotonic()
     last_autonomy_trigger_at = time.monotonic()
     last_low_signal_repair_cycle = 0
@@ -6263,11 +6290,14 @@ def main() -> int:
         if now < crash_cooldown_until:
             remaining = min(crash_cooldown_until - now, max(0.0, deadline - now))
             if remaining > 0:
-                log(f"memory/crash cooldown active before cycle={cycle}: sleeping {remaining:.0f}s")
-                time.sleep(min(remaining, max(1.0, args.sleep_seconds)))
+                if last_crash_cooldown_log_at <= 0 or now - last_crash_cooldown_log_at >= 30:
+                    log(f"memory/crash cooldown active before cycle={cycle}: sleeping up to {remaining:.0f}s")
+                    last_crash_cooldown_log_at = now
+                time.sleep(min(remaining, max(5.0, args.sleep_seconds), 30.0))
                 if time.monotonic() < crash_cooldown_until:
                     cycle -= 1
                     continue
+                last_crash_cooldown_log_at = 0.0
         stale_blocked = block_stale_rejected_implementation_tasks()
         if stale_blocked:
             log(f"supervisor blocked stale rejected implementation tasks count={stale_blocked}")

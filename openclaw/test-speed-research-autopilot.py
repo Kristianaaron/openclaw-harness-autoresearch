@@ -1770,10 +1770,38 @@ def main() -> int:
         assert "plateau-pivot --recent-rows 120 --min-sweeps 3 --target-tps 30.0" in review_log
         assert "evaluator-integrity" in review_log
         assert "implementation-handoff-audit --min-score 90" in review_log
-        assert review_log.count("implementation-handoff-audit --min-score 90") == 3
+        assert review_log.count("$ " + str(review_helper) + " implementation-handoff-audit --min-score 90") == 1
+        assert review_log.count("SKIP duplicate review command: " + str(review_helper) + " implementation-handoff-audit --min-score 90") == 2
         assert "frontier-eval --recent-rows 120 --allow-fail" in review_log
         assert "gepa-policy-promote --min-candidates 3" in review_log
         assert "gepa-escalation --recent-rows 120 --min-blocked 3 --min-rework 2 --min-trajectory 2 --min-low-quality 2" in review_log
+        review_timeout_helper = Path(tmp) / "review-timeout-helper.py"
+        review_timeout_helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import time\n"
+            "time.sleep(2)\n",
+            encoding="utf-8",
+        )
+        review_timeout_helper.chmod(0o700)
+        review_timeout_args = Namespace(
+            **{
+                **vars(review_args),
+                "research_helper_bin": str(review_timeout_helper),
+                "quality_review_timeout_seconds": 0.05,
+                "quality_review_total_timeout_seconds": 1.0,
+            }
+        )
+        ok, issue = helper.run_supervisor_quality_review(
+            review_timeout_args,
+            10,
+            "nightly",
+            Path(tmp) / "autopilot.log",
+        )
+        assert not ok
+        assert issue == "supervisor quality/frontier review timeout: environment-snapshot"
+        assert "SUPERVISOR QUALITY REVIEW TIMEOUT command=environment-snapshot" in (
+            Path(tmp) / "autopilot.log"
+        ).read_text(encoding="utf-8")
         refill_args = Namespace(**{**vars(review_args), "external_blocker_refill_before_stop": True})
         with patch.object(
             helper,
