@@ -5154,7 +5154,12 @@ def drafter_bottleneck_next_tasks(
         expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
         if expansion_tasks:
             return expansion_tasks
-        return filter_seedable_tasks(root, [source_scout_task(timestamp, evidence={"reason": "material drafter candidates exhausted; external candidate family evidence required", "bottleneck_state": state})])
+        evidence = {
+            "reason": "material drafter candidates exhausted and prior frontier expansion routes are already consumed",
+            "bottleneck_state": state,
+            "required_next": "materially new drafter family or explicit external blocker",
+        }
+        return filter_seedable_tasks(root, [material_exhaustion_breakout_task(timestamp, evidence=evidence)])
     if step == "seed_frontier_deliberation_escape":
         candidate_tasks = frontier_escape_candidate_tasks(root, rows if rows is not None else result_rows(root), timestamp)
         if candidate_tasks:
@@ -6427,6 +6432,27 @@ def frontier_expansion_task(
     }
 
 
+def material_exhaustion_breakout_task(timestamp: int, *, evidence: dict[str, Any], priority: int = 100) -> dict[str, Any]:
+    """Create a canary-only route change after all known drafter candidates fail."""
+    return frontier_expansion_task(
+        timestamp,
+        slug="material-exhaustion-breakout",
+        priority=priority,
+        target="openclaw/openclaw-mtp-drafter-calibrate.py",
+        hypothesis=(
+            "All current JANQ drafter material candidates are exhausted. The next speed work must define "
+            "a materially new drafter family or an explicit external blocker before another calibration, "
+            "source-scout, MTP-report, or synthesis loop can count as progress."
+        ),
+        acceptance=(
+            "The canary contract proves the exhausted candidates are remembered, stale bottleneck-review "
+            "zero-seed recovery is not ready, and the next path requires new candidate-family evidence plus "
+            "paired TUI decode promotion gates."
+        ),
+        evidence=evidence,
+    )
+
+
 def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: int) -> list[dict[str, Any]]:
     """Route exhausted lanes into one new bounded candidate path instead of terminal churn."""
     ensure_lane_contracts(root)
@@ -6479,6 +6505,12 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
                     ),
                     evidence=evidence,
                 ),
+            )
+        )
+        candidates.append(
+            (
+                "frontier-expansion-material-exhaustion-breakout-",
+                material_exhaustion_breakout_task(timestamp, evidence=evidence, priority=98),
             )
         )
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
@@ -6736,11 +6768,16 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
             timestamp,
             reason="Frontier deliberation selected the canonical JANQ drafter bottleneck route",
         )
+    material_exhausted = (
+        bottleneck_state.get("state") == "material_drafter_candidates_exhausted"
+        or bool(bottleneck_state.get("material_candidates_exhausted"))
+    )
     escape_candidate_tasks = frontier_escape_candidate_tasks(root, rows, timestamp)
     waiting_on_bottleneck_route = active_drafter_bottleneck_route(root) or (
         bottleneck_state["state"] != "no_terminal_quantized_blocker"
         and not bottleneck_tasks
         and not escape_candidate_tasks
+        and not material_exhausted
         and (
             str(bottleneck_state.get("next_step", "")).startswith("wait_for_")
             or bottleneck_state.get("next_step") != "seed_frontier_deliberation_escape"
@@ -6840,7 +6877,18 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_task = mtp_acceptance_yield_task(timestamp, evidence=evidence)
         selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
     if selected_task is None:
-        if not waiting_on_bottleneck_route:
+        if material_exhausted:
+            selected_task = material_exhaustion_breakout_task(
+                timestamp,
+                evidence={
+                    **evidence,
+                    "selected_by": "frontier_agent_deliberation",
+                    "required_next": "materially new JANQ drafter family or explicit external blocker",
+                },
+                priority=100,
+            )
+            selected_reason = "material drafter candidates are exhausted; create a new candidate-family breakout contract"
+        elif not waiting_on_bottleneck_route:
             selected_task = agent_deliberation_task(
                 timestamp,
                 slug="open-problem-contract",

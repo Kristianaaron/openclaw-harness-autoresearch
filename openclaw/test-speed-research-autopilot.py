@@ -1696,6 +1696,27 @@ def main() -> int:
         assert ok
         assert "existing synthesis-timeout recovery task" in issue
         assert len(helper.read_jsonl(helper.TASKS)) == before_task_count
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="drafter-material-candidate-exhausted-unit",
+            status="blocked",
+            target="janq-drafter-material-candidate",
+            hypothesis="unit material candidates are exhausted",
+            commit="unit-test",
+            notes="decision=all-material-drafter-candidates-exhausted",
+        )
+        ok, issue = helper.run_supervisor_synthesis(timeout_args, 11, "nightly", Path(tmp) / "autopilot.log")
+        assert ok
+        assert "synthesis timeout" in issue
+        tasks = helper.read_jsonl(helper.TASKS)
+        stale_recovery = [
+            task for task in tasks if str(task.get("id", "")).startswith("synthesis-timeout-recovery-")
+        ]
+        assert stale_recovery and all(task["status"] == "blocked" for task in stale_recovery)
+        breakouts = [task for task in tasks if str(task.get("id", "")).startswith("material-exhaustion-breakout-")]
+        assert len(breakouts) == 1
+        assert breakouts[0]["supervisor_action"] == "focused-test"
+        assert breakouts[0]["metric"] == "material_exhaustion_breakout_contract"
         review_helper = Path(tmp) / "review-helper.py"
         review_marker = Path(tmp) / "review-marker.txt"
         review_helper.write_text(

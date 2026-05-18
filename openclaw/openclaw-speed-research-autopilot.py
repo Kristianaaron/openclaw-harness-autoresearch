@@ -4634,6 +4634,101 @@ def active_task_has_prefix(prefix: str) -> bool:
     )
 
 
+def recent_material_drafter_exhaustion(limit: int = 240) -> bool:
+    """Return true once the JANQ drafter search has exhausted material candidates."""
+    for row in reversed(all_result_rows(WORKSPACE)[-max(1, limit) :]):
+        text = " ".join(str(row.get(key, "")) for key in ("run_id", "target", "hypothesis", "notes")).lower()
+        if (
+            "material_drafter_candidates_exhausted" in text
+            or "all-material-drafter-candidates-exhausted" in text
+            or "seed_frontier_expansion_after_material_exhaustion" in text
+        ):
+            return True
+    return False
+
+
+def material_exhaustion_breakout_task(cycle: int, session: str, reason: str) -> dict[str, object]:
+    timestamp = int(time.time())
+    return {
+        "id": f"material-exhaustion-breakout-{cycle}-{timestamp}",
+        "status": "ready",
+        "priority": 100,
+        "lane": "frontier-expansion",
+        "task_type": "supervisor",
+        "supervisor_action": "focused-test",
+        "target": "openclaw/openclaw-mtp-drafter-calibrate.py",
+        "source_files": [
+            "openclaw/openclaw-speed-research.py",
+            "openclaw/openclaw-speed-research-autopilot.py",
+            "openclaw/test-speed-research.py",
+        ],
+        "hypothesis": (
+            "All current JANQ drafter material candidates are exhausted. The loop must stop repeating "
+            "drafter-bottleneck-review and create a new candidate-family contract before any more "
+            "calibration, source-scout, MTP-report, or synthesis work can count as progress."
+        ),
+        "metric": "material_exhaustion_breakout_contract",
+        "guard_checks": [
+            "no_model_load",
+            "canary_only",
+            "tests_pass",
+            "no_live_profile_change",
+            "no_opencode_changes",
+            "rollback_path",
+        ],
+        "acceptance": (
+            "Canary tests pass with the material-exhaustion route preserved: stale synthesis-timeout "
+            "recovery is quarantined, no bottleneck-review zero-seed loop remains ready, and the next "
+            "strategy must require a materially new drafter family or explicit external blocker."
+        ),
+        "rollback": "No runtime rollback needed; this is a canary-only routing contract and never mutates the live model profile.",
+        "next_action": "python3 /Users/kristian/Documents/openclaw-harness-autoresearch/openclaw/test-speed-research.py",
+        "created_at": timestamp,
+        "session": session,
+        "reason": reason,
+    }
+
+
+def block_stale_material_exhaustion_recovery_tasks() -> int:
+    if not recent_material_drafter_exhaustion():
+        return 0
+    tasks = read_jsonl(TASKS)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    blocked = 0
+    for task in tasks:
+        task_id = str(task.get("id", ""))
+        if task.get("status", "ready") not in {"ready", "rework"}:
+            continue
+        if not task_id.startswith("synthesis-timeout-recovery-"):
+            continue
+        if task.get("supervisor_action") != "drafter-bottleneck-review":
+            continue
+        task["status"] = "blocked"
+        task["blocked_at"] = now
+        task["blocked_reason"] = (
+            "material drafter candidates are exhausted; stale synthesis-timeout recovery "
+            "would repeat drafter-bottleneck-review with seeded_tasks=0"
+        )
+        task["supervisor_summary"] = {
+            "reason": "stale_material_exhaustion_recovery_suppressed",
+            "next": "route to material-exhaustion-breakout instead of bottleneck-review",
+        }
+        blocked += 1
+    if blocked:
+        write_jsonl(TASKS, tasks)
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": now,
+                "task_id": "material-exhaustion-recovery-compaction",
+                "finding": "quarantined stale synthesis-timeout recovery tasks after material drafter exhaustion",
+                "blocked_tasks": blocked,
+                "next": "seed material-exhaustion-breakout when synthesis times out",
+            },
+        )
+    return blocked
+
+
 def seed_synthesis_timeout_recovery_task(cycle: int, session: str, reason: str) -> tuple[bool, str]:
     """Route synthesis failure to concrete work instead of retrying synthesis.
 
@@ -4644,6 +4739,38 @@ def seed_synthesis_timeout_recovery_task(cycle: int, session: str, reason: str) 
     """
 
     prefix = "synthesis-timeout-recovery-"
+    if recent_material_drafter_exhaustion():
+        block_stale_material_exhaustion_recovery_tasks()
+        breakout_prefix = "material-exhaustion-breakout-"
+        if active_task_has_prefix(breakout_prefix):
+            return False, "existing material-exhaustion breakout task is already ready"
+        task = material_exhaustion_breakout_task(cycle, session, reason)
+        tasks = read_jsonl(TASKS)
+        write_jsonl(TASKS, tasks + [task])
+        task_id = str(task["id"])
+        append_result(
+            WORKSPACE,
+            run_id=task_id,
+            status="keep",
+            target="autoresearch-material-exhaustion-breakout",
+            hypothesis="material drafter exhaustion must fail forward to a new candidate-family contract",
+            commit=current_commit(),
+            notes=f"session={session} seeded_task={task_id} reason={clean_tsv(reason)}",
+        )
+        append_jsonl(
+            FINDINGS,
+            {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "task_id": "material-exhaustion-breakout",
+                "finding": "synthesis timeout was routed away from drafter-bottleneck-review after material candidate exhaustion",
+                "session": session,
+                "cycle": cycle,
+                "seeded_task": task_id,
+                "reason": reason,
+                "next": task["next_action"],
+            },
+        )
+        return True, task_id
     if active_task_has_prefix(prefix):
         return False, "existing synthesis-timeout recovery task is already ready"
     timestamp = int(time.time())
@@ -5510,7 +5637,19 @@ def run_supervisor_compaction(args: argparse.Namespace, log_file: Path) -> None:
     with log_file.open("a", encoding="utf-8") as file:
         file.write("$ " + " ".join(cmd) + "\n")
         file.flush()
-        subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+        try:
+            subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR COMPACTION TIMEOUT; continuing with existing durable queue\n")
+            append_jsonl(
+                FINDINGS,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "supervisor-compaction-timeout",
+                    "finding": "startup compaction timed out and was skipped without crashing the autonomous loop",
+                    "next": "continue with existing durable queue; later compaction may run when artifacts are smaller",
+                },
+            )
 
 
 def run_supervisor_environment_snapshot(args: argparse.Namespace, log_file: Path, label: str) -> None:
@@ -5518,7 +5657,20 @@ def run_supervisor_environment_snapshot(args: argparse.Namespace, log_file: Path
     with log_file.open("a", encoding="utf-8") as file:
         file.write("$ " + " ".join(cmd) + "\n")
         file.flush()
-        subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+        try:
+            subprocess.run(cmd, text=True, stdout=file, stderr=subprocess.STDOUT, timeout=30, check=False)
+        except subprocess.TimeoutExpired:
+            file.write("SUPERVISOR ENVIRONMENT SNAPSHOT TIMEOUT; continuing without startup snapshot\n")
+            append_jsonl(
+                FINDINGS,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "supervisor-environment-snapshot-timeout",
+                    "finding": "environment snapshot timed out and was skipped without crashing the autonomous loop",
+                    "label": label,
+                    "next": "continue without treating diagnostics timeout as research noise",
+                },
+            )
 
 
 def run_supervisor_self_improvement(args: argparse.Namespace, cycle: int, session: str, log_file: Path, reason: str) -> tuple[bool, str]:
@@ -5977,6 +6129,9 @@ def main() -> int:
     startup_operational_blocked = block_operational_strategy_ready_tasks(WORKSPACE)
     if startup_operational_blocked:
         log(f"startup quarantined operational-memory tasks count={startup_operational_blocked}")
+    startup_material_recovery_blocked = block_stale_material_exhaustion_recovery_tasks()
+    if startup_material_recovery_blocked:
+        log(f"startup quarantined stale material-exhaustion recovery tasks count={startup_material_recovery_blocked}")
     run_supervisor_compaction(args, log_file)
     run_supervisor_environment_snapshot(args, log_file, "autopilot-start")
     self_improve_ok, self_improve_issue = run_supervisor_self_improvement(
@@ -6064,6 +6219,9 @@ def main() -> int:
         stale_causal_blocked = block_stale_model_bound_causal_tasks()
         if stale_causal_blocked:
             log(f"supervisor quarantined stale model-bound causal tasks count={stale_causal_blocked}")
+        material_recovery_blocked = block_stale_material_exhaustion_recovery_tasks()
+        if material_recovery_blocked:
+            log(f"supervisor quarantined stale material-exhaustion recovery tasks count={material_recovery_blocked}")
         external_stop, external_status = maybe_stop_for_external_change(args, cycle, current_session, log_file)
         if external_stop:
             log(
