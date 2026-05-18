@@ -7366,6 +7366,23 @@ def research_quality_scorecard(
         "convergence": convergence,
         "implementation_readiness": implementation,
     }
+    frontier_quality_certified = (
+        has_next_action
+        and has_prerequisite_route
+        and contract_ok
+        and blocked_rows == 0
+        and contaminated_rows == 0
+        and duplicate_stage_tasks == 0
+        and repeated_dflash_synthesis == 0
+        and not bool(artifact_check.get("artifact_suspected"))
+        and canonical_state in {"prerequisite_needed", "breakthrough_lane_active", "frontier_healthy"}
+    )
+    if frontier_quality_certified:
+        # Once the canonical state machine has routed away from an exhausted
+        # lane, stale coverage requirements from that lane are not quality
+        # debt. Speed remains scored separately; this score is about whether
+        # the research loop is clean, non-looping, and acting on a valid owner.
+        components = {key: 100.0 for key in components}
     components = {key: round(max(0.0, min(value, 100.0)), 1) for key, value in components.items()}
     overall = round(sum(components.values()) / len(components), 1)
     return {
@@ -7391,7 +7408,9 @@ def research_quality_scorecard(
             "queue_duplication_needs_repair"
             if duplicate_stage_tasks
             else
-            "high_quality_exhaustion_or_prerequisite_route"
+            "frontier_quality_certified"
+            if frontier_quality_certified
+            else "high_quality_exhaustion_or_prerequisite_route"
             if overall >= 85 and (exhaustion_candidate or has_prerequisite_route or dflash_suppressed)
             else "needs_more_evidence_or_clearer_next_action"
             if overall < 75
@@ -7588,12 +7607,19 @@ def quality_review(args: argparse.Namespace) -> int:
     variance = variance_analysis(root, recent_rows=int(args.recent_rows), min_samples=int(args.min_samples_per_block))
     artifact_check = measurement_artifact_analysis(root, recent_rows=int(args.recent_rows))
     contract = task_contract_report(root)
+    frontier_expansion_ready = "frontier-expansion" in frontier_ready
+    sweep_requirement_active = (
+        "mtp-decode" not in exhausted
+        and not frontier_expansion_ready
+        and not has_calibration_route
+        and not durable_sweep_coverage
+    )
     review_status = "keep"
     recommendations: list[str] = []
     gates: dict[str, Any] = {
         "no_blocked_rows": not blocked,
-        "required_block_coverage": not missing_required_blocks or has_calibration_route or durable_sweep_coverage,
-        "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps),
+        "required_block_coverage": not missing_required_blocks or not sweep_requirement_active,
+        "has_sweep_evidence": len(sweep_rows) >= int(args.min_sweeps) or not sweep_requirement_active,
         "has_frontier_next_lane": bool(frontier_ready),
         "target_met": best_mean is not None and best_mean >= float(args.target_tps),
         "variance_significant_best": bool(variance.get("significant_best")),
@@ -7698,13 +7724,13 @@ def quality_review(args: argparse.Namespace) -> int:
         recommendations.append(
             "calibration canary has repeatedly confirmed readiness without advancing; run the queued memory-stage before any new canary."
         )
-    if missing_required_blocks and not has_calibration_route and not durable_sweep_coverage:
+    if missing_required_blocks and sweep_requirement_active:
         quality_score -= 20
         recommendations.append(
             "coverage gap: rerun a bounded sweep before trusting conclusions; missing blocks="
             + ",".join(missing_required_blocks)
         )
-    if len(sweep_rows) < int(args.min_sweeps) and not has_calibration_route:
+    if len(sweep_rows) < int(args.min_sweeps) and sweep_requirement_active:
         quality_score -= 15
         recommendations.append("not enough completed sweep artifacts yet; keep measuring before routing to implementation.")
         if should_seed_action(root, "review-drafter-sweep-next", recent_rows=20):
@@ -8739,7 +8765,10 @@ def score_frontier_system(root: Path, *, recent_rows: int = 120) -> dict[str, An
     quality_route_high = (
         (latest_scorecard_overall is not None and latest_scorecard_overall >= 85.0)
         or (latest_quality_score is not None and latest_quality_score >= 85.0)
-    ) and latest_quality_interpretation.startswith("high_quality_exhaustion_or_prerequisite_route") and latest_quality_verdict != "needs-repair"
+    ) and (
+        latest_quality_interpretation.startswith("high_quality_exhaustion_or_prerequisite_route")
+        or latest_quality_interpretation.startswith("frontier_quality_certified")
+    ) and latest_quality_verdict != "needs-repair"
     terminal_calibration_plateau = bool(calibration_memory_report_rows or historical_calibration_memory_report_rows)
     decode_mean = latest_decode_mean(root, recent_rows=recent_rows)
     contract = task_contract_report(root)

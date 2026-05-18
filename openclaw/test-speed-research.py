@@ -1566,6 +1566,8 @@ def main() -> int:
                             canonical_state="prerequisite_needed",
                         )
                         assert certified_scorecard["overall"] >= 99.0
+                        assert certified_scorecard["interpretation"] == "frontier_quality_certified"
+                        assert all(value == 100.0 for value in certified_scorecard["components"].values())
                         low_signal_scorecard = helper.research_quality_scorecard(
                             blocked_rows=0,
                             missing_required_blocks=["2", "3", "4"],
@@ -1612,6 +1614,38 @@ def main() -> int:
                         )
                         assert low_signal_scorecard["overall"] >= 99.0
                         assert low_signal_scorecard["components"]["causal"] >= 98.0
+                        frontier_scout_scorecard = helper.research_quality_scorecard(
+                            blocked_rows=0,
+                            missing_required_blocks=["2", "3", "4"],
+                            sweep_rows=1,
+                            min_sweeps=3,
+                            repeated_block2=False,
+                            repeated_keep_current=False,
+                            plateau_below_target=False,
+                            exhaustion_candidate=False,
+                            frontier_ready=["frontier-expansion"],
+                            seeded_tasks=[],
+                            ready_tasks=[
+                                helper.drafter_family_source_scout_task(
+                                    123466,
+                                    evidence={"unit": True},
+                                )
+                            ],
+                            contaminated_rows=0,
+                            clean_runtime_maps=0,
+                            variance={},
+                            artifact_check={"artifact_suspected": False},
+                            contract_ok=True,
+                            dflash_suppressed=True,
+                            repeated_dflash_synthesis=0,
+                            duplicate_stage_tasks=0,
+                            best_mean=None,
+                            target_tps=30.0,
+                            server_decode_values=[],
+                            canonical_state="breakthrough_lane_active",
+                        )
+                        assert frontier_scout_scorecard["overall"] == 100.0
+                        assert frontier_scout_scorecard["interpretation"] == "frontier_quality_certified"
                         assert helper.actionable_blocked_rows(helper.result_rows(gradient_blocked_root)) == []
                         assert helper.filter_seedable_tasks(
                             gradient_blocked_root,
