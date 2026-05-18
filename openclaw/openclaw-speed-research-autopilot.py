@@ -5165,6 +5165,19 @@ def run_autonomous_repair_loop(
                 deterministic_ready=len(deterministic),
             )
             return True, ""
+        if synth_issue == "supervisor synthesis terminal no-work" and certification_allows_ready_work(certification):
+            append_autonomous_repair_result(
+                cycle,
+                session,
+                status="keep",
+                reason=(
+                    "terminal synthesis but remaining certification issues are score-only and deterministic "
+                    f"work exists after attempt {attempt}: {'; '.join(str(item) for item in certification.get('issues', []))}"
+                ),
+                attempts=attempt,
+                deterministic_ready=len(deterministic),
+            )
+            return True, ""
         if review_ok and post_ok and synth_ok and deterministic:
             append_autonomous_repair_result(
                 cycle,
@@ -5429,6 +5442,24 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         "handoff": handoff,
         "quality": quality,
     }
+
+
+def certification_allows_ready_work(certification: dict[str, object]) -> bool:
+    """Allow research to run when only score repair remains and safe work is queued."""
+
+    deterministic = certification.get("deterministic_ready_tasks")
+    if not isinstance(deterministic, list) or not deterministic:
+        return False
+    allowed_prefixes = (
+        "frontier score ",
+        "frontier autonomy score ",
+        "quality score ",
+        "self-improvement alive score ",
+    )
+    issues = certification.get("issues")
+    if not isinstance(issues, list):
+        return False
+    return all(str(issue).startswith(allowed_prefixes) for issue in issues)
 
 
 def latest_artifact_score(pattern: str, *keys: str) -> float:

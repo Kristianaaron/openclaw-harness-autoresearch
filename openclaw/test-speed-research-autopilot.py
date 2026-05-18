@@ -525,6 +525,44 @@ def check_autonomous_repair_owner(helper) -> None:
         findings = helper.FINDINGS.read_text(encoding="utf-8")
         assert "autonomous-repair-owner" in findings
 
+        configure_workspace(helper, Path(tmp) / "score-only-terminal")
+        helper.ensure_task_queue()
+        with patch.object(helper, "run_supervisor_quality_review", return_value=(True, "")):
+            with patch.object(helper, "run_supervisor_self_improvement", return_value=(True, "")):
+                with patch.object(
+                    helper,
+                    "run_supervisor_synthesis",
+                    return_value=(False, "supervisor synthesis terminal no-work"),
+                ):
+                    with patch.object(
+                        helper,
+                        "frontier_certification_status",
+                        return_value={
+                            "ok": False,
+                            "issues": [
+                                "frontier score 9.49<min 9.8",
+                                "frontier autonomy score 65.0<min 99.0",
+                                "quality score 74.0<min 90",
+                            ],
+                            "deterministic_ready_tasks": ["progress-owner"],
+                        },
+                    ):
+                        with patch.object(
+                            helper,
+                            "deterministic_ready_tasks",
+                            return_value=[{"id": "progress-owner"}],
+                        ):
+                            ok, issue = helper.run_autonomous_repair_loop(
+                                args,
+                                18,
+                                "score-only-terminal",
+                                helper.WORKSPACE / "autopilot.log",
+                                reason="score-only startup gate",
+                            )
+        assert ok is True
+        assert issue == ""
+        assert "score-only" in helper.RESULTS.read_text(encoding="utf-8")
+
 
 def main() -> int:
     helper = load_helper()
@@ -638,6 +676,28 @@ def main() -> int:
         certified = helper.frontier_certification_status(certification_args)
         assert certified["ok"] is True
         assert certified["autonomy_research_continue_ok"] is True
+        assert helper.certification_allows_ready_work(
+            {
+                "issues": [
+                    "frontier score 9.49<min 9.8",
+                    "frontier autonomy score 65.0<min 99.0",
+                    "quality score 74.0<min 90",
+                ],
+                "deterministic_ready_tasks": ["progress-owner"],
+            }
+        ) is True
+        assert helper.certification_allows_ready_work(
+            {
+                "issues": ["task contract is not clean"],
+                "deterministic_ready_tasks": ["progress-owner"],
+            }
+        ) is False
+        assert helper.certification_allows_ready_work(
+            {
+                "issues": ["quality score 74.0<min 90"],
+                "deterministic_ready_tasks": [],
+            }
+        ) is False
         (helper.BENCHMARKS / "frontier-autonomy-score-2.json").write_text(
             json.dumps(
                 {
