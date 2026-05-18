@@ -5139,7 +5139,15 @@ def drafter_bottleneck_next_tasks(
             expansion_tasks = frontier_expansion_tasks(root, rows if rows is not None else result_rows(root), timestamp)
             if expansion_tasks:
                 return expansion_tasks
-            return filter_seedable_tasks(root, [source_scout_task(timestamp, evidence={"reason": "all material drafter candidates exhausted", "bottleneck_state": state})])
+            evidence = {
+                "reason": (
+                    "all material drafter candidates are exhausted and frontier expansion routes are already consumed; "
+                    "generic source-scout/MTP fallback is disallowed until materially new drafter evidence exists"
+                ),
+                "bottleneck_state": state,
+                "required_next": "materially new drafter family or explicit external blocker",
+            }
+            return filter_seedable_tasks(root, [material_exhaustion_breakout_task(timestamp, evidence=evidence)])
         if active_task_has_prefix(root, "agent-deliberation-quant-safe-drafter-candidate-"):
             return []
         evidence = {
@@ -5432,6 +5440,9 @@ def active_drafter_bottleneck_route(root: Path) -> bool:
             "trace-distillation-gradient-repair-",
             "trace-distillation-adapter-bridge-",
             "agent-deliberation-quant-safe-drafter-candidate-",
+            "frontier-expansion-drafter-family-search-",
+            "frontier-expansion-material-exhaustion-breakout-",
+            "material-exhaustion-breakout-",
         ),
     ) or (not adapter_impl_done and active_task_has_prefix(root, "implementation-drafter-adapter-method-"))
 
@@ -6852,6 +6863,17 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_reason = "repeated source-scout/MTP escape requires a quantization-safe drafter candidate"
     elif waiting_on_bottleneck_route:
         selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
+    elif material_exhausted:
+        selected_task = material_exhaustion_breakout_task(
+            timestamp,
+            evidence={
+                **evidence,
+                "selected_by": "frontier_agent_deliberation",
+                "required_next": "materially new JANQ drafter family or explicit external blocker",
+            },
+            priority=100,
+        )
+        selected_reason = "material drafter candidates are exhausted; create a new candidate-family breakout contract"
     elif (
         not source_artifact
         and not active_task_has_prefix(root, "agent-deliberation-source-scout-")
@@ -6877,18 +6899,7 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_task = mtp_acceptance_yield_task(timestamp, evidence=evidence)
         selected_reason = "no fresh trainable path exists, so improve acceptance-yield observability"
     if selected_task is None:
-        if material_exhausted:
-            selected_task = material_exhaustion_breakout_task(
-                timestamp,
-                evidence={
-                    **evidence,
-                    "selected_by": "frontier_agent_deliberation",
-                    "required_next": "materially new JANQ drafter family or explicit external blocker",
-                },
-                priority=100,
-            )
-            selected_reason = "material drafter candidates are exhausted; create a new candidate-family breakout contract"
-        elif not waiting_on_bottleneck_route:
+        if not waiting_on_bottleneck_route:
             selected_task = agent_deliberation_task(
                 timestamp,
                 slug="open-problem-contract",

@@ -2844,6 +2844,47 @@ def main() -> int:
             assert mtp_tasks[0]["supervisor_action"] == "mtp-report"
             assert mtp_tasks[0]["metric"] == "mean_accept"
             assert mtp_report["architect"]["selected_task_id"].startswith("agent-deliberation-mtp-acceptance-yield-")
+            with tempfile.TemporaryDirectory() as material_tmp:
+                material_root = Path(material_tmp) / "research" / "speed"
+                helper.ensure_research_state(material_root)
+                helper.append_result(
+                    material_root,
+                    run_id="drafter-material-candidate-exhausted-unit",
+                    status="blocked",
+                    target="janq-drafter-material-candidate",
+                    hypothesis="unit all material candidates exhausted",
+                    commit="abc123",
+                    notes="decision=all-material-drafter-candidates-exhausted",
+                )
+                with (
+                    patch.object(
+                        helper,
+                        "drafter_bottleneck_state",
+                        return_value={
+                            "state": "material_drafter_candidates_exhausted",
+                            "next_step": "seed_frontier_expansion_after_material_exhaustion",
+                            "material_candidates_exhausted": True,
+                        },
+                    ),
+                    patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(
+                        helper,
+                        "canonical_autoresearch_state",
+                        return_value={"clean": True, "noise": {"unresolved_blocked_rows": 0, "memory_blocks": 0}},
+                    ),
+                ):
+                    material_report, material_tasks = helper.frontier_agent_deliberation(
+                        material_root,
+                        helper.result_rows(material_root),
+                        123459,
+                    )
+            assert material_tasks
+            assert material_tasks[0]["id"].startswith("frontier-expansion-material-exhaustion-breakout-")
+            assert material_tasks[0]["supervisor_action"] == "focused-test"
+            assert material_report["architect"]["selected_task_id"].startswith(
+                "frontier-expansion-material-exhaustion-breakout-"
+            )
+            assert "source-scout" not in material_report["architect"]["selected_task_id"]
             patch_repo = Path(tmp) / "patch-repo"
             (patch_repo / "openclaw").mkdir(parents=True)
             (patch_repo / "openclaw" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -3625,6 +3666,38 @@ def main() -> int:
                 )
                 assert next_tasks
                 assert all("drafter-material-candidate" not in str(task.get("next_action", "")) for task in next_tasks)
+                with (
+                    patch.object(helper, "frontier_expansion_tasks", return_value=[]),
+                    patch.object(
+                        helper,
+                        "drafter_bottleneck_state",
+                        return_value={
+                            "state": "adapter_calibration_no_lift",
+                            "next_step": "seed_quant_safe_drafter_candidate",
+                            "reason": "unit forced stale quant-safe route",
+                        },
+                    ),
+                ):
+                    closed_tasks = helper.drafter_bottleneck_next_tasks(
+                        exhausted_root,
+                        helper.result_rows(exhausted_root),
+                        1779000003,
+                        reason="unit exhausted material candidate no source scout fallback",
+                    )
+                assert closed_tasks
+                assert all(
+                    str(task.get("id", "")).startswith("frontier-expansion-material-exhaustion-breakout-")
+                    for task in closed_tasks
+                )
+                assert all(task.get("supervisor_action") == "focused-test" for task in closed_tasks)
+                blocked_actions = {"source-scout", "mtp-report", "drafter-bottleneck-review"}
+                blocked_prefixes = (
+                    "agent-deliberation-source-scout-",
+                    "agent-deliberation-mtp-acceptance-yield-",
+                    "synthesis-timeout-recovery-",
+                )
+                assert all(task.get("supervisor_action") not in blocked_actions for task in closed_tasks)
+                assert all(not str(task.get("id", "")).startswith(blocked_prefixes) for task in closed_tasks)
                 helper.write_jsonl(exhausted_root / "tasks.jsonl", next_tasks)
                 canonical = helper.canonical_autoresearch_state(exhausted_root, recent_rows=120)
                 assert canonical["clean"]
