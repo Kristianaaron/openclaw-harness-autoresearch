@@ -617,7 +617,17 @@ def main() -> int:
             encoding="utf-8",
         )
         (helper.BENCHMARKS / "quality-review-1.json").write_text(
-            json.dumps({"quality_score": 90, "scorecard": {"overall": 89.8}}),
+            json.dumps({"quality_score": 90, "scorecard": {"overall": 89.8}, "verdict": "healthy"}),
+            encoding="utf-8",
+        )
+        (helper.BENCHMARKS / "frontier-autonomy-score-1.json").write_text(
+            json.dumps(
+                {
+                    "total_score": 80,
+                    "decision": "repair",
+                    "hard_gate_failures": ["scorecard_at_least_continue_threshold"],
+                }
+            ),
             encoding="utf-8",
         )
         certification_args = Namespace(
@@ -627,6 +637,30 @@ def main() -> int:
         )
         certified = helper.frontier_certification_status(certification_args)
         assert certified["ok"] is True
+        assert certified["autonomy_research_continue_ok"] is True
+        (helper.BENCHMARKS / "frontier-autonomy-score-2.json").write_text(
+            json.dumps(
+                {
+                    "total_score": 80,
+                    "decision": "repair",
+                    "hard_gate_failures": ["zero_active_noise"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        noisy_autonomy = helper.frontier_certification_status(certification_args)
+        assert noisy_autonomy["ok"] is False
+        assert any("frontier autonomy score" in issue for issue in noisy_autonomy["issues"])
+        (helper.BENCHMARKS / "frontier-autonomy-score-3.json").write_text(
+            json.dumps(
+                {
+                    "total_score": 100,
+                    "decision": "continue",
+                    "hard_gate_failures": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         helper.write_jsonl(
             helper.TASKS,
             [

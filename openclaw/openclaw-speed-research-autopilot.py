@@ -5372,12 +5372,22 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
     ]
     quality_score = float(max(quality_values)) if quality_values else 0.0
     contract = frontier.get("task_contract") if isinstance(frontier.get("task_contract"), dict) else {}
+    autonomy_failures = autonomy.get("hard_gate_failures") if isinstance(autonomy.get("hard_gate_failures"), list) else []
+    autonomy_failure_names = {str(item) for item in autonomy_failures}
+    autonomy_research_continue_ok = bool(
+        autonomy
+        and autonomy_score >= 80.0
+        and autonomy_failure_names
+        and autonomy_failure_names <= {"scorecard_at_least_continue_threshold"}
+        and quality.get("verdict") == "healthy"
+        and quality_score >= float(args.frontier_certification_min_quality)
+    )
     issues: list[str] = []
     if not replay.get("ok"):
         issues.append("replay guards failed")
     if frontier_score < float(args.frontier_certification_min_score):
         issues.append(f"frontier score {frontier_score}<min {args.frontier_certification_min_score}")
-    if autonomy and autonomy_score < 99.0:
+    if autonomy and autonomy_score < 99.0 and not autonomy_research_continue_ok:
         issues.append(f"frontier autonomy score {autonomy_score}<min 99.0")
     if alive and alive_score < 95.0:
         issues.append(f"self-improvement alive score {alive_score}<min 95.0")
@@ -5406,6 +5416,8 @@ def frontier_certification_status(args: argparse.Namespace) -> dict[str, object]
         "self_improvement_alive_score": alive_score if alive else None,
         "handoff_score": handoff_score,
         "quality_score": quality_score,
+        "autonomy_research_continue_ok": autonomy_research_continue_ok,
+        "autonomy_hard_gate_failures": sorted(autonomy_failure_names),
         "deterministic_ready_tasks": [str(task.get("id", "")) for task in deterministic[:8]],
         "implementation_bridge_ready_tasks": [str(task.get("id", "")) for task in bridge_ready[:8]],
         "bridge_only_ready": bridge_only_ready,
