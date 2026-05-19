@@ -6209,6 +6209,7 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
     exhausted_fingerprints = exhausted_calibration_fingerprints(root, recent_rows=600)
     adapter_loop_saturated = adapter_logit_loop_saturated(root, recent_rows=240)
     bottleneck_state = drafter_bottleneck_state(root, recent_rows=240)
+    material_candidates_exhausted = material_drafter_candidates_exhausted(root, recent_rows=600)
     active_calibration_stages = {
         calibration_memory_stage_name(task) for task in active_calibration_memory_stage_tasks(root)
     }
@@ -6232,6 +6233,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         ):
             continue
         if runtime_clean_exhausted and lane == "runtime-overhead" and "contamination" not in task_id:
+            continue
+        if material_candidates_exhausted and task_id.startswith("agent-deliberation-quant-safe-drafter-candidate-"):
             continue
         if adapter_loop_saturated and is_adapter_logit_loop_task(task):
             continue
@@ -7130,19 +7133,15 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
     elif material_exhausted and material_breakout_proved:
         if source_artifact or recent_keep_result_has_prefix(root, "source-scout-", recent_rows=240):
-            selected_task = quant_safe_drafter_candidate_task(
-                timestamp,
-                evidence={
-                    **evidence,
-                    "selected_by": "frontier_agent_deliberation",
-                    "reason": (
-                        "material exhaustion breakout and source-scout evidence are already present; "
-                        "advance to a quant-safe drafter candidate gate"
-                    ),
-                    "required_next": "bounded quant-safe JANQ drafter candidate contract",
-                },
-            )
-            selected_reason = "source-scout evidence exists; advance to quant-safe drafter candidate gate"
+            expansion_tasks = frontier_expansion_tasks(root, rows, timestamp)
+            if expansion_tasks:
+                selected_task = expansion_tasks[0]
+                selected_reason = "source-scout evidence exists; advance through source-grounded drafter-family expansion"
+            else:
+                selected_reason = (
+                    "material exhaustion and source-grounded expansion are already consumed; "
+                    "do not reseed quant-safe candidate gates without a materially new drafter family"
+                )
         else:
             selected_task = drafter_family_source_scout_task(
                 timestamp,

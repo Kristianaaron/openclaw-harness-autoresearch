@@ -3016,6 +3016,7 @@ def main() -> int:
                         },
                     ),
                     patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(helper, "material_drafter_candidates_exhausted", return_value=True),
                     patch.object(
                         helper,
                         "canonical_autoresearch_state",
@@ -3066,6 +3067,8 @@ def main() -> int:
                         },
                     ),
                     patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(helper, "material_drafter_candidates_exhausted", return_value=True),
+                    patch.object(helper, "material_exhaustion_breakout_proved", return_value=True),
                     patch.object(
                         helper,
                         "canonical_autoresearch_state",
@@ -3126,6 +3129,8 @@ def main() -> int:
                         },
                     ),
                     patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(helper, "material_drafter_candidates_exhausted", return_value=True),
+                    patch.object(helper, "material_exhaustion_breakout_proved", return_value=True),
                     patch.object(
                         helper,
                         "canonical_autoresearch_state",
@@ -3138,8 +3143,10 @@ def main() -> int:
                         123461,
                     )
             assert sourced_tasks
-            assert sourced_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-"), sourced_tasks
-            assert "advance to quant-safe drafter candidate" in sourced_report["architect"]["selected_reason"]
+            assert sourced_tasks[0]["id"].startswith(
+                "frontier-expansion-source-grounded-drafter-family-"
+            ), sourced_tasks
+            assert "source-grounded drafter-family expansion" in sourced_report["architect"]["selected_reason"]
             with (
                 patch.object(helper, "material_drafter_candidates_exhausted", return_value=True),
                 patch.object(helper, "material_exhaustion_breakout_proved", return_value=True),
@@ -3679,6 +3686,12 @@ def main() -> int:
             )
             assert len(repeated_route_tasks) == 1
             assert repeated_route_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-")
+            exhausted_candidate = helper.quant_safe_drafter_candidate_task(
+                1778980004,
+                evidence={"unit": True},
+            )
+            with patch.object(helper, "material_drafter_candidates_exhausted", return_value=True):
+                assert helper.filter_seedable_tasks(progress_root, [exhausted_candidate]) == []
         with tempfile.TemporaryDirectory() as canary_tmp:
             canary_root = Path(canary_tmp) / "research" / "speed"
             canary_home = Path(canary_tmp) / "home"
