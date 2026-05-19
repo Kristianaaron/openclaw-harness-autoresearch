@@ -949,7 +949,6 @@ LOW_SIGNAL_REMEASURE_ESCAPE_TARGETS = {
     "frontier-agent-deliberation",
     "runtime-overhead-map",
     "calibration-memory-report",
-    "autoresearch-implementation-handoff",
     "autoresearch-low-signal-repair",
     "patch-execute",
 }
@@ -1186,8 +1185,6 @@ def recent_low_signal_decode_remeasure_status(args: argparse.Namespace) -> dict[
     remeasure_synthesis = [row for row in post_escape_rows if is_remeasure_synthesis(row)]
     clean_decode_rows = [row for row in post_escape_rows if is_clean_decode(row)]
     escape_rows = [row for row in rows if is_escape(row)]
-    min_remeasure = int(getattr(args, "low_signal_min_decode_remeasures", 3))
-    loop = len(remeasure_synthesis) >= min_remeasure and len(clean_decode_rows) >= min_remeasure and not escape_rows
     recent_ready_remeasure = [
         str(task.get("id", ""))
         for task in read_jsonl(TASKS)
@@ -1201,6 +1198,12 @@ def recent_low_signal_decode_remeasure_status(args: argparse.Namespace) -> dict[
         and str(task.get("supervisor_action", ""))
         in {"source-scout", "runtime-overhead-map", "frontier-deliberation"}
     ]
+    min_remeasure = int(getattr(args, "low_signal_min_decode_remeasures", 3))
+    loop = (
+        len(remeasure_synthesis) >= min_remeasure
+        and len(clean_decode_rows) >= min_remeasure
+        and not ready_escape_tasks
+    )
     if not loop and len(remeasure_synthesis) >= min_remeasure + 1 and recent_ready_remeasure:
         loop = True
     if loop and ready_escape_tasks and not recent_ready_remeasure:

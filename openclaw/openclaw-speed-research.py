@@ -5962,6 +5962,21 @@ def lane_contract_fallback_tasks(
     dflash_blocked = dflash_lane_is_blocked(root, recent_rows=240) or "frontier-dflash" in exhausted_lanes(root)
     tasks: list[dict[str, Any]] = []
     bottleneck_state = drafter_bottleneck_state(root, recent_rows, recent_rows=240)
+    repeated_decode_fallbacks = recent_lane_contract_decode_fallback_count(root, recent_rows=60) >= 3
+    material_breakout_proved = material_exhaustion_breakout_proved(root, recent_rows, recent_rows=240)
+    if repeated_decode_fallbacks and material_breakout_proved:
+        scout_task = drafter_family_source_scout_task(
+            timestamp,
+            evidence={
+                "reason": (
+                    "lane-contract fallback detected repeated decode remeasurements after material "
+                    "JANQ drafter candidates were exhausted"
+                ),
+                "bottleneck_state": bottleneck_state,
+                "required_next": "fresh external evidence for a materially new JANQ drafter family",
+            },
+        )
+        return filter_seedable_tasks(root, [scout_task])
     if bottleneck_state["state"] != "no_terminal_quantized_blocker":
         bottleneck_tasks = drafter_bottleneck_next_tasks(root, recent_rows, timestamp, reason=reason)
         if bottleneck_tasks:
@@ -6124,6 +6139,24 @@ def lane_contract_fallback_tasks(
                 )
             )
     if not tasks:
+        if repeated_decode_fallbacks:
+            deliberation_report, deliberation_tasks = frontier_agent_deliberation(root, recent_rows, timestamp)
+            if deliberation_tasks:
+                path = root / "benchmarks" / f"frontier-agent-deliberation-{deliberation_report['timestamp']}.json"
+                deliberation_report["seeded"] = len(deliberation_tasks)
+                path.write_text(json.dumps(deliberation_report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                return filter_seedable_tasks(root, deliberation_tasks)
+            append_jsonl(
+                root / "findings.jsonl",
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "task_id": "lane-contract-decode-remeasure-loop-suppressed",
+                    "finding": "repeated clean decode remeasurements are plateau evidence, not a next action",
+                    "reason": reason,
+                    "next": "require frontier deliberation, drafter-family source evidence, or an explicit external blocker",
+                },
+            )
+            return []
         if dflash_blocked and active_calibration_memory_stage_tasks(root):
             append_jsonl(
                 root / "findings.jsonl",
@@ -6969,9 +7002,11 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
             timestamp,
             reason="Frontier deliberation selected the canonical JANQ drafter bottleneck route",
         )
+    material_breakout_proved = material_exhaustion_breakout_proved(root, rows, recent_rows=240)
     material_exhausted = (
         bottleneck_state.get("state") == "material_drafter_candidates_exhausted"
         or bool(bottleneck_state.get("material_candidates_exhausted"))
+        or material_breakout_proved
     )
     escape_candidate_tasks = frontier_escape_candidate_tasks(root, rows, timestamp)
     waiting_on_bottleneck_route = active_drafter_bottleneck_route(root) or (
@@ -7053,9 +7088,18 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
         selected_reason = "repeated source-scout/MTP escape requires a quantization-safe drafter candidate"
     elif waiting_on_bottleneck_route:
         selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
-    elif material_exhausted and material_exhaustion_breakout_proved(root, rows, recent_rows=240):
-        selected_reason = "material exhaustion breakout already proved; materially new drafter-family evidence required"
-    elif material_exhausted and not material_exhaustion_breakout_proved(root, rows, recent_rows=240):
+    elif material_exhausted and material_breakout_proved:
+        selected_task = drafter_family_source_scout_task(
+            timestamp,
+            evidence={
+                **evidence,
+                "selected_by": "frontier_agent_deliberation",
+                "reason": "material exhaustion breakout already proved; gather new drafter-family evidence",
+                "required_next": "materially new JANQ drafter family or explicit external blocker",
+            },
+        )
+        selected_reason = "material exhaustion breakout already proved; seed drafter-family source evidence instead of another measurement"
+    elif material_exhausted and not material_breakout_proved:
         selected_task = material_exhaustion_breakout_task(
             timestamp,
             evidence={

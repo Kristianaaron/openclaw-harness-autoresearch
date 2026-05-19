@@ -2664,6 +2664,41 @@ def main() -> int:
                 reason="unit-test dflash blocked with active calibration stage",
             ) == []
             helper.write_jsonl(root / "tasks.jsonl", [])
+            helper.append_result(
+                root,
+                run_id="supervisor-focused-test-material-exhausted-unit",
+                status="keep",
+                target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                hypothesis=(
+                    "All current JANQ drafter material candidates are exhausted and the next path requires "
+                    "a materially new drafter family."
+                ),
+                commit="abc123",
+                notes="focused test passed state=material_drafter_candidates_exhausted",
+            )
+            for index in range(3):
+                helper.append_result(
+                    root,
+                    run_id=f"synthesis-remeasure-loop-unit-{index}",
+                    status="keep",
+                    target="synthesis",
+                    hypothesis="fallback synthesis repeated decode measurements",
+                    commit="abc123",
+                    notes="contract_actions=lane-contract-decode-remeasure-ready-work-gap-123",
+                )
+            scout_fallback = helper.lane_contract_fallback_tasks(
+                root,
+                helper.result_rows(root),
+                123467,
+                reason="unit-test repeated decode fallback after material exhaustion",
+            )
+            assert scout_fallback, "material exhaustion should route to new drafter-family evidence"
+            assert scout_fallback[0]["supervisor_action"] == "source-scout", scout_fallback
+            assert "decode-remeasure" not in scout_fallback[0]["id"]
+            report, scout_tasks = helper.frontier_agent_deliberation(root, helper.result_rows(root), 123468)
+            assert report["ok"] is True, report
+            assert scout_tasks[0]["id"].startswith("frontier-expansion-drafter-family-source-scout-")
+            helper.write_jsonl(root / "tasks.jsonl", [])
             handoff_paths = list((root / "benchmarks").glob("implementation-handoff-audit-*.json"))
             assert handoff_paths
             handoff = json.loads(handoff_paths[-1].read_text(encoding="utf-8"))
@@ -3042,7 +3077,8 @@ def main() -> int:
                         helper.result_rows(material_terminal_root),
                         123460,
                     )
-            assert terminal_tasks == []
+            assert terminal_tasks
+            assert terminal_tasks[0]["id"].startswith("frontier-expansion-drafter-family-source-scout-"), terminal_tasks
             assert "already proved" in terminal_report["architect"]["selected_reason"]
             with tempfile.TemporaryDirectory() as focused_tmp:
                 focused_root = Path(focused_tmp) / "research" / "speed"

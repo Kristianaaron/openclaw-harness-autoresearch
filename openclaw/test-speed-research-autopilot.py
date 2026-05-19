@@ -2631,6 +2631,17 @@ def main() -> int:
         )
         remeasure_status = helper.recent_low_signal_decode_remeasure_status(remeasure_args)
         assert remeasure_status["loop"], remeasure_status
+        helper.append_result(
+            helper.WORKSPACE,
+            run_id="implementation-handoff-should-not-mask-remeasure-loop",
+            status="keep",
+            target="autoresearch-implementation-handoff",
+            hypothesis="handoff audit is a review artifact, not an escape from decode remeasure churn",
+            commit="abc123",
+            notes="ok=True score=100 ready_deterministic=1",
+        )
+        masked_remeasure_status = helper.recent_low_signal_decode_remeasure_status(remeasure_args)
+        assert masked_remeasure_status["loop"], masked_remeasure_status
         trigger_status = helper.autonomy_trigger_status(
             remeasure_args,
             cycle=24,
