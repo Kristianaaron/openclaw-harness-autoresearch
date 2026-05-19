@@ -3080,6 +3080,92 @@ def main() -> int:
             assert terminal_tasks
             assert terminal_tasks[0]["id"].startswith("frontier-expansion-drafter-family-source-scout-"), terminal_tasks
             assert "already proved" in terminal_report["architect"]["selected_reason"]
+            with tempfile.TemporaryDirectory() as sourced_material_tmp:
+                sourced_material_root = Path(sourced_material_tmp) / "research" / "speed"
+                helper.ensure_research_state(sourced_material_root)
+                helper.append_result(
+                    sourced_material_root,
+                    run_id="drafter-material-candidate-exhausted-unit",
+                    status="blocked",
+                    target="janq-drafter-material-candidate",
+                    hypothesis="unit all material candidates exhausted",
+                    commit="abc123",
+                    notes="decision=all-material-drafter-candidates-exhausted",
+                )
+                helper.append_result(
+                    sourced_material_root,
+                    run_id="supervisor-focused-test-material-exhaustion-unit",
+                    status="keep",
+                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                    hypothesis="All current JANQ drafter material candidates are exhausted.",
+                    commit="abc123",
+                    notes="focused test passed",
+                )
+                (sourced_material_root / "benchmarks" / "source-scout-unit.json").write_text(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "findings": [
+                                {
+                                    "status": "fetched",
+                                    "url": "https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with (
+                    patch.object(
+                        helper,
+                        "drafter_bottleneck_state",
+                        return_value={
+                            "state": "material_drafter_candidates_exhausted",
+                            "next_step": "seed_frontier_expansion_after_material_exhaustion",
+                            "material_candidates_exhausted": True,
+                        },
+                    ),
+                    patch.object(helper, "drafter_bottleneck_next_tasks", return_value=[]),
+                    patch.object(
+                        helper,
+                        "canonical_autoresearch_state",
+                        return_value={"clean": True, "noise": {"unresolved_blocked_rows": 0, "memory_blocks": 0}},
+                    ),
+                ):
+                    sourced_report, sourced_tasks = helper.frontier_agent_deliberation(
+                        sourced_material_root,
+                        helper.result_rows(sourced_material_root),
+                        123461,
+                    )
+            assert sourced_tasks
+            assert sourced_tasks[0]["id"].startswith("agent-deliberation-quant-safe-drafter-candidate-"), sourced_tasks
+            assert "advance to quant-safe drafter candidate" in sourced_report["architect"]["selected_reason"]
+            with (
+                patch.object(helper, "material_drafter_candidates_exhausted", return_value=True),
+                patch.object(helper, "material_exhaustion_breakout_proved", return_value=True),
+                patch.object(
+                    helper,
+                    "latest_source_scout_artifact",
+                    return_value={
+                        "_artifact_path": str(sourced_material_root / "benchmarks" / "source-scout-unit.json"),
+                        "ok": True,
+                    },
+                ),
+            ):
+                source_grounded_tasks = helper.frontier_expansion_tasks(
+                    sourced_material_root,
+                    helper.result_rows(sourced_material_root),
+                    123462,
+                )
+            assert source_grounded_tasks
+            assert source_grounded_tasks[0]["id"].startswith(
+                "frontier-expansion-source-grounded-drafter-family-"
+            ), source_grounded_tasks
+            assert "source-scout" in source_grounded_tasks[0]["evidence"].get("source_scout_artifact", "")
+            source_scout_owner = helper.drafter_family_source_scout_task(123462, evidence={"unit": True})
+            assert helper.material_progress_task_rank(source_grounded_tasks[0]) > helper.material_progress_task_rank(
+                source_scout_owner
+            )
             with tempfile.TemporaryDirectory() as focused_tmp:
                 focused_root = Path(focused_tmp) / "research" / "speed"
                 helper.ensure_research_state(focused_root)
@@ -3956,15 +4042,15 @@ def main() -> int:
                         "reason": "unit forced stale quant-safe route",
                     },
                 ):
-                    assert (
-                        helper.drafter_bottleneck_next_tasks(
-                            exhausted_root,
-                            helper.result_rows(exhausted_root),
-                            1779000004,
-                            reason="unit exhausted material candidate breakout already proved",
-                        )
-                        == []
+                    after_breakout_tasks = helper.drafter_bottleneck_next_tasks(
+                        exhausted_root,
+                        helper.result_rows(exhausted_root),
+                        1779000004,
+                        reason="unit exhausted material candidate breakout already proved",
                     )
+                assert after_breakout_tasks
+                assert after_breakout_tasks[0]["id"].startswith("frontier-expansion-drafter-family-source-scout-")
+                assert after_breakout_tasks[0]["supervisor_action"] == "source-scout"
                 helper.write_jsonl(exhausted_root / "tasks.jsonl", next_tasks)
                 canonical = helper.canonical_autoresearch_state(exhausted_root, recent_rows=120)
                 assert canonical["clean"]

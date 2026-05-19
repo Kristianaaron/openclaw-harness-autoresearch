@@ -108,6 +108,7 @@ FRONTIER_SOURCE_URLS = (
     "https://github.com/NousResearch/hermes-agent",
     "https://github.com/raullenchai/Rapid-MLX",
     "https://github.com/z-lab/dflash",
+    "https://blog.google/innovation-and-ai/technology/developers-tools/multi-token-prediction-gemma-4/",
     "https://ai.google.dev/gemma/docs/mtp/mtp",
     "https://huggingface.co/dealignai/Gemma-4-31B-JANG_4M-CRACK",
     "https://www.reddit.com/r/LocalLLaMA/search.json?q=Gemma%204%20MTP%20drafter%20decode%20speed&restrict_sr=1&sort=new",
@@ -115,6 +116,7 @@ FRONTIER_SOURCE_URLS = (
 )
 SOURCE_SCOUT_ALLOWED_HOSTS = {
     "ai.google.dev",
+    "blog.google",
     "github.com",
     "huggingface.co",
     "raw.githubusercontent.com",
@@ -2738,6 +2740,8 @@ def material_progress_task_rank(task: dict[str, Any]) -> int:
     metric = str(task.get("metric", ""))
     target = str(task.get("target", ""))
     next_action = str(task.get("next_action", ""))
+    if task_id.startswith("frontier-expansion-source-grounded-drafter-family-"):
+        return 4
     if (
         task.get("benchmark_mode") == "decode-sample"
         or target == "decode-sample"
@@ -5578,6 +5582,27 @@ def recent_drafter_trace_ready(root: Path, *, recent_rows: int = 160) -> bool:
 def active_drafter_bottleneck_route(root: Path) -> bool:
     """Return true when a deterministic JANQ drafter route is already queued."""
     adapter_impl_done = adapter_method_implementation_completed(root)
+    material_exhausted = material_drafter_candidates_exhausted(root, recent_rows=600)
+    route_prefixes = [
+        "drafter-calibration-canary-",
+        "deliberate-drafter-calibration-canary-",
+        "review-drafter-calibration-canary-",
+        "handoff-audit-drafter-calibration-canary-",
+        "lane-contract-drafter-calibration-canary-",
+        "adapter-drafter-calibration-canary-",
+        "drafter-calibration-memory-stage-",
+        "drafter-calibration-run-",
+        "calibration-memory-report-",
+        "drafter-adapter-method-contract-",
+        "trace-distillation-gradient-repair-",
+        "trace-distillation-adapter-bridge-",
+        "frontier-expansion-drafter-family-search-",
+        "frontier-expansion-material-exhaustion-breakout-",
+        "frontier-expansion-source-grounded-drafter-family-",
+        "material-exhaustion-breakout-",
+    ]
+    if not material_exhausted:
+        route_prefixes.append("agent-deliberation-quant-safe-drafter-candidate-")
     return active_task_has_action(
         root,
         {
@@ -5587,27 +5612,9 @@ def active_drafter_bottleneck_route(root: Path) -> bool:
             "calibration-memory-report",
             "drafter-adapter-method-contract",
         },
-    ) or active_task_has_any_prefix(
-        root,
-        (
-            "drafter-calibration-canary-",
-            "deliberate-drafter-calibration-canary-",
-            "review-drafter-calibration-canary-",
-            "handoff-audit-drafter-calibration-canary-",
-            "lane-contract-drafter-calibration-canary-",
-            "adapter-drafter-calibration-canary-",
-            "drafter-calibration-memory-stage-",
-            "drafter-calibration-run-",
-            "calibration-memory-report-",
-            "drafter-adapter-method-contract-",
-            "trace-distillation-gradient-repair-",
-            "trace-distillation-adapter-bridge-",
-            "agent-deliberation-quant-safe-drafter-candidate-",
-            "frontier-expansion-drafter-family-search-",
-            "frontier-expansion-material-exhaustion-breakout-",
-            "material-exhaustion-breakout-",
-        ),
-    ) or (not adapter_impl_done and active_task_has_prefix(root, "implementation-drafter-adapter-method-"))
+    ) or active_task_has_any_prefix(root, tuple(route_prefixes)) or (
+        not adapter_impl_done and active_task_has_prefix(root, "implementation-drafter-adapter-method-")
+    )
 
 
 def drafter_calibration_breakthrough_tasks(
@@ -5965,18 +5972,19 @@ def lane_contract_fallback_tasks(
     repeated_decode_fallbacks = recent_lane_contract_decode_fallback_count(root, recent_rows=60) >= 3
     material_breakout_proved = material_exhaustion_breakout_proved(root, recent_rows, recent_rows=240)
     if repeated_decode_fallbacks and material_breakout_proved:
-        scout_task = drafter_family_source_scout_task(
-            timestamp,
-            evidence={
-                "reason": (
-                    "lane-contract fallback detected repeated decode remeasurements after material "
-                    "JANQ drafter candidates were exhausted"
-                ),
-                "bottleneck_state": bottleneck_state,
-                "required_next": "fresh external evidence for a materially new JANQ drafter family",
-            },
-        )
-        return filter_seedable_tasks(root, [scout_task])
+        source_scout_artifact = latest_source_scout_artifact(root)
+        evidence = {
+            "reason": (
+                "lane-contract fallback detected repeated decode remeasurements after material "
+                "JANQ drafter candidates were exhausted"
+            ),
+            "bottleneck_state": bottleneck_state,
+            "required_next": "fresh external evidence for a materially new JANQ drafter family",
+            "source_scout_artifact": source_scout_artifact.get("_artifact_path", ""),
+        }
+        if source_scout_artifact or recent_keep_result_has_prefix(root, "source-scout-", recent_rows=240):
+            return filter_seedable_tasks(root, [quant_safe_drafter_candidate_task(timestamp, evidence=evidence)])
+        return filter_seedable_tasks(root, [drafter_family_source_scout_task(timestamp, evidence=evidence)])
     if bottleneck_state["state"] != "no_terminal_quantized_blocker":
         bottleneck_tasks = drafter_bottleneck_next_tasks(root, recent_rows, timestamp, reason=reason)
         if bottleneck_tasks:
@@ -6688,39 +6696,71 @@ def frontier_expansion_tasks(root: Path, rows: list[dict[str, str]], timestamp: 
         "decode_mean_tps": decode_mean,
         "block_sweep_settled": block_sweep_settled,
         "material_candidates_exhausted": material_drafter_candidates_exhausted(root, recent_rows=600),
+        "source_scout_artifact": latest_source_scout_artifact(root).get("_artifact_path", ""),
     }
 
     candidates: list[tuple[str, dict[str, Any]]] = []
     material_breakout_proved = material_exhaustion_breakout_proved(root, rows, recent_rows=240)
-    if evidence["material_candidates_exhausted"] and not material_breakout_proved:
-        candidates.append(
-            (
-                "frontier-expansion-drafter-family-search-",
-                frontier_expansion_task(
-                    timestamp,
-                    slug="drafter-family-search",
-                    priority=100,
-                    target="openclaw/openclaw-mtp-drafter-calibrate.py",
-                    hypothesis=(
-                        "All current JANQ drafter adapter families reached no-lift; the next breakthrough path "
-                        "must identify a materially new drafter family or training objective before another "
-                        "calibration run is allowed."
+    if evidence["material_candidates_exhausted"]:
+        if material_breakout_proved and evidence["source_scout_artifact"]:
+            candidates.append(
+                (
+                    "frontier-expansion-source-grounded-drafter-family-",
+                    frontier_expansion_task(
+                        timestamp,
+                        slug="source-grounded-drafter-family",
+                        priority=100,
+                        target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                        hypothesis=(
+                            "Known JANQ drafter material candidates are exhausted and fresh source evidence exists; "
+                            "the next breakthrough path must convert that source evidence into one concrete "
+                            "quantization-safe drafter-family contract instead of reseeding source-scout or MTP work."
+                        ),
+                        acceptance=(
+                            "The contract names exactly one new drafter-family idea grounded in the latest "
+                            "source-scout artifact, records why prior candidates are exhausted, defines a "
+                            "no-live-profile canary, and requires paired TUI decode gates before promotion."
+                        ),
+                        evidence=evidence,
                     ),
-                    acceptance=(
-                        "The contract records the exhausted adapter-logit, low-rank-hidden, and "
-                        "pre-projection-low-rank candidates, then names one new candidate family with evidence, "
-                        "canary scope, memory class, and decode TPS promotion gates."
+                )
+            )
+        elif material_breakout_proved:
+            candidates.append(
+                (
+                    "frontier-expansion-drafter-family-source-scout-",
+                    drafter_family_source_scout_task(timestamp, evidence=evidence),
+                )
+            )
+        else:
+            candidates.append(
+                (
+                    "frontier-expansion-drafter-family-search-",
+                    frontier_expansion_task(
+                        timestamp,
+                        slug="drafter-family-search",
+                        priority=100,
+                        target="openclaw/openclaw-mtp-drafter-calibrate.py",
+                        hypothesis=(
+                            "All current JANQ drafter adapter families reached no-lift; the next breakthrough path "
+                            "must identify a materially new drafter family or training objective before another "
+                            "calibration run is allowed."
+                        ),
+                        acceptance=(
+                            "The contract records the exhausted adapter-logit, low-rank-hidden, and "
+                            "pre-projection-low-rank candidates, then names one new candidate family with evidence, "
+                            "canary scope, memory class, and decode TPS promotion gates."
+                        ),
+                        evidence=evidence,
                     ),
-                    evidence=evidence,
-                ),
+                )
             )
-        )
-        candidates.append(
-            (
-                "frontier-expansion-material-exhaustion-breakout-",
-                material_exhaustion_breakout_task(timestamp, evidence=evidence, priority=98),
+            candidates.append(
+                (
+                    "frontier-expansion-material-exhaustion-breakout-",
+                    material_exhaustion_breakout_task(timestamp, evidence=evidence, priority=98),
+                )
             )
-        )
     if calibration_blocker == CALIBRATION_QUANTIZED_GRADIENT_BLOCKER:
         candidates.append(
             (
@@ -7089,16 +7129,31 @@ def frontier_agent_deliberation(root: Path, rows: list[dict[str, str]], timestam
     elif waiting_on_bottleneck_route:
         selected_reason = f"canonical JANQ drafter route already active or blocked next_step={bottleneck_state.get('next_step')}"
     elif material_exhausted and material_breakout_proved:
-        selected_task = drafter_family_source_scout_task(
-            timestamp,
-            evidence={
-                **evidence,
-                "selected_by": "frontier_agent_deliberation",
-                "reason": "material exhaustion breakout already proved; gather new drafter-family evidence",
-                "required_next": "materially new JANQ drafter family or explicit external blocker",
-            },
-        )
-        selected_reason = "material exhaustion breakout already proved; seed drafter-family source evidence instead of another measurement"
+        if source_artifact or recent_keep_result_has_prefix(root, "source-scout-", recent_rows=240):
+            selected_task = quant_safe_drafter_candidate_task(
+                timestamp,
+                evidence={
+                    **evidence,
+                    "selected_by": "frontier_agent_deliberation",
+                    "reason": (
+                        "material exhaustion breakout and source-scout evidence are already present; "
+                        "advance to a quant-safe drafter candidate gate"
+                    ),
+                    "required_next": "bounded quant-safe JANQ drafter candidate contract",
+                },
+            )
+            selected_reason = "source-scout evidence exists; advance to quant-safe drafter candidate gate"
+        else:
+            selected_task = drafter_family_source_scout_task(
+                timestamp,
+                evidence={
+                    **evidence,
+                    "selected_by": "frontier_agent_deliberation",
+                    "reason": "material exhaustion breakout already proved; gather new drafter-family evidence",
+                    "required_next": "materially new JANQ drafter family or explicit external blocker",
+                },
+            )
+            selected_reason = "material exhaustion breakout already proved; seed drafter-family source evidence instead of another measurement"
     elif material_exhausted and not material_breakout_proved:
         selected_task = material_exhaustion_breakout_task(
             timestamp,
