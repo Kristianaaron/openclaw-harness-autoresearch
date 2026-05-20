@@ -75,6 +75,34 @@ def main() -> int:
             assert (root / "README-openclaw-speed.md").exists()
             assert (root / "implementation-skill.md").exists()
             assert (root / "benchmark-manifest.json").exists()
+            modular_home = Path(tmp) / "modular-home"
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENCLAW_HOME": str(modular_home),
+                    "OPENCLAW_RESEARCH_DIR": str(modular_home / "research" / "design-wiki"),
+                    "OPENCLAW_RESEARCH_NAME": "design-wiki",
+                    "OPENCLAW_RESEARCH_OBJECTIVE": "Build a high-taste design reference wiki with evidence-backed source notes.",
+                    "OPENCLAW_RESEARCH_PRIMARY_METRICS": "source_quality,coverage,actionability",
+                    "OPENCLAW_RESEARCH_LANES": "source-scout,evidence-map,implementation-gate,safety",
+                },
+                clear=False,
+            ):
+                assert helper.setup_workspace(Namespace(repo_url="file:///no/such/repo")) == 0
+                modular_root = modular_home / "research" / "design-wiki"
+                profile = json.loads((modular_root / "research-profile.json").read_text())
+                assert profile["name"] == "design-wiki"
+                assert "design reference wiki" in profile["objective"]
+                assert profile["metrics"]["primary"] == ["source_quality", "coverage", "actionability"]
+                program = (modular_root / "program.md").read_text()
+                assert "OpenClaw Autoresearch: design-wiki" in program
+                assert "decode tokens/sec" not in program
+                prompt = helper.prompt_text(modular_root)
+                assert "OpenClaw Modular Autoresearch bootstrap" in prompt
+                assert "design reference wiki" in prompt
+                tasks = helper.read_jsonl(modular_root / "tasks.jsonl")
+                assert any(task.get("lane") == "source-scout" for task in tasks)
+                assert not any(task.get("lane") == "mtp-decode" for task in tasks if task.get("status") == "ready")
             runtime_root = Path(tmp) / "runtime-clean-research" / "speed"
             helper.ensure_research_state(runtime_root)
             helper.append_result(

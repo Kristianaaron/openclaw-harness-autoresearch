@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_WORKSPACE = Path.home() / ".openclaw" / "research" / "speed"
 DEFAULT_TARGET_TPS = 30.0
 ARCHITECTURE_VERSION = 1
 
@@ -42,7 +41,12 @@ CORE_ARCHITECTURE_FILES = [
 
 
 def workspace_root() -> Path:
-    return Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR", DEFAULT_WORKSPACE)).expanduser()
+    explicit = os.environ.get("OPENCLAW_RESEARCH_DIR") or os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    name = os.environ.get("OPENCLAW_RESEARCH_NAME") or os.environ.get("OPENCLAW_RESEARCH_TOPIC") or "speed"
+    slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower()).strip("-")[:80] or "research"
+    return Path.home() / ".openclaw" / "research" / slug
 
 
 def read_json(path: Path) -> dict[str, Any]:

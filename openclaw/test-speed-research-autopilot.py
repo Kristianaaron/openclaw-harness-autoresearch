@@ -68,6 +68,22 @@ def check_installed_helper_freshness(helper) -> None:
             helper.__file__ = original_file
 
 
+def check_modular_workspace_resolution() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp) / "openclaw-home"
+        with patch.dict(
+            os.environ,
+            {"OPENCLAW_HOME": str(home), "OPENCLAW_RESEARCH_NAME": "Design Wiki"},
+            clear=False,
+        ):
+            helper = load_helper()
+        assert helper.WORKSPACE == home / "research" / "design-wiki"
+        explicit = Path(tmp) / "explicit-workspace"
+        with patch.dict(os.environ, {"OPENCLAW_RESEARCH_DIR": str(explicit)}, clear=False):
+            helper = load_helper()
+        assert helper.WORKSPACE == explicit
+
+
 def check_prompt_and_routing_guards(helper) -> None:
     prompt = helper.continuation_prompt(1, 0)
     assert "do not read it this turn" in prompt
@@ -565,6 +581,7 @@ def check_autonomous_repair_owner(helper) -> None:
 
 
 def main() -> int:
+    check_modular_workspace_resolution()
     helper = load_helper()
     check_installed_helper_freshness(helper)
     check_prompt_and_routing_guards(helper)

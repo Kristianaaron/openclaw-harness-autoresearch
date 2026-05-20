@@ -45,7 +45,21 @@ from openclaw_speed_research_core import (
 
 HOME = Path.home()
 OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", HOME / ".openclaw")).expanduser()
-WORKSPACE = Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR", OPENCLAW_HOME / "research" / "speed")).expanduser()
+
+
+def slugify(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")[:80] or "research"
+
+
+def workspace_from_env() -> Path:
+    explicit = os.environ.get("OPENCLAW_RESEARCH_DIR") or os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    name = os.environ.get("OPENCLAW_RESEARCH_NAME") or os.environ.get("OPENCLAW_RESEARCH_TOPIC") or "speed"
+    return OPENCLAW_HOME / "research" / slugify(name)
+
+
+WORKSPACE = workspace_from_env()
 RESULTS = WORKSPACE / "results.tsv"
 IDEAS = WORKSPACE / "ideas.md"
 TASKS = WORKSPACE / "tasks.jsonl"

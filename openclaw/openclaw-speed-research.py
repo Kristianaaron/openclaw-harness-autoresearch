@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any
 
 from openclaw_speed_research_core import (
+    DEFAULT_RESEARCH_PROFILE,
     RESULTS_HEADER,
+    RESEARCH_PROFILE_VERSION,
     append_result,
     append_jsonl,
     benchmark_result_schema_ok,
@@ -278,8 +280,39 @@ def home() -> Path:
     return Path(os.environ.get("OPENCLAW_HOME", Path.home() / ".openclaw")).expanduser()
 
 
+def slugify(value: object) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return slug[:80] or "research"
+
+
+def split_csv(values: list[str] | str | None, *, default: list[str]) -> list[str]:
+    if values is None:
+        return list(default)
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        raw_values = list(values)
+    parsed: list[str] = []
+    for value in raw_values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item and item not in parsed:
+                parsed.append(item)
+    return parsed or list(default)
+
+
+def active_research_slug() -> str:
+    explicit = os.environ.get("OPENCLAW_RESEARCH_NAME") or os.environ.get("OPENCLAW_RESEARCH_TOPIC")
+    if explicit:
+        return slugify(explicit)
+    return "speed"
+
+
 def workspace_root() -> Path:
-    return Path(os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR", home() / "research" / "speed")).expanduser()
+    explicit = os.environ.get("OPENCLAW_RESEARCH_DIR") or os.environ.get("OPENCLAW_SPEED_RESEARCH_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return home() / "research" / active_research_slug()
 
 
 def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -734,6 +767,300 @@ Forbidden actions include `find ~`, `find /`, `find /Users`, `ls -R`, `grep -R`,
 """
 
 
+GENERIC_PRIMARY_METRICS = ["evidence_quality", "actionability", "implementation_readiness", "risk_reduction"]
+GENERIC_SECONDARY_METRICS = ["source_quality", "novelty", "reproducibility", "cost", "rollback_confidence"]
+GENERIC_ALLOWED_LANES = [
+    "source-scout",
+    "evidence-map",
+    "hypothesis",
+    "experiment",
+    "implementation-gate",
+    "policy-optimization",
+    "safety",
+    "exhaustion-report",
+]
+
+
+def is_speed_profile(profile: dict[str, Any]) -> bool:
+    name = str(profile.get("name", "")).lower()
+    objective = str(profile.get("objective", "")).lower()
+    return name in {"openclaw-speed", "speed", "decode-speed-research"} or "decode speed" in objective or "decode tokens/sec" in objective
+
+
+def research_profile_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    default_name = os.environ.get("OPENCLAW_RESEARCH_NAME") or "openclaw-speed"
+    default_objective = os.environ.get("OPENCLAW_RESEARCH_OBJECTIVE") or DEFAULT_RESEARCH_PROFILE["objective"]
+    name = getattr(args, "name", "") or default_name
+    objective = getattr(args, "objective", "") or default_objective
+    product = getattr(args, "product", "") or os.environ.get("OPENCLAW_RESEARCH_PRODUCT", "OpenClaw")
+    forbidden = split_csv(
+        getattr(args, "forbidden", None) or os.environ.get("OPENCLAW_RESEARCH_FORBIDDEN"),
+        default=["opencode", "tokens", "secrets", ".env"],
+    )
+    if objective == DEFAULT_RESEARCH_PROFILE["objective"] and slugify(name) in {"speed", "openclaw-speed"}:
+        return json.loads(json.dumps(DEFAULT_RESEARCH_PROFILE))
+    primary = split_csv(
+        getattr(args, "primary_metric", None) or os.environ.get("OPENCLAW_RESEARCH_PRIMARY_METRICS"),
+        default=GENERIC_PRIMARY_METRICS,
+    )
+    secondary = split_csv(
+        getattr(args, "secondary_metric", None) or os.environ.get("OPENCLAW_RESEARCH_SECONDARY_METRICS"),
+        default=GENERIC_SECONDARY_METRICS,
+    )
+    lanes = split_csv(
+        getattr(args, "lane", None) or os.environ.get("OPENCLAW_RESEARCH_LANES"),
+        default=GENERIC_ALLOWED_LANES,
+    )
+    source_topic = getattr(args, "source_topic", "") or os.environ.get("OPENCLAW_RESEARCH_SOURCE_TOPIC") or slugify(name)
+    return {
+        "version": RESEARCH_PROFILE_VERSION,
+        "name": slugify(name),
+        "title": str(name),
+        "objective": str(objective),
+        "source_topic": source_topic,
+        "scope": {
+            "product": product,
+            "forbidden": forbidden,
+            "allowed_lanes": lanes,
+        },
+        "metrics": {
+            "primary": primary,
+            "secondary": secondary,
+        },
+        "implementation_contract": {
+            "required_fields": ["source_files", "acceptance", "rollback"],
+            "required_guard_any": ["tests_pass", "canary_only", "no_live_profile_change", "no_forbidden_scope_change"],
+            "patch_execute_required_fields": ["patch_file", "source_files", "tests"],
+        },
+    }
+
+
+def generic_program_md(profile: dict[str, Any]) -> str:
+    title = profile.get("title") or profile.get("name") or "OpenClaw Autoresearch"
+    objective = profile.get("objective") or "Research the active objective with evidence-first experiments."
+    scope = profile.get("scope", {}) if isinstance(profile.get("scope"), dict) else {}
+    metrics = profile.get("metrics", {}) if isinstance(profile.get("metrics"), dict) else {}
+    forbidden = ", ".join(scope.get("forbidden", []) or ["opencode", "secrets", ".env"])
+    lanes = ", ".join(scope.get("allowed_lanes", []) or GENERIC_ALLOWED_LANES)
+    primary = ", ".join(metrics.get("primary", []) or GENERIC_PRIMARY_METRICS)
+    secondary = ", ".join(metrics.get("secondary", []) or GENERIC_SECONDARY_METRICS)
+    return f"""# OpenClaw Autoresearch: {title}
+
+This workspace adapts the `karpathy/autoresearch` method to a modular OpenClaw research objective. The profile, not the helper filename, defines what is being researched.
+
+## Active Objective
+
+{objective}
+
+## Scope
+
+Work on OpenClaw-owned research artifacts and explicitly relevant sources only. Forbidden scope: {forbidden}.
+
+Allowed lanes: {lanes}.
+
+## Metrics
+
+Primary metrics: {primary}.
+
+Secondary metrics: {secondary}.
+
+## Research Method
+
+Use small experiments, explicit evidence, keep/discard decisions, and a durable loop:
+
+1. Read `RUN_MEMORY.md` and `SUMMARY.md` first.
+2. Pick one bounded task aligned to the active objective.
+3. Inspect one named source, note, benchmark, or artifact at a time.
+4. Convert findings into a result row, a source note, a hypothesis, or a gated implementation candidate.
+5. Do not count repeated synthesis, duplicate tasks, or unsupported claims as progress.
+6. Promote implementation only through the canary, rollback, scorecard, and safety gates.
+7. If a lane is exhausted, record why and route to the next allowed lane.
+
+## Tool Discipline
+
+- Use one narrow tool call per assistant turn.
+- Never use broad local search commands such as `find ~`, `find /Users`, `ls -R`, or recursive grep over home.
+- Prefer explicit workspace files under this research directory and source URLs added to `sources/queue.md`.
+- If evidence is missing, record a prerequisite task instead of guessing.
+
+## Implementation Gate
+
+Before keeping any source or config change:
+
+1. Name the subsystem touched.
+2. Point to evidence from this workspace.
+3. State expected behavior and metric movement.
+4. Generate the smallest patch.
+5. Run canary/focused tests.
+6. Confirm rollback.
+7. Record keep/discard/blocked in `results.tsv`.
+
+## Results
+
+Append every experiment to `results.tsv` as TSV:
+
+`timestamp run_id status target hypothesis ttft_s prefill_tps decode_tps wall_s memory_gb commit notes`
+
+Statuses: `keep`, `discard`, `blocked`, `crash`.
+
+## Bootstrap Ladder
+
+The wrapper and autopilot own setup. In a fresh agent run, perform one of these narrow actions:
+
+1. Read exactly `RUN_MEMORY.md`.
+2. Read exactly `SUMMARY.md`.
+3. Read exactly `sources/queue.md`.
+4. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic {profile.get('source_topic') or slugify(title)}`.
+5. Run exactly `/Users/kristian/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 80`.
+
+Do not run setup commands during bootstrap. Do not read the full `program.md` unless explicitly asked.
+"""
+
+
+def program_md_for_profile(profile: dict[str, Any]) -> str:
+    return program_md() if is_speed_profile(profile) else generic_program_md(profile)
+
+
+def load_profile(root: Path) -> dict[str, Any]:
+    path = root / "research-profile.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        value = DEFAULT_RESEARCH_PROFILE
+    return value if isinstance(value, dict) else DEFAULT_RESEARCH_PROFILE
+
+
+def generic_initial_tasks(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    name = str(profile.get("name") or "research")
+    topic = str(profile.get("source_topic") or name)
+    objective = str(profile.get("objective") or "research active objective")
+    return [
+        {
+            "id": f"{name}-source-scout",
+            "status": "ready",
+            "lane": "source-scout",
+            "task_type": "supervisor",
+            "supervisor_action": "source-scout",
+            "target": "sources/queue.md",
+            "hypothesis": f"high-quality sources should ground the objective: {objective}",
+            "metric": "source_quality",
+            "next_action": f"/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic {topic}",
+            "acceptance": "A source-scout artifact records fetched/skipped references and one concrete next-source gap.",
+        },
+        {
+            "id": f"{name}-quality-review",
+            "status": "ready",
+            "lane": "safety",
+            "task_type": "supervisor",
+            "supervisor_action": "quality-review",
+            "target": "results.tsv",
+            "hypothesis": "modular research must measure quality before implementation",
+            "metric": "quality_score",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 80",
+            "acceptance": "A quality artifact states continue/pivot/repair with evidence.",
+        },
+        {
+            "id": f"{name}-frontier-synthesis",
+            "status": "ready",
+            "lane": "hypothesis",
+            "task_type": "supervisor",
+            "supervisor_action": "synthesize",
+            "target": "STRATEGY.md",
+            "hypothesis": "evidence should become one ranked next action, not broad wandering",
+            "metric": "implementation_readiness",
+            "next_action": "/Users/kristian/.openclaw/bin/openclaw-speed-research synthesize --kind frontier",
+            "acceptance": "One bounded next task is seeded or an exhaustion reason is recorded.",
+        },
+    ]
+
+
+def seed_generic_task_queue(root: Path, profile: dict[str, Any], *, replace_speed_defaults: bool) -> None:
+    tasks_path = root / "tasks.jsonl"
+    tasks = read_jsonl(tasks_path)
+    speed_markers = {"mtp-decode", "drafter-alignment", "frontier-dflash", "production-mtp", "runtime-overhead"}
+    filtered_tasks = [
+        task
+        for task in tasks
+        if not (
+            task.get("status", "ready") in {"ready", "rework"}
+            and (
+                str(task.get("lane", "")) in speed_markers
+                or "drafter" in str(task.get("next_action", "")).lower()
+                or "decode-sample" in str(task.get("next_action", "")).lower()
+                or "mtp-report" in str(task.get("next_action", "")).lower()
+            )
+        )
+    ]
+    if len(filtered_tasks) != len(tasks):
+        write_jsonl(tasks_path, filtered_tasks)
+        tasks = filtered_tasks
+    should_replace = replace_speed_defaults or not tasks
+    if not should_replace:
+        ready = [task for task in tasks if task.get("status", "ready") in {"ready", "rework"}]
+        if ready and all(str(task.get("lane", "")) in speed_markers for task in ready[:8]):
+            should_replace = True
+    if should_replace:
+        write_jsonl(tasks_path, generic_initial_tasks(profile))
+    else:
+        upsert_tasks(root, generic_initial_tasks(profile))
+
+
+def write_generic_strategy(root: Path, profile: dict[str, Any]) -> None:
+    title = profile.get("title") or profile.get("name") or "OpenClaw Autoresearch"
+    objective = profile.get("objective") or "Research the active objective."
+    metrics = profile.get("metrics", {}) if isinstance(profile.get("metrics"), dict) else {}
+    lanes = (profile.get("scope", {}) if isinstance(profile.get("scope"), dict) else {}).get("allowed_lanes", [])
+    text = f"""# Strategy
+
+Objective: {objective}
+
+## Current Best Understanding
+
+- Research profile: {title}
+- Primary metrics: {', '.join(metrics.get('primary', []) or GENERIC_PRIMARY_METRICS)}
+- Allowed lanes: {', '.join(lanes or GENERIC_ALLOWED_LANES)}
+
+## Top Hypotheses
+
+1. High-quality sources and explicit evidence should come before implementation.
+2. Each cycle should produce a result row, finding, hypothesis, or gated implementation candidate.
+3. Exhausted lanes should be retired and routed to the next allowed lane.
+
+## Rejected Or Exhausted
+
+- Repeated synthesis without new evidence is noise.
+- Broad local search is not allowed.
+
+## Current Synthesis
+
+Start with source grounding, then move to one bounded experiment or implementation gate that directly serves the active objective.
+"""
+    write_if_changed(root / "STRATEGY.md", text)
+
+
+def generic_readme_md(profile: dict[str, Any]) -> str:
+    title = profile.get("title") or profile.get("name") or "OpenClaw Autoresearch"
+    objective = profile.get("objective") or "Research the active objective."
+    return f"""# OpenClaw Modular Research Workspace
+
+Profile: {title}
+
+Objective: {objective}
+
+This workspace uses the OpenClaw autoresearch supervisor for a custom topic. The same deterministic safety gates, result ledger, source queue, implementation handoff, and self-improvement checks apply, but the objective/metrics/lanes come from `research-profile.json`.
+
+Useful commands:
+
+```bash
+openclaw research-setup
+openclaw research-add-source "https://example.com" --kind url --title "Example"
+openclaw research --max-hours 4 --cycles 80
+```
+
+Keep the runtime workspace out of git. Source changes belong in the setup repository and must pass canary tests before promotion.
+"""
+
+
 def readme_md() -> str:
     return """# OpenClaw Speed Research Workspace
 
@@ -1151,7 +1478,40 @@ The canary must include actionable side information from actual failures, explic
 
 
 def prompt_text(root: Path) -> str:
+    profile = load_profile(root)
     compact_workspace(root)
+    if not is_speed_profile(profile):
+        (root / "research-profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        seed_generic_task_queue(root, profile, replace_speed_defaults=False)
+        title = profile.get("title") or profile.get("name") or "OpenClaw Autoresearch"
+        objective = profile.get("objective") or "Research the active objective with evidence-first experiments."
+        source_topic = profile.get("source_topic") or slugify(title)
+        return f"""OpenClaw Modular Autoresearch bootstrap.
+
+Workspace: {root}
+
+Research profile: {title}
+Objective: {objective}
+
+First assistant action: read exactly:
+`{root / 'RUN_MEMORY.md'}`
+
+Then read exactly:
+`{root / 'SUMMARY.md'}`
+
+Then choose exactly one bounded next action from:
+- read `{root / 'sources' / 'queue.md'}`
+- run `/Users/kristian/.openclaw/bin/openclaw-speed-research source-scout --topic {source_topic}`
+- run `/Users/kristian/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 80`
+
+Hard constraints:
+- OpenClaw only. Do not touch opencode.
+- Stay inside the active research profile.
+- Continue the loop without asking me to manually continue.
+- Use one narrow tool call per assistant turn.
+- Never use broad local search commands.
+- Do not run setup commands during bootstrap.
+"""
     return f"""OpenClaw Speed Autoresearch bootstrap.
 
 Workspace: {root}
@@ -1200,34 +1560,50 @@ def ensure_optional_self_improvement_state(root: Path) -> None:
 
 
 def setup_workspace(args: argparse.Namespace) -> int:
+    if getattr(args, "workspace", ""):
+        os.environ["OPENCLAW_RESEARCH_DIR"] = str(getattr(args, "workspace"))
     root = workspace_root()
+    was_new_workspace = not root.exists()
     root.mkdir(parents=True, exist_ok=True)
     ensure_research_state(root)
+    profile = research_profile_from_args(args)
+    profile_path = root / "research-profile.json"
+    existing_profile = load_profile(root)
+    if not is_speed_profile(profile) or was_new_workspace or is_speed_profile(existing_profile):
+        profile_path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    else:
+        profile = existing_profile
     ensure_optional_self_improvement_state(root)
     ensure_lane_contracts(root)
+    if not is_speed_profile(profile):
+        seed_generic_task_queue(root, profile, replace_speed_defaults=was_new_workspace)
     (root / "sources").mkdir(exist_ok=True)
     clone_status = clone_or_update_reference(root, args.repo_url)
-    write_if_changed(root / "program.md", program_md())
+    write_if_changed(root / "program.md", program_md_for_profile(profile))
     remove_section(root / "program.md", "Starting Point")
-    upsert_section(root / "program.md", "Research Method", research_method_section())
-    upsert_section(root / "program.md", "Bootstrap Ladder", bootstrap_ladder_section())
-    upsert_section(root / "program.md", "Narrow Tool Catalog", narrow_tool_catalog_section())
-    upsert_section(root / "program.md", "Current Priority", current_priority_section())
-    upsert_section(root / "program.md", "Frontier Speed Track", frontier_speed_track_section())
-    ensure_section(root / "program.md", "## Tool Discipline", tool_discipline_section())
-    upsert_section(root / "program.md", "Realistic Experiment Backlog", realistic_experiment_backlog_section())
-    upsert_section(root / "program.md", "Speed Targets", speed_targets_section())
-    upsert_section(root / "program.md", "Implementation Gate", implementation_gate_section())
-    upsert_section(root / "program.md", "Dynamic Policy Optimization", dynamic_policy_optimization_section())
-    refresh_strategy_objective(root / "STRATEGY.md")
-    upsert_section(root / "STRATEGY.md", "Current Best Understanding", strategy_current_best_section())
-    upsert_section(root / "STRATEGY.md", "Top Hypotheses", strategy_top_hypotheses_section())
-    upsert_section(root / "STRATEGY.md", "Rejected Or Exhausted", strategy_rejected_section())
-    upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_current_synthesis_section())
-    upsert_section(root / "STRATEGY.md", "Decode MTP Focus", strategy_decode_focus_section())
-    write_if_changed(root / "README-openclaw-speed.md", readme_md())
+    if is_speed_profile(profile):
+        upsert_section(root / "program.md", "Research Method", research_method_section())
+        upsert_section(root / "program.md", "Bootstrap Ladder", bootstrap_ladder_section())
+        upsert_section(root / "program.md", "Narrow Tool Catalog", narrow_tool_catalog_section())
+        upsert_section(root / "program.md", "Current Priority", current_priority_section())
+        upsert_section(root / "program.md", "Frontier Speed Track", frontier_speed_track_section())
+        ensure_section(root / "program.md", "## Tool Discipline", tool_discipline_section())
+        upsert_section(root / "program.md", "Realistic Experiment Backlog", realistic_experiment_backlog_section())
+        upsert_section(root / "program.md", "Speed Targets", speed_targets_section())
+        upsert_section(root / "program.md", "Implementation Gate", implementation_gate_section())
+        upsert_section(root / "program.md", "Dynamic Policy Optimization", dynamic_policy_optimization_section())
+        refresh_strategy_objective(root / "STRATEGY.md")
+        upsert_section(root / "STRATEGY.md", "Current Best Understanding", strategy_current_best_section())
+        upsert_section(root / "STRATEGY.md", "Top Hypotheses", strategy_top_hypotheses_section())
+        upsert_section(root / "STRATEGY.md", "Rejected Or Exhausted", strategy_rejected_section())
+        upsert_section(root / "STRATEGY.md", "Current Synthesis", strategy_current_synthesis_section())
+        upsert_section(root / "STRATEGY.md", "Decode MTP Focus", strategy_decode_focus_section())
+        write_if_changed(root / "README-openclaw-speed.md", readme_md())
+    else:
+        write_generic_strategy(root, profile)
+        write_if_changed(root / "README-openclaw-research.md", generic_readme_md(profile))
     write_if_changed(root / "implementation-skill.md", implementation_skill_md())
-    write_if_missing(root / "ideas.md", "# Speed Research Ideas\n\n")
+    write_if_missing(root / "ideas.md", f"# {profile.get('title') or profile.get('name')} Ideas\n\n")
     write_if_missing(
         root / "sources" / "queue.md",
         "# Research Source Queue\n\n"
@@ -1241,6 +1617,9 @@ def setup_workspace(args: argparse.Namespace) -> int:
         "logs/\nbenchmarks/*.json\nexperiments/*.json\n*.tmp\n",
     )
     compact_workspace(root)
+    if not is_speed_profile(profile):
+        profile_path.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        seed_generic_task_queue(root, profile, replace_speed_defaults=False)
     print(root)
     print(clone_status)
     return 0
@@ -13538,6 +13917,15 @@ def main() -> int:
 
     setup = sub.add_parser("setup")
     setup.add_argument("--repo-url", default=DEFAULT_REPO_URL)
+    setup.add_argument("--workspace", default="")
+    setup.add_argument("--name", default="")
+    setup.add_argument("--objective", default="")
+    setup.add_argument("--product", default="")
+    setup.add_argument("--source-topic", default="")
+    setup.add_argument("--primary-metric", action="append", default=[])
+    setup.add_argument("--secondary-metric", action="append", default=[])
+    setup.add_argument("--lane", action="append", default=[])
+    setup.add_argument("--forbidden", action="append", default=[])
     setup.set_defaults(func=setup_workspace)
 
     self_improve_parser = sub.add_parser("self-improve")

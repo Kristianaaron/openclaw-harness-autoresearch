@@ -270,6 +270,10 @@ of them.
 
 ## Running Autoresearch
 
+Autoresearch is now profile-driven. The historical speed workflow is still the
+default preset, but any topic can define its own workspace, objective, metrics,
+lanes, and source queue through `research-profile.json`.
+
 Short run:
 
 ```bash
@@ -294,6 +298,34 @@ Runtime evidence is written under the OpenClaw research workspace:
 ```
 
 That runtime workspace is intentionally not committed to this repo.
+
+Generic topic run:
+
+```bash
+OPENCLAW_RESEARCH_NAME="design-wiki" \
+OPENCLAW_RESEARCH_OBJECTIVE="Build a high-taste design reference wiki with evidence-backed source notes." \
+OPENCLAW_RESEARCH_PRIMARY_METRICS="source_quality,coverage,actionability" \
+OPENCLAW_RESEARCH_LANES="source-scout,evidence-map,implementation-gate,safety" \
+openclaw research --max-hours 4 --cycles 80
+```
+
+Useful generic aliases:
+
+```bash
+openclaw research-setup
+openclaw research-prompt
+openclaw research-add-source "https://example.com" --kind url --title "Example"
+openclaw research-watchdog --allow-degraded
+```
+
+Generic workspaces live at:
+
+```text
+~/.openclaw/research/<OPENCLAW_RESEARCH_NAME slug>
+```
+
+Use `OPENCLAW_RESEARCH_DIR=/absolute/path` when you need an explicit workspace.
+The speed commands remain compatibility aliases for the `speed` profile.
 
 ## Health And Quality Checks
 

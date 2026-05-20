@@ -154,6 +154,10 @@ _openclaw_sync_speed_research_helpers() {
   rc=$?
   [[ "$rc" -eq 1 ]] && return 1
   [[ "$rc" -eq 2 ]] && changed=1
+  _openclaw_sync_file_if_changed "$openclaw_harness_src/openclaw-autoresearch-watchdog.py" "$speed_research_watchdog" 755
+  rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  [[ "$rc" -eq 2 ]] && changed=1
   if [[ "$changed" == "1" ]]; then
     echo "OpenClaw speed research helpers synced from $openclaw_harness_src"
   fi
@@ -401,17 +405,17 @@ case "${1:-}" in
     "$HOME/.openclaw/bin/openclaw-local-health"
     return $?
     ;;
-  speed-research-setup|research-speed-setup)
+  speed-research-setup|research-speed-setup|research-setup|autoresearch-setup)
     _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" setup
     return $?
     ;;
-  speed-research-prompt|research-speed-prompt)
+  speed-research-prompt|research-speed-prompt|research-prompt|autoresearch-prompt)
     _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" prompt
     return $?
     ;;
-  speed-research-benchmark|research-speed-benchmark)
+  speed-research-benchmark|research-speed-benchmark|research-benchmark|autoresearch-benchmark)
     shift
     _openclaw_sync_speed_research_helpers || return $?
     if ! _openclaw_has_arg_prefix "--help" "$@" && ! _openclaw_has_arg_prefix "-h" "$@"; then
@@ -423,24 +427,24 @@ case "${1:-}" in
     "$speed_research" benchmark "$@"
     return $?
     ;;
-  speed-research-add-source|research-speed-add-source)
+  speed-research-add-source|research-speed-add-source|research-add-source|autoresearch-add-source)
     shift
     _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" add-source "$@"
     return $?
     ;;
-  speed-research-self-improve|research-speed-self-improve)
+  speed-research-self-improve|research-speed-self-improve|research-self-improve|autoresearch-self-improve)
     shift
     _openclaw_sync_speed_research_helpers || return $?
     "$speed_research" self-improve "$@"
     return $?
     ;;
-  speed-research-watchdog|research-speed-watchdog)
+  speed-research-watchdog|research-speed-watchdog|research-watchdog|autoresearch-watchdog)
     shift
     "$speed_research_watchdog" "$@"
     return $?
     ;;
-  speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui)
+  speed-research|research-speed|speed-research-auto|research-speed-auto|speed-research-overnight|research-speed-overnight|speed-research-tui|research-speed-tui|research|autoresearch|research-auto|autoresearch-auto|research-overnight|autoresearch-overnight|research-tui|autoresearch-tui)
     _openclaw_sync_speed_research_helpers || return $?
     case "${2:-}" in
       setup|prompt|benchmark|record|synthesize|compact|self-improve)
@@ -513,7 +517,7 @@ case "${1:-}" in
     openclaw_cleanup_gateway=1
     _openclaw_stop_gateway_owned
     _openclaw_start_gateway_once || return $?
-    if [[ "$openclaw_mode" == "speed-research-tui" || "$openclaw_mode" == "research-speed-tui" ]]; then
+    if [[ "$openclaw_mode" == "speed-research-tui" || "$openclaw_mode" == "research-speed-tui" || "$openclaw_mode" == "research-tui" || "$openclaw_mode" == "autoresearch-tui" ]]; then
       openclaw_args=("tui" "--session" "$speed_research_session" "--history-limit" "${OPENCLAW_SPEED_RESEARCH_HISTORY_LIMIT:-1}" "--timeout-ms" "${OPENCLAW_SPEED_RESEARCH_TIMEOUT_MS:-900000}" "--message" "$research_prompt")
     else
       shift
