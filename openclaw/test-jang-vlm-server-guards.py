@@ -150,6 +150,45 @@ def test_dflash_adapter_and_kwargs() -> None:
                 os.environ[key] = value
 
 
+def test_mtp_fast_sampler_defaults() -> None:
+    old_draft = server.DRAFT_MODEL
+    old_backend = server.DRAFT_BACKEND
+    old_env = {
+        key: os.environ.get(key)
+        for key in (
+            "OPENCLAW_JANG_DEFAULT_TEMPERATURE",
+            "OPENCLAW_JANG_REPETITION_PENALTY",
+            "OPENCLAW_JANG_TOP_P",
+            "OPENCLAW_JANG_PREFILL_STEP_SIZE",
+        )
+    }
+    try:
+        server.DRAFT_MODEL = object()
+        server.DRAFT_BACKEND = "mtp"
+        for key in old_env:
+            os.environ.pop(key, None)
+        kwargs = server.generation_kwargs({"max_tokens": 32})
+        assert kwargs["temperature"] == 0.0
+        assert kwargs["top_p"] == 1.0
+        assert kwargs["repetition_penalty"] == 1.0
+        assert kwargs["prefill_step_size"] == 2048
+        assert server.generation_kwargs({"max_tokens": 32, "top_p": 0.75})["top_p"] == 0.75
+
+        os.environ["OPENCLAW_JANG_TOP_P"] = "0.95"
+        os.environ["OPENCLAW_JANG_PREFILL_STEP_SIZE"] = "4096"
+        kwargs = server.generation_kwargs({"max_tokens": 32})
+        assert kwargs["top_p"] == 0.95
+        assert kwargs["prefill_step_size"] == 4096
+    finally:
+        server.DRAFT_MODEL = old_draft
+        server.DRAFT_BACKEND = old_backend
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_logit_bias_draft_wrapper() -> None:
     class FakeConfig:
         vocab_size = 4
@@ -228,5 +267,6 @@ if __name__ == "__main__":
     test_json_tool_call()
     test_reasoning_and_loop_guards()
     test_dflash_adapter_and_kwargs()
+    test_mtp_fast_sampler_defaults()
     test_logit_bias_draft_wrapper()
     print("ok")

@@ -415,10 +415,14 @@ def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "OPENCLAW_JANG_REPETITION_PENALTY",
         1.0 if DRAFT_MODEL is not None else 1.05,
     )
+    default_top_p = env_float(
+        "OPENCLAW_JANG_TOP_P",
+        1.0 if DRAFT_MODEL is not None else 0.9,
+    )
     kwargs: dict[str, Any] = {
         "max_tokens": max_tokens,
         "temperature": float(payload.get("temperature") if payload.get("temperature") is not None else default_temperature),
-        "top_p": float(payload.get("top_p") if payload.get("top_p") is not None else 0.9),
+        "top_p": float(payload.get("top_p") if payload.get("top_p") is not None else default_top_p),
         "repetition_penalty": float(
             payload.get("repetition_penalty")
             if payload.get("repetition_penalty") is not None
