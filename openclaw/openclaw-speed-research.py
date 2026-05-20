@@ -32,6 +32,7 @@ from openclaw_speed_research_core import (
     benchmark_result_schema_ok,
     benchmark_spec,
     block_operational_strategy_ready_tasks,
+    calibration_chain_detour_reason,
     causal_review_report,
     decode_measurement_signal,
     ensure_research_state,
@@ -6247,6 +6248,8 @@ def filter_seedable_tasks(root: Path, tasks: list[dict[str, Any]]) -> list[dict[
         if adapter_loop_saturated and is_adapter_logit_loop_task(task):
             continue
         if bottleneck_state["state"] != "no_terminal_quantized_blocker" and is_generic_frontier_escape_task(task):
+            continue
+        if calibration_chain_detour_reason(root, task):
             continue
         if has_active_calibration_stage and (
             action == "drafter-calibration-canary" or "drafter-calibration-canary" in task_id

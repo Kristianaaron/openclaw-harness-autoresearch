@@ -1618,6 +1618,9 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         return "bounded drafter calibration run is already ready; execute it before advisory deliberation"
     if is_calibration_canary_task(task) and active_task_prefix_exists(root, "drafter-calibration-run-"):
         return "bounded drafter calibration run is already ready; do not reseed calibration canary"
+    calibration_detour = calibration_chain_detour_reason(root, task)
+    if calibration_detour:
+        return calibration_detour
     if (
         recent_calibration_rejected_no_lift(
             root,
@@ -2618,6 +2621,50 @@ def has_active_calibration_memory_stage(root: Path) -> bool:
     )
 
 
+def calibration_chain_detour_reason(root: Path, task: dict[str, Any]) -> str:
+    """Block work that would steal ownership from staged drafter calibration.
+
+    The drafter-fit path has ordered prerequisites. Once a memory-stage task is
+    ready, decode remeasurement and advisory synthesis are noise until that
+    stage advances, completes, or records a terminal blocker.
+    """
+
+    if not has_active_calibration_memory_stage(root):
+        return ""
+    if is_calibration_memory_stage_task(task):
+        return ""
+    task_id = str(task.get("id", ""))
+    action = str(task.get("supervisor_action", ""))
+    lane = lane_key_for_task(task)
+    benchmark_mode = str(task.get("benchmark_mode", ""))
+    next_action = str(task.get("next_action", "")).lower()
+    if is_calibration_canary_task(task):
+        return "calibration memory-stage chain is active; stale canary reseeding is noise"
+    if benchmark_mode == "decode-sample" or "decode-remeasure" in task_id or "benchmark --mode decode-sample" in next_action:
+        return "calibration memory-stage chain is active; decode remeasure waits for staged calibration outcome"
+    if lane in {
+        "runtime-overhead",
+        "frontier-dflash",
+        "frontier-deliberation",
+        "frontier-expansion",
+        "production-mtp",
+        "policy-optimization",
+    }:
+        return f"calibration memory-stage chain is active; {lane} waits for staged calibration outcome"
+    if action in {
+        "runtime-overhead-map",
+        "mtp-report",
+        "source-scout",
+        "dflash-compatibility-gate",
+        "frontier-deliberation",
+        "implementation-bridge",
+    }:
+        return f"calibration memory-stage chain is active; {action} waits for staged calibration outcome"
+    if any(token in task_id for token in ("source-scout", "mtp-report", "handoff-deliberation", "dflash-compatibility")):
+        return "calibration memory-stage chain is active; advisory/fallback detours wait"
+    return ""
+
+
 def gepa_decision_score(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     """Deterministic GEPA-style pre-selection score.
 
@@ -2651,6 +2698,14 @@ def gepa_decision_score(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     elif owner_ready and lane in {"frontier-deliberation", "frontier-expansion", "policy-optimization"}:
         score -= 70
         reasons.append("advisory work waits while concrete progress owner is ready")
+
+    if has_active_calibration_memory_stage(root):
+        if is_calibration_memory_stage_task(task):
+            score += 280
+            reasons.append("active staged calibration owns the next action")
+        elif calibration_chain_detour_reason(root, task):
+            score -= 320
+            reasons.append("staged calibration lock suppresses decode/advisory detours")
 
     not_progress = [str(item).lower() for item in progress.get("not_progress", [])] if isinstance(progress, dict) else []
     if key in {
@@ -2728,6 +2783,10 @@ def score_task(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     elif is_calibration_canary_task(task) and has_active_calibration_memory_stage(root):
         score -= 90
         reasons.append("calibration canary is suppressed while a memory-stage task is ready")
+    detour_reason = calibration_chain_detour_reason(root, task)
+    if detour_reason:
+        score -= 240
+        reasons.append(detour_reason)
     if "tests_pass" in guard_checks:
         score += 4
     if "memory_gate" in guard_checks or "memory_ok" in guard_checks:
@@ -3313,12 +3372,12 @@ def select_next_task(root: Path) -> dict[str, Any] | None:
             return None
     if not filtered:
         return None
+    stage_ready = [task for task in filtered if is_calibration_memory_stage_task(task)]
+    if stage_ready:
+        filtered = stage_ready
     contract_clean = [task for task in filtered if not task_contract_issues(root, task)["blockers"]]
     if contract_clean:
         filtered = contract_clean
-    stage_ready = [task for task in filtered if is_calibration_memory_stage_task(task)]
-    if stage_ready:
-        filtered = [task for task in filtered if not is_calibration_canary_task(task)]
     journal = read_jsonl(root / "journal.jsonl")
     lane_scores: dict[str, float] = {}
     for entry in journal[-250:]:

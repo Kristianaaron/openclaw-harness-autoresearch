@@ -956,13 +956,27 @@ def main() -> int:
                     "stage": "metadata",
                     "next_action": "openclaw-speed-research drafter-calibration-memory-stage --stage metadata",
                 },
+                {
+                    "id": "handoff-audit-decode-remeasure-after-calibration-block-test",
+                    "status": "ready",
+                    "priority": 140,
+                    "lane": "runtime-overhead",
+                    "task_type": "supervisor",
+                    "benchmark_mode": "decode-sample",
+                    "next_action": "openclaw-speed-research benchmark --mode decode-sample",
+                },
             ],
         )
         assert helper.select_next_task(helper.WORKSPACE)["id"] == "drafter-calibration-memory-stage-metadata-test"
         assert helper.suppress_ready_calibration_canaries("unit-test-stage-ready", {"status": "keep"}) == 1
-        assert all(
-            task["status"] == "done" or task["id"] == "drafter-calibration-memory-stage-metadata-test"
-            for task in helper.read_jsonl(helper.TASKS)
+        queue_after_stage_lock = helper.read_jsonl(helper.TASKS)
+        assert any(
+            task["id"] == "review-drafter-calibration-canary-test" and task["status"] == "done"
+            for task in queue_after_stage_lock
+        )
+        assert any(
+            task["id"] == "drafter-calibration-memory-stage-metadata-test" and task["status"] == "ready"
+            for task in queue_after_stage_lock
         )
         for index in range(2):
             helper.append_result(

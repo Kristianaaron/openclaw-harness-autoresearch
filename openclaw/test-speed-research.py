@@ -2703,6 +2703,21 @@ def main() -> int:
                 123466,
                 reason="unit-test dflash blocked with active calibration stage",
             ) == []
+            decode_detour = helper.lane_contract_decode_task(
+                123467,
+                task_id="handoff-audit-decode-remeasure-after-calibration-block-123467",
+                priority=120,
+                reason="unit-test stale handoff fallback",
+            )
+            assert helper.filter_seedable_tasks(root, [decode_detour]) == []
+            blocker = core.task_operational_blocker(root, decode_detour)
+            assert "calibration memory-stage chain is active" in blocker
+            helper.write_jsonl(root / "tasks.jsonl", [*helper.read_jsonl(root / "tasks.jsonl"), decode_detour])
+            selected = core.select_next_task(root)
+            assert selected is not None
+            assert selected["id"] == "drafter-calibration-memory-stage-metadata-ready"
+            ranked = {item["task_id"]: item for item in core.rank_tasks(root, limit=100)}
+            assert ranked["drafter-calibration-memory-stage-metadata-ready"]["score"] > ranked[decode_detour["id"]]["score"]
             helper.write_jsonl(root / "tasks.jsonl", [])
             helper.append_result(
                 root,
