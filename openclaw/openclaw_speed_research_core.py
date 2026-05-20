@@ -1604,6 +1604,8 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
         or task_id.startswith("agent-deliberation-quant-safe-drafter-candidate-")
     ):
         return "all material drafter candidates are exhausted; route to frontier expansion or external candidate-family search"
+    if material_candidates_exhausted and task_id.startswith("agent-deliberation-handoff-deliberation-"):
+        return "material drafter candidates are exhausted; run the frontier expansion breakout instead of stale handoff deliberation"
     if adapter_method_implementation_completed(root) and (
         task_id.startswith(("implementation-drafter-adapter-method-", "drafter-adapter-method-contract-"))
         or action in {"drafter-adapter-method-contract"}
@@ -1632,17 +1634,27 @@ def task_operational_blocker(root: Path, task: dict[str, Any], *, memory: dict[s
     if state.get("state") == "waiting_for_prerequisite":
         return str(state.get("reason") or f"semantic task is waiting for prerequisite: {key}")
     progress_path = root / "progress-memory.json"
-    if progress_path.exists() and key in {
-        "frontier-deliberation:source-scout:source_evidence_count",
-        "production-mtp:mtp-report:mean_accept",
-    }:
+    if progress_path.exists():
         progress = read_json(progress_path, {})
         bottleneck = progress.get("current_bottleneck", {}) if isinstance(progress, dict) else {}
         not_progress = progress.get("not_progress", []) if isinstance(progress, dict) else []
         next_step = str(bottleneck.get("next_step", ""))
         stale_escape_named = any("source-scout or MTP reports" in str(item) for item in not_progress)
-        if next_step == "seed_frontier_deliberation_escape" and stale_escape_named:
+        if (
+            key
+            in {
+                "frontier-deliberation:source-scout:source_evidence_count",
+                "production-mtp:mtp-report:mean_accept",
+            }
+            and next_step == "seed_frontier_deliberation_escape"
+            and stale_escape_named
+        ):
             return "progress memory requires a quant-safe drafter candidate, not source-scout/MTP reseeding"
+        if (
+            next_step == "seed_frontier_expansion_after_material_exhaustion"
+            and task_id.startswith("agent-deliberation-handoff-deliberation-")
+        ):
+            return "progress memory requires material-exhaustion frontier expansion, not stale handoff deliberation"
     return ""
 
 

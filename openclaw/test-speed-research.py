@@ -533,6 +533,46 @@ def main() -> int:
                     ("agent-deliberation-source-scout-", "agent-deliberation-mtp-acceptance-yield-")
                 )
             )
+            material_progress_root = Path(tmp) / "progress-memory-material-exhaustion"
+            helper.ensure_research_state(material_progress_root)
+            (material_progress_root / "progress-memory.json").write_text(
+                json.dumps(
+                    {
+                        "current_bottleneck": {"next_step": "seed_frontier_expansion_after_material_exhaustion"},
+                        "not_progress": ["Repeating handoff deliberation after material candidates are exhausted."],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stale_handoff = helper.agent_deliberation_task(
+                132,
+                slug="handoff-deliberation",
+                priority=94,
+                target="openclaw/openclaw-speed-research.py",
+                hypothesis="unit stale handoff should not outrank the material-exhaustion route",
+                acceptance="unit",
+                evidence={},
+            )
+            breakout = helper.material_exhaustion_breakout_task(132, evidence={"unit": True})
+            assert helper.task_operational_blocker(material_progress_root, stale_handoff)
+            assert not helper.task_operational_blocker(material_progress_root, breakout)
+            assert helper.material_progress_task_rank(breakout) > helper.material_progress_task_rank(stale_handoff)
+            helper.write_jsonl(material_progress_root / "tasks.jsonl", [stale_handoff, breakout])
+            assert helper.block_operational_strategy_ready_tasks(material_progress_root) >= 1
+            material_tasks = helper.read_jsonl(material_progress_root / "tasks.jsonl")
+            assert any(
+                task["id"] == stale_handoff["id"]
+                and task.get("status") == "blocked"
+                and "material-exhaustion frontier expansion" in task.get("blocked_reason", "")
+                for task in material_tasks
+            )
+            material_ready = [
+                task
+                for task in material_tasks
+                if task.get("status") in {"ready", "rework"}
+                and task["id"] in {stale_handoff["id"], breakout["id"]}
+            ]
+            assert [task["id"] for task in material_ready] == [breakout["id"]]
             quant_safe_route_root = Path(tmp) / "quant-safe-route"
             quant_safe_home = Path(tmp) / "quant-safe-home"
             trace_dir = quant_safe_home / "drafter-fit"

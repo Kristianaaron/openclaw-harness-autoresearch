@@ -2625,6 +2625,7 @@ def breakthrough_progress_context(
         for task in read_jsonl(root / "tasks.jsonl")
         if task.get("status", "ready") in {"ready", "rework"}
         and is_deterministic_research_task(task)
+        and not task_operational_blocker(root, task)
     ]
     first_ready = ready[0] if ready else {}
     achieved = bool(best_live_tps is not None and best_live_tps >= target_tps and speed.get("paired_live_candidate_evidence"))
@@ -2740,7 +2741,14 @@ def material_progress_task_rank(task: dict[str, Any]) -> int:
     metric = str(task.get("metric", ""))
     target = str(task.get("target", ""))
     next_action = str(task.get("next_action", ""))
-    if task_id.startswith("frontier-expansion-source-grounded-drafter-family-"):
+    if task_id.startswith(
+        (
+            "frontier-expansion-material-exhaustion-breakout-",
+            "frontier-expansion-source-grounded-drafter-family-",
+        )
+    ):
+        return 5
+    if task_id.startswith("frontier-expansion-drafter-family-source-scout-"):
         return 4
     if (
         task.get("benchmark_mode") == "decode-sample"
