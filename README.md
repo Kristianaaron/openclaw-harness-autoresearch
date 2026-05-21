@@ -1,305 +1,85 @@
 # OpenClaw Harness Autoresearch
 
-OpenClaw-only local harness hardening for Gemma 4 31B JANG/JANQ on Apple Silicon.
+A hardened OpenClaw-only research harness for local agent work on Apple Silicon.
 
-This repository contains the OpenClaw model profile layer, local MLX/JANG launchers,
-model proxy guardrails, prefix warming, memory gates, deterministic benchmarking,
-and an autonomous speed autoresearch supervisor. The primary objective is to make
-normal `openclaw tui` use faster and more reliable without touching opencode.
+The project started as a local speed/reliability harness for OpenClaw running
+Gemma 4 JANG/JANQ, then grew into a modular autoresearch system. It keeps
+Karpathy-style autoresearch at the core: small experiments, evidence-first
+notes, TSV logs, and keep/discard decisions. On top of that, it adds production
+guardrails for local LLM agents: memory gates, deterministic supervisors,
+quality reviewers, implementation handoff, rollback rules, and modular research
+profiles.
 
-## Scope
+It does **not** manage opencode.
 
-- OpenClaw only. No opencode configuration, runtime files, or behavior changes.
-- Model/profile-driven backend selection, so backend details stay outside the
-  gateway and TUI.
-- Local Apple Silicon MLX/JANG reliability and speed experiments.
-- Current optimization focus: Gemma 4 31B JANG/JANQ decode speed, MTP/drafter
-  acceptance, DFlash compatibility, and perceived latency.
-- Sensitive runtime state stays outside the repo under the user's OpenClaw home
-  and is ignored by Git.
+## What This Adds To Karpathy Autoresearch
+
+Karpathy's `autoresearch` pattern is the base loop:
+
+```text
+question -> experiment -> result -> keep/discard -> next question
+```
+
+This repo adds the harness needed to run that loop safely inside a local
+OpenClaw agent setup:
+
+| Layer | Added Capability |
+| --- | --- |
+| Runtime safety | macOS memory/Metal/Python crash gates before heavy local model work |
+| Supervisor | deterministic task routing before model-bound reasoning |
+| Evidence ledger | `results.tsv`, JSONL findings, benchmark artifacts, compact summaries |
+| Quality review | scorecards for noise, duplicate work, evidence quality, and next actions |
+| Implementation handoff | canary patches, allowlists, rollback checks, secret/path scans |
+| Self-improvement | advisory lessons, skill variants, shadow review, rollback records |
+| Modular profiles | research any topic by swapping objective, metrics, lanes, and sources |
+| Watchdog | independent health/quality reviewer that can detect stalls and stale locks |
+
+## System Flow
+
+```mermaid
+flowchart TD
+    A["Research Profile"] --> B["Program + Strategy"]
+    B --> C["Autopilot Supervisor"]
+    C --> D{"Deterministic Task?"}
+    D -->|yes| E["Benchmark / Review / Source Scout"]
+    D -->|no| F["Bounded Agent Turn"]
+    E --> G["Evidence Artifacts"]
+    F --> G
+    G --> H["Quality + Frontier Review"]
+    H --> I{"Safe To Implement?"}
+    I -->|no| J["Refocus / Retire Lane / Record Blocker"]
+    I -->|yes| K["Patch Canary"]
+    K --> L{"Promotion Gates Pass?"}
+    L -->|yes| M["Promote + Mark Stable"]
+    L -->|no| N["Reject / Roll Back / Quarantine"]
+    J --> C
+    M --> C
+    N --> C
+```
 
 ## Key Features
 
-### Model And Runtime Layer
+### Model And Runtime Guardrails
 
-- OpenClaw model profiles describe backend type, ports, health URLs, server
-  commands, logs, and memory class.
-- Gateway remains model-agnostic; the active model profile decides which local
-  backend should run.
-- Launch wrappers start only the OpenClaw-owned backend that is needed.
-- Memory gates check macOS free memory, compressor, swap, and pressure before
-  launching or continuing large local MLX work.
-- Interrupt handling writes a checkpoint and stops OpenClaw-owned model
-  processes so memory can be released cleanly after `Ctrl+C`.
+- Profile-driven model backend selection.
+- OpenClaw gateway stays model-agnostic.
+- Launchers start only the needed OpenClaw-owned backend.
+- Memory gates check free memory, compressor, swap, and pressure.
+- Interrupt handling writes a neutral checkpoint and stops owned processes.
+- Large prompt/tool contexts are preflighted before local MLX execution.
 
-### Proxy Guardrails
+### Proxy And TUI Safety
 
-- SSE deadlines and idle watchdogs prevent silent stream hangs.
-- Tool-call and reasoning streams are separated and bounded.
-- Repeated `thought`, reasoning marker, and malformed tool-call patterns are
-  detected before they can flood the TUI.
-- Broad local tool commands are blocked or routed toward narrower inspections.
-- Large prompt/tool contexts are preflighted before local MLX execution to avoid
-  Metal or memory pressure crashes.
+- SSE deadlines and stream watchdogs prevent silent hangs.
+- Tool calls and reasoning streams are bounded and separated.
+- Repeated reasoning markers and malformed tool JSON are detected.
+- Broad local tool commands are blocked or redirected to narrower paths.
+- Prompt-size and tool-result caps reduce context spiral risk.
 
-### Autoresearch Supervisor
+### Modular Autoresearch
 
-The autoresearch loop is a deterministic supervisor around OpenClaw research
-turns. The LLM can propose hypotheses and synthesize findings, but the supervisor
-owns benchmark execution, task routing, review, memory protection, and promotion
-gates.
-
-Core loop:
-
-1. Measure baseline health and speed.
-2. Select the next runnable task from `tasks.jsonl`.
-3. Prefer deterministic supervisor tasks before model-bound research turns.
-4. Run bounded benchmarks or analyses.
-5. Record evidence in `results.tsv`, `findings.jsonl`, `experiments.jsonl`, and
-   benchmark artifacts.
-6. Review quality, task contracts, implementation handoff, replay guards, and
-   frontier eval.
-7. Keep, discard, suppress, or refocus lanes based on evidence.
-8. Seed the next deterministic tranche automatically.
-
-The loop is designed to continue overnight until `--max-hours` is reached or the
-user presses `Ctrl+C`. Clean external blockers are converted into an autonomous
-refocus tranche by default instead of stopping and waiting for manual prompting.
-
-### Frontier Expansion
-
-When the active speed lanes exhaust, the supervisor now opens one new bounded
-candidate path instead of repeating the same synthesis or stopping:
-
-- JANQ quantized-gradient calibration blockers route to a trace-distillation
-  candidate that detaches target traces and trains only the drafter-side
-  projection.
-- DFlash/JANQ blocker loops route to a candidate-search gate that only reopens
-  DFlash when the drafter candidate changes.
-- Settled MTP block-size sweeps route to verify/cache/rollback instrumentation.
-- Repeated clean runtime maps route to one scoped source-bridge candidate.
-
-Every frontier-expansion task is no-model-load, canary-only, scoped to OpenClaw,
-and carries explicit acceptance and rollback gates before any later promotion.
-
-### Frontier Agent Deliberation
-
-When deterministic lane routing cannot find the next useful move, the supervisor
-can run a bounded agent-to-agent deliberation layer. It is intentionally not a
-free-form swarm. It has three fixed roles:
-
-- **Scout** gathers current evidence and can run a timeout-bounded source scout
-  against allowlisted hosts such as GitHub, Reddit, X, Hugging Face, Google AI
-  docs, Rapid-MLX, dFlash, GEPA, Hermes Agent, and Karpathy autoresearch.
-- **Skeptic** rejects repeated exhausted work, duplicate synthesis, DFlash retry
-  loops without a changed candidate, and MTP block sweeps that already settled.
-- **Architect** emits exactly one canary-only deterministic contract with
-  acceptance, rollback, no-model-load, no-live-profile-change, and
-  no-opencode-change gates.
-
-The deliberation layer only writes evidence artifacts and durable tasks. It does
-not mutate source, profiles, model settings, runtime processes, or opencode. If
-active memory/Metal noise exists, it fails closed. If non-memory tool/model noise
-is present, it routes one recovery contract so the noise is handled as evidence
-instead of counted as progress.
-
-High-risk paths discovered by the architect are Crabbox-gated automatically.
-Runtime servers, launchers, model profiles, drafter calibration/training code,
-autopilot, watchdog, and proxy surfaces are tagged `crabbox_required=true`.
-Patches touching those surfaces may pass local canary, but promotion is blocked
-until fresh static-SSH-Mac Crabbox evidence, full-suite evidence, rollback
-rehearsal, and a `frontier-autonomy-score` of `100` are present.
-
-### Deterministic Lane Contracts
-
-Each research lane declares the work it is allowed to do:
-
-- prerequisites before it can run;
-- known hard blockers;
-- fallback or refocus route;
-- memory/cost class;
-- promotion gates;
-- rollback requirements.
-
-Examples:
-
-- DFlash/JANQ compatibility is blocked until the exact drafter candidate and
-  target-generated trace requirements are satisfied.
-- Settled block-size sweeps stop reseeding repeated work once evidence shows the
-  current block is the winner.
-- Drafter calibration fails closed when memory constraints make local training
-  unsafe, and uses stop-gradient target traces so quantized JANQ weights are not
-  differentiated through.
-- Runtime-overhead work is routed separately from raw decode-speed work so
-  measurement contamination does not masquerade as model speed.
-
-### Implementation Handoff
-
-Research does not directly mutate the live setup. Implementation goes through a
-gated bridge:
-
-- implementation candidates must be scoped to OpenClaw-owned files;
-- patch paths are allowlisted;
-- `.env`, token, key, password, secret, opencode, and private config paths are
-  denied;
-- safe patches run in a canary workspace first;
-- tests must pass before promotion;
-- architectural changes require explicit approval;
-- rollback information must be present.
-
-### Self-Improvement Sidecar
-
-The sidecar records trajectories, lessons, proposed skill updates, and evaluator
-feedback. It is advisory by default: generated variants are held for review and
-canary evaluation rather than mutating the active system automatically.
-
-The goal is a stable evolutionary layer: the system can learn from repeated
-failure modes and improve its own research instructions without destabilizing the
-main OpenClaw runtime.
-
-### Autoresearch Watchdog
-
-`openclaw-autoresearch-watchdog` is the independent reviewer layer. It is
-deliberately deterministic: it reads the active research workspace, checks the
-autopilot lock, latest log freshness, quality review, frontier eval,
-implementation handoff, stability burn-in, active noise, and decode metrics, then
-writes a review artifact under `~/.openclaw/research/speed/watchdog/`.
-
-The watchdog does not edit `tasks.jsonl` while autopilot owns the workspace. That
-keeps the main loop stable and avoids hidden races. Its job is to do the
-Codex-style health/quality review automatically and state the next deterministic
-move: continue, repair routing, investigate a stall, or seed the next candidate.
-
-The watchdog also writes an explicit architecture contract and advisory candidate
-list into each report. These candidates are evidence-linked and marked
-`allowed_for_live_queue=false`: the sidecar may propose, but only the autopilot
-and patch-executor can mutate live tasks after their normal quality, canary, and
-rollback gates pass. This keeps new ideas from becoming duplicate task noise.
-
-It also repairs stale autopilot locks. If a previous autopilot process is gone
-but `autopilot.lock` still points at that dead PID, the watchdog archives the
-lock under `watchdog/stale-locks/`, removes the stale marker, and reports an
-idle-ready state instead of leaving the next run blocked by old state.
-
-### Frontier Autonomy Score
-
-`frontier-autonomy-score` is the hard promotion authority for self-applied
-changes. It combines quality review, frontier eval, handoff audit, stability
-burn-in, canonical noise, bad-behavior rows, patch classification, canary
-evidence, rollback rehearsal, and Crabbox sandbox evidence into one deterministic
-decision.
-
-Promotion fails closed unless every hard gate passes:
-
-- quality score and scorecard are at least `99`;
-- frontier eval is at least `9.8`;
-- handoff audit is `100`;
-- stability burn-in passes;
-- active canonical noise is `0`;
-- memory, Metal, Python, tool-loop, malformed-output, and reasoning-leak signals
-  are absent in the active window;
-- rollback rehearsal is present for promotion;
-- architectural patches include fresh static-SSH-Mac Crabbox evidence.
-
-Safe/moderate patches may auto-promote only at score `100`. Architectural
-patches must pass Crabbox first, then local canary, then the same score gate.
-Passing promotions append to `stable-builds.jsonl`; failed or incomplete
-candidates are blocked/quarantined instead of mutating the live runtime.
-
-### Self-Improvement Alive Eval
-
-`alive-eval` scores whether the self-improvement layer is actually doing the
-manual work we were previously doing from Codex: observe health, diagnose
-quality loss, route one repair, evolve canary skills, shadow-review the change,
-and contain or roll back anything unsafe.
-
-The eval is deterministic and artifact-based. It checks durable lessons,
-trajectories, proposals, eval cases, canary variants, shadow reviews, rollback
-records, watchdog/routing evidence, zero active noise, and proof that active
-skills were not mutated directly. Each scored component now emits an evidence
-ledger with required artifact paths, counters, and pass/fail bits; if any
-required evidence is missing, certification fails closed. `frontier-eval` now
-includes this score, so the system cannot call itself frontier-level unless the
-self-improvement loop has evidence that it can replace manual check-and-patch
-intervention.
-
-Run once:
-
-```bash
-openclaw speed-research-watchdog --allow-degraded
-```
-
-Install the provided LaunchAgent template if you want it to run every 10 minutes:
-
-```bash
-cp launchagents/local.openclaw-autoresearch-watchdog.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/local.openclaw-autoresearch-watchdog.plist
-launchctl kickstart -k "gui/$UID/local.openclaw-autoresearch-watchdog"
-```
-
-## Referenced Ideas And Repositories
-
-This project is custom OpenClaw harness code, but several external projects and
-methods inform the design:
-
-- Karpathy `autoresearch`: small experiments, evidence-first notes,
-  keep/discard decisions, and durable research loops.
-  <https://github.com/karpathy/autoresearch>
-- DSPy GEPA: reflective prompt/program optimization ideas used as inspiration
-  for reviewer and policy refinement, while keeping active promotion gated.
-  <https://github.com/stanfordnlp/dspy>
-- Nous Research Hermes Agent: self-improvement and skill-memory concepts used
-  as inspiration for the sidecar trajectory/lesson/proposal layer.
-  <https://github.com/NousResearch/hermes-agent>
-- Rapid-MLX: speed-oriented MLX serving ideas, prefix cache, batching, and
-  backend performance direction.
-  <https://github.com/raullenchai/Rapid-MLX>
-- vMLX behavior: reference-only guidance for Gemma/JANG handling, streaming
-  stability, thinking/tool separation, and loop avoidance.
-- dFlash: speculative decoding and drafter-fit research direction for future
-  decode-speed work.
-  <https://github.com/z-lab/dflash>
-- Google Gemma MTP documentation: official multi-token prediction/drafter
-  concepts for Gemma-family decode speedups.
-  <https://ai.google.dev/gemma/docs/mtp/mtp>
-- Hugging Face model card guidance for the active Gemma 4 JANG/JANQ model family.
-
-External code is not vendored here unless explicitly present in this repository.
-These references are design inputs, not a claim that this repo is a fork of any
-of them.
-
-## Running Autoresearch
-
-Autoresearch is now profile-driven. The historical speed workflow is still the
-default preset, but any topic can define its own workspace, objective, metrics,
-lanes, and source queue through `research-profile.json`.
-
-Short run:
-
-```bash
-openclaw speed-research --max-hours 1 --cycles 20
-```
-
-Overnight run:
-
-```bash
-openclaw speed-research --max-hours 12 --cycles 80
-```
-
-The cycle count is a tranche size. The supervisor auto-extends while useful work
-remains and the max-hours budget has not expired. Stop with `Ctrl+C`; the
-autopilot writes a neutral interrupt checkpoint and stops OpenClaw-owned model
-processes when configured to do so.
-
-Runtime evidence is written under the OpenClaw research workspace:
-
-```text
-~/.openclaw/research/speed
-```
-
-That runtime workspace is intentionally not committed to this repo.
-
-Generic topic run:
+Speed research is now only the default preset. You can research any topic by
+setting a profile:
 
 ```bash
 OPENCLAW_RESEARCH_NAME="design-wiki" \
@@ -309,27 +89,210 @@ OPENCLAW_RESEARCH_LANES="source-scout,evidence-map,implementation-gate,safety" \
 openclaw research --max-hours 4 --cycles 80
 ```
 
-Useful generic aliases:
+Generic workspaces live under:
+
+```text
+~/.openclaw/research/<profile-slug>
+```
+
+Use `OPENCLAW_RESEARCH_DIR=/absolute/path` for an explicit workspace.
+
+### Research Profiles
+
+A profile defines the current research system:
+
+```mermaid
+flowchart LR
+    P["research-profile.json"] --> O["Objective"]
+    P --> M["Primary Metrics"]
+    P --> L["Allowed Lanes"]
+    P --> S["Source Topic"]
+    P --> F["Forbidden Scope"]
+    O --> W["program.md"]
+    M --> Q["Quality Review"]
+    L --> T["tasks.jsonl"]
+    S --> R["Source Scout"]
+```
+
+Examples:
+
+| Use Case | Primary Metrics | Suggested Lanes |
+| --- | --- | --- |
+| Decode speed | `decode_tps,mean_accept,speedup_factor` | `mtp-decode,drafter-alignment,runtime-overhead` |
+| Design wiki | `source_quality,coverage,actionability` | `source-scout,evidence-map,implementation-gate` |
+| App improvement | `bug_rate,task_success,latency` | `experiment,implementation-gate,safety` |
+| Research synthesis | `evidence_quality,novelty,reproducibility` | `source-scout,hypothesis,evidence-map` |
+
+## Metrics
+
+### Runtime Metrics
+
+```mermaid
+xychart-beta
+    title "Example Decode Path Improvement"
+    x-axis ["No Drafter", "Stable MTP", "Target"]
+    y-axis "tok/s" 0 --> 30
+    bar [12.5, 15.7, 20]
+```
+
+| Metric | Meaning | Why It Matters |
+| --- | --- | --- |
+| `decode_tps` | generated tokens per second | raw response speed |
+| `ttft_s` | time to first token | perceived snappiness |
+| `prefill_tps` | prompt processing speed | long-context startup cost |
+| `mean_accept` | accepted draft tokens | speculative decoding quality |
+| `memory_before/after` | macOS memory state | crash and pressure risk |
+| `measurement_quality` | clean vs contaminated | prevents false speed claims |
+
+### Autonomy Metrics
+
+```mermaid
+flowchart TD
+    A["Evidence Quality"] --> S["Frontier Score"]
+    B["No Active Noise"] --> S
+    C["Implementation Handoff"] --> S
+    D["Rollback Proof"] --> S
+    E["Memory/Crash Clean"] --> S
+    F["Watchdog Healthy"] --> S
+```
+
+| Metric | Good State |
+| --- | --- |
+| Quality score | `>= 99` for promotion |
+| Frontier eval | `>= 9.8` for promotion |
+| Handoff audit | `100` |
+| Active canonical noise | `0` |
+| Crash/memory/Metal signals | `0` active blockers |
+| Rollback rehearsal | present for promoted patches |
+
+These are intentionally strict. The system fails closed when evidence is
+missing.
+
+## Main Commands
+
+Speed preset:
 
 ```bash
-openclaw research-setup
-openclaw research-prompt
+openclaw speed-research --max-hours 10 --cycles 80
+```
+
+Generic profile:
+
+```bash
+openclaw research --max-hours 4 --cycles 80
+```
+
+Add a source:
+
+```bash
 openclaw research-add-source "https://example.com" --kind url --title "Example"
+```
+
+Print the current bootstrap prompt:
+
+```bash
+openclaw research-prompt
+```
+
+Run watchdog review:
+
+```bash
 openclaw research-watchdog --allow-degraded
 ```
 
-Generic workspaces live at:
+Run a decode benchmark for the speed profile:
 
-```text
-~/.openclaw/research/<OPENCLAW_RESEARCH_NAME slug>
+```bash
+openclaw speed-research-benchmark --mode decode-sample
 ```
 
-Use `OPENCLAW_RESEARCH_DIR=/absolute/path` when you need an explicit workspace.
-The speed commands remain compatibility aliases for the `speed` profile.
+## Evidence Files
 
-## Health And Quality Checks
+Each workspace contains:
 
-Common checks:
+| File | Purpose |
+| --- | --- |
+| `research-profile.json` | objective, metrics, lanes, scope |
+| `program.md` | installed research policy |
+| `STRATEGY.md` | current strategy and synthesis |
+| `RUN_MEMORY.md` | durable progress memory |
+| `tasks.jsonl` | active and completed work queue |
+| `results.tsv` | compact experiment ledger |
+| `findings.jsonl` | durable findings |
+| `experiments.jsonl` | experiment metadata |
+| `benchmarks/*.json` | detailed benchmark/review artifacts |
+| `watchdog/*.json` | independent health reports |
+
+## Implementation Safety
+
+Research does not directly mutate production code. Candidate patches go through:
+
+```mermaid
+flowchart LR
+    A["Idea"] --> B["Scoped Patch"]
+    B --> C["Path + Secret Scan"]
+    C --> D["Canary Workspace"]
+    D --> E["Focused Tests"]
+    E --> F["Rollback Check"]
+    F --> G{"Risk Tier"}
+    G -->|safe/moderate| H["Frontier Score"]
+    G -->|architectural| I["Crabbox Required"]
+    I --> H
+    H -->|pass| J["Promote"]
+    H -->|fail| K["Reject / Quarantine"]
+```
+
+Denied by default:
+
+- opencode files;
+- `.env` files;
+- passwords, API keys, OAuth tokens, private certificates;
+- private model caches;
+- runtime logs;
+- private local config.
+
+## Referenced Ideas
+
+This is custom OpenClaw harness code inspired by:
+
+- [Karpathy autoresearch](https://github.com/karpathy/autoresearch): small
+  evidence-first research loops.
+- [DSPy GEPA](https://github.com/stanfordnlp/dspy): reflective policy/program
+  optimization ideas.
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent): skill memory and
+  self-improvement concepts.
+- [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX): MLX serving and speed
+  ideas.
+- [dFlash](https://github.com/z-lab/dflash): speculative decoding and drafter
+  research direction.
+- [Gemma MTP docs](https://ai.google.dev/gemma/docs/mtp/mtp): multi-token
+  prediction/drafter concepts.
+
+External code is not vendored unless it is explicitly present in this repo.
+
+## Repository Layout
+
+```text
+openclaw/
+  openclaw-wrapper.zsh                 # user-facing wrapper and aliases
+  openclaw-model-proxy.py              # OpenAI-compatible proxy guardrails
+  openclaw-speed-research.py           # deterministic research helper commands
+  openclaw-speed-research-autopilot.py # autonomous supervisor loop
+  openclaw-autoresearch-watchdog.py    # independent deterministic reviewer
+  openclaw-drafter-fit.py              # JANQ drafter-fit gates
+  openclaw-mtp-drafter-calibrate.py    # bounded calibration helpers
+  test-*.py                            # safety and behavior tests
+
+launchagents/
+  *.plist                              # optional macOS LaunchAgent templates
+
+docs/case-studies/
+  *.md                                 # portfolio-readable case study logs
+```
+
+## Testing
+
+Common local checks:
 
 ```bash
 python3 openclaw/test-autonomy-policy.py
@@ -341,68 +304,9 @@ python3 -m compileall -q openclaw
 zsh -n openclaw/openclaw-wrapper.zsh
 ```
 
-Live no-model review checks:
+## Secret Hygiene
 
-```bash
-~/.openclaw/bin/openclaw-speed-research quality-review --recent-rows 120 --min-sweeps 3 --min-samples-per-block 3 --target-tps 30
-~/.openclaw/bin/openclaw-speed-research implementation-handoff-audit --min-score 90
-~/.openclaw/bin/openclaw-speed-research frontier-eval --recent-rows 120 --min-score 9 --allow-fail
-~/.openclaw/bin/openclaw-speed-research sota-eval --recent-rows 160 --allow-fail
-```
-
-The frontier eval tracks:
-
-- Karpathy-style core loop quality;
-- crash and memory safety;
-- research quality;
-- implementation handoff;
-- self-improvement;
-- modularity.
-
-The SOTA eval is stricter about autonomous behavior. It separately scores
-zero-noise stability, Scout/Skeptic/Architect problem solving, allowlisted source
-retrieval, Crabbox governance for high-risk paths, topic portability, and the
-review stack. It is the best single check for whether the system can keep moving
-without human/Codex intervention while still failing closed on unsafe changes.
-
-## Repository Layout
-
-```text
-openclaw/
-  openclaw-wrapper.zsh                 # user-facing OpenClaw wrapper
-  openclaw-model-proxy.py              # OpenAI-compatible proxy guardrails
-  openclaw-speed-research.py           # deterministic research helper commands
-  openclaw-speed-research-autopilot.py # overnight supervisor loop
-  openclaw-autoresearch-watchdog.py    # independent deterministic reviewer
-  openclaw-drafter-fit.py              # JANQ drafter-fit promotion gates
-  openclaw-mtp-drafter-calibrate.py    # bounded calibration helpers
-  test-*.py                            # focused safety and behavior tests
-
-launchagents/
-  local.openclaw-model-server.plist    # optional macOS LaunchAgent template
-  local.openclaw-autoresearch-watchdog.plist
-
-docs/case-studies/
-  *.md                                 # portfolio-readable case study logs
-```
-
-## Safety And Secret Hygiene
-
-The repo is intended to contain source, tests, docs, and launch templates only.
-Do not commit:
-
-- `.env` or `.env.*`;
-- API keys, passwords, OAuth tokens, or private certificates;
-- private SSH keys;
-- model cache files;
-- runtime logs;
-- local OpenClaw research artifacts;
-- opencode config or runtime files.
-
-The patch executor and implementation handoff also scan candidate patches for
-secret-like content and deny unsafe paths before promotion.
-
-Before pushing, run at minimum:
+Before pushing:
 
 ```bash
 git status --short
@@ -411,5 +315,4 @@ rg -n "(API_KEY|SECRET|TOKEN|PASSWORD|BEGIN (RSA|OPENSSH|PRIVATE)|sk-[A-Za-z0-9]
 ```
 
 Expected matches should be placeholder strings, denied-path tests, environment
-variable names, or documentation examples only. Investigate anything that looks
-like a real credential before committing.
+variable names, or documentation examples only.
