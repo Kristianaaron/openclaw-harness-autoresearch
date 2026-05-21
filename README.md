@@ -1,185 +1,154 @@
 # OpenClaw Harness Autoresearch
 
-A hardened OpenClaw-only research harness for local agent work on Apple Silicon.
+A modular autoresearch harness for OpenClaw.
 
-The project started as a local speed/reliability harness for OpenClaw running
-Gemma 4 JANG/JANQ, then grew into a modular autoresearch system. It keeps
-Karpathy-style autoresearch at the core: small experiments, evidence-first
-notes, TSV logs, and keep/discard decisions. On top of that, it adds production
-guardrails for local LLM agents: memory gates, deterministic supervisors,
-quality reviewers, implementation handoff, rollback rules, and modular research
-profiles.
-
-It does **not** manage opencode.
-
-## What This Adds To Karpathy Autoresearch
-
-Karpathy's `autoresearch` pattern is the base loop:
+It keeps the simple Karpathy autoresearch loop at the center:
 
 ```text
-question -> experiment -> result -> keep/discard -> next question
+question -> experiment -> evidence -> keep/discard -> next question
 ```
 
-This repo adds the harness needed to run that loop safely inside a local
-OpenClaw agent setup:
+Then it adds the engineering needed for that loop to run safely inside a local
+agent environment: deterministic supervision, quality review, memory/crash
+guards, implementation gates, rollback checks, and reusable research profiles.
 
-| Layer | Added Capability |
+This repo is OpenClaw-only. It does not manage opencode.
+
+## What It Adds
+
+| Area | What This Repo Adds |
 | --- | --- |
-| Runtime safety | macOS memory/Metal/Python crash gates before heavy local model work |
-| Supervisor | deterministic task routing before model-bound reasoning |
-| Evidence ledger | `results.tsv`, JSONL findings, benchmark artifacts, compact summaries |
-| Quality review | scorecards for noise, duplicate work, evidence quality, and next actions |
-| Implementation handoff | canary patches, allowlists, rollback checks, secret/path scans |
-| Self-improvement | advisory lessons, skill variants, shadow review, rollback records |
-| Modular profiles | research any topic by swapping objective, metrics, lanes, and sources |
-| Watchdog | independent health/quality reviewer that can detect stalls and stale locks |
+| Research profiles | Swap objective, metrics, lanes, and sources for different research goals |
+| Supervisor loop | Routes work through deterministic tasks before model-bound reasoning |
+| Evidence ledger | Stores compact progress in TSV, JSONL, benchmark, and review artifacts |
+| Quality review | Scores evidence quality, duplicate work, noise, blockers, and next action |
+| Safety gates | Blocks unsafe paths, secrets, private config, broad commands, and stale locks |
+| Implementation handoff | Requires scoped patches, canaries, tests, rollback, and promotion gates |
+| Watchdog | Reviews health and quality independently from the active research loop |
+| Self-improvement | Records lessons and candidate skill updates without mutating blindly |
 
-## System Flow
+## How The Loop Works
 
 ```mermaid
 flowchart TD
-    A["Research Profile"] --> B["Program + Strategy"]
-    B --> C["Autopilot Supervisor"]
-    C --> D{"Deterministic Task?"}
-    D -->|yes| E["Benchmark / Review / Source Scout"]
-    D -->|no| F["Bounded Agent Turn"]
-    E --> G["Evidence Artifacts"]
-    F --> G
-    G --> H["Quality + Frontier Review"]
-    H --> I{"Safe To Implement?"}
-    I -->|no| J["Refocus / Retire Lane / Record Blocker"]
-    I -->|yes| K["Patch Canary"]
-    K --> L{"Promotion Gates Pass?"}
-    L -->|yes| M["Promote + Mark Stable"]
-    L -->|no| N["Reject / Roll Back / Quarantine"]
-    J --> C
-    M --> C
-    N --> C
+    A["Research profile"] --> B["Supervisor"]
+    B --> C{"Can this be done deterministically?"}
+    C -->|yes| D["Run benchmark / review / source task"]
+    C -->|no| E["Run bounded agent turn"]
+    D --> F["Write evidence"]
+    E --> F
+    F --> G["Quality review"]
+    G --> H{"Actionable next step?"}
+    H -->|continue| B
+    H -->|blocked| I["Record blocker / route fallback"]
+    H -->|patch candidate| J["Canary implementation"]
+    I --> B
+    J --> K{"Promotion gates pass?"}
+    K -->|yes| L["Promote + mark stable"]
+    K -->|no| M["Reject / rollback / quarantine"]
+    L --> B
+    M --> B
 ```
 
-## Key Features
+## Research Profiles
 
-### Model And Runtime Guardrails
+A profile defines what the harness is trying to improve.
 
-- Profile-driven model backend selection.
-- OpenClaw gateway stays model-agnostic.
-- Launchers start only the needed OpenClaw-owned backend.
-- Memory gates check free memory, compressor, swap, and pressure.
-- Interrupt handling writes a neutral checkpoint and stops owned processes.
-- Large prompt/tool contexts are preflighted before local MLX execution.
+```mermaid
+flowchart LR
+    P["research-profile.json"] --> O["Objective"]
+    P --> M["Metrics"]
+    P --> L["Allowed lanes"]
+    P --> S["Sources"]
+    P --> R["Forbidden scope"]
+    O --> Q["program.md"]
+    M --> V["Quality review"]
+    L --> T["tasks.jsonl"]
+    S --> E["Evidence ledger"]
+```
 
-### Proxy And TUI Safety
-
-- SSE deadlines and stream watchdogs prevent silent hangs.
-- Tool calls and reasoning streams are bounded and separated.
-- Repeated reasoning markers and malformed tool JSON are detected.
-- Broad local tool commands are blocked or redirected to narrower paths.
-- Prompt-size and tool-result caps reduce context spiral risk.
-
-### Modular Autoresearch
-
-Speed research is now only the default preset. You can research any topic by
-setting a profile:
+Example generic run:
 
 ```bash
 OPENCLAW_RESEARCH_NAME="design-wiki" \
-OPENCLAW_RESEARCH_OBJECTIVE="Build a high-taste design reference wiki with evidence-backed source notes." \
+OPENCLAW_RESEARCH_OBJECTIVE="Build an evidence-backed design reference wiki." \
 OPENCLAW_RESEARCH_PRIMARY_METRICS="source_quality,coverage,actionability" \
 OPENCLAW_RESEARCH_LANES="source-scout,evidence-map,implementation-gate,safety" \
 openclaw research --max-hours 4 --cycles 80
 ```
 
-Generic workspaces live under:
+Workspaces live under:
 
 ```text
 ~/.openclaw/research/<profile-slug>
 ```
 
-Use `OPENCLAW_RESEARCH_DIR=/absolute/path` for an explicit workspace.
+Use `OPENCLAW_RESEARCH_DIR=/absolute/path` when you want an explicit workspace.
 
-### Research Profiles
+## Key Metrics
 
-A profile defines the current research system:
-
-```mermaid
-flowchart LR
-    P["research-profile.json"] --> O["Objective"]
-    P --> M["Primary Metrics"]
-    P --> L["Allowed Lanes"]
-    P --> S["Source Topic"]
-    P --> F["Forbidden Scope"]
-    O --> W["program.md"]
-    M --> Q["Quality Review"]
-    L --> T["tasks.jsonl"]
-    S --> R["Source Scout"]
-```
-
-Examples:
-
-| Use Case | Primary Metrics | Suggested Lanes |
-| --- | --- | --- |
-| Decode speed | `decode_tps,mean_accept,speedup_factor` | `mtp-decode,drafter-alignment,runtime-overhead` |
-| Design wiki | `source_quality,coverage,actionability` | `source-scout,evidence-map,implementation-gate` |
-| App improvement | `bug_rate,task_success,latency` | `experiment,implementation-gate,safety` |
-| Research synthesis | `evidence_quality,novelty,reproducibility` | `source-scout,hypothesis,evidence-map` |
-
-## Metrics
-
-### Runtime Metrics
-
-```mermaid
-xychart-beta
-    title "Example Decode Path Improvement"
-    x-axis ["No Drafter", "Stable MTP", "Target"]
-    y-axis "tok/s" 0 --> 30
-    bar [12.5, 15.7, 20]
-```
-
-| Metric | Meaning | Why It Matters |
-| --- | --- | --- |
-| `decode_tps` | generated tokens per second | raw response speed |
-| `ttft_s` | time to first token | perceived snappiness |
-| `prefill_tps` | prompt processing speed | long-context startup cost |
-| `mean_accept` | accepted draft tokens | speculative decoding quality |
-| `memory_before/after` | macOS memory state | crash and pressure risk |
-| `measurement_quality` | clean vs contaminated | prevents false speed claims |
-
-### Autonomy Metrics
+The harness is metric-driven. A research profile can define its own measures,
+but every run also tracks general system health.
 
 ```mermaid
 flowchart TD
-    A["Evidence Quality"] --> S["Frontier Score"]
-    B["No Active Noise"] --> S
-    C["Implementation Handoff"] --> S
-    D["Rollback Proof"] --> S
-    E["Memory/Crash Clean"] --> S
-    F["Watchdog Healthy"] --> S
+    A["Progress"] --> F["Run score"]
+    B["Evidence quality"] --> F
+    C["No active noise"] --> F
+    D["Implementation readiness"] --> F
+    E["Runtime stability"] --> F
 ```
 
-| Metric | Good State |
+| Metric | What It Answers |
 | --- | --- |
-| Quality score | `>= 99` for promotion |
-| Frontier eval | `>= 9.8` for promotion |
-| Handoff audit | `100` |
-| Active canonical noise | `0` |
-| Crash/memory/Metal signals | `0` active blockers |
-| Rollback rehearsal | present for promoted patches |
+| Progress | Did the run produce new durable evidence? |
+| Evidence quality | Are findings specific, reproducible, and tied to artifacts? |
+| Novelty | Is the system avoiding duplicate synthesis and repeated dead ends? |
+| Stability | Did memory, process, stream, and tool guards stay clean? |
+| Handoff readiness | Is an implementation candidate scoped, testable, and reversible? |
+| Promotion safety | Did canary, rollback, and score gates pass? |
 
-These are intentionally strict. The system fails closed when evidence is
-missing.
+## Implementation Safety
+
+Research does not directly mutate production code. Candidate changes move
+through a gated implementation path.
+
+```mermaid
+flowchart LR
+    A["Idea"] --> B["Scoped patch"]
+    B --> C["Path + secret scan"]
+    C --> D["Canary workspace"]
+    D --> E["Focused tests"]
+    E --> F["Rollback check"]
+    F --> G{"Risk tier"}
+    G -->|safe/moderate| H["Promotion score"]
+    G -->|architectural| I["Sandbox required"]
+    I --> H
+    H -->|pass| J["Promote"]
+    H -->|fail| K["Reject / quarantine"]
+```
+
+Denied by default:
+
+- opencode files;
+- `.env` files;
+- passwords, API keys, OAuth tokens, private certificates;
+- private model caches;
+- runtime logs;
+- private local config.
 
 ## Main Commands
 
-Speed preset:
-
-```bash
-openclaw speed-research --max-hours 10 --cycles 80
-```
-
-Generic profile:
+Generic research:
 
 ```bash
 openclaw research --max-hours 4 --cycles 80
+```
+
+Print the active bootstrap prompt:
+
+```bash
+openclaw research-prompt
 ```
 
 Add a source:
@@ -188,22 +157,10 @@ Add a source:
 openclaw research-add-source "https://example.com" --kind url --title "Example"
 ```
 
-Print the current bootstrap prompt:
-
-```bash
-openclaw research-prompt
-```
-
-Run watchdog review:
+Run an independent health review:
 
 ```bash
 openclaw research-watchdog --allow-degraded
-```
-
-Run a decode benchmark for the speed profile:
-
-```bash
-openclaw speed-research-benchmark --mode decode-sample
 ```
 
 ## Evidence Files
@@ -223,50 +180,16 @@ Each workspace contains:
 | `benchmarks/*.json` | detailed benchmark/review artifacts |
 | `watchdog/*.json` | independent health reports |
 
-## Implementation Safety
-
-Research does not directly mutate production code. Candidate patches go through:
-
-```mermaid
-flowchart LR
-    A["Idea"] --> B["Scoped Patch"]
-    B --> C["Path + Secret Scan"]
-    C --> D["Canary Workspace"]
-    D --> E["Focused Tests"]
-    E --> F["Rollback Check"]
-    F --> G{"Risk Tier"}
-    G -->|safe/moderate| H["Frontier Score"]
-    G -->|architectural| I["Crabbox Required"]
-    I --> H
-    H -->|pass| J["Promote"]
-    H -->|fail| K["Reject / Quarantine"]
-```
-
-Denied by default:
-
-- opencode files;
-- `.env` files;
-- passwords, API keys, OAuth tokens, private certificates;
-- private model caches;
-- runtime logs;
-- private local config.
-
 ## Referenced Ideas
 
 This is custom OpenClaw harness code inspired by:
 
 - [Karpathy autoresearch](https://github.com/karpathy/autoresearch): small
   evidence-first research loops.
-- [DSPy GEPA](https://github.com/stanfordnlp/dspy): reflective policy/program
-  optimization ideas.
+- [DSPy GEPA](https://github.com/stanfordnlp/dspy): reflective scoring and
+  policy/program optimization ideas.
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent): skill memory and
   self-improvement concepts.
-- [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX): MLX serving and speed
-  ideas.
-- [dFlash](https://github.com/z-lab/dflash): speculative decoding and drafter
-  research direction.
-- [Gemma MTP docs](https://ai.google.dev/gemma/docs/mtp/mtp): multi-token
-  prediction/drafter concepts.
 
 External code is not vendored unless it is explicitly present in this repo.
 
@@ -279,15 +202,14 @@ openclaw/
   openclaw-speed-research.py           # deterministic research helper commands
   openclaw-speed-research-autopilot.py # autonomous supervisor loop
   openclaw-autoresearch-watchdog.py    # independent deterministic reviewer
-  openclaw-drafter-fit.py              # JANQ drafter-fit gates
-  openclaw-mtp-drafter-calibrate.py    # bounded calibration helpers
+  openclaw_self_improvement.py         # sidecar memory and skill evolution
   test-*.py                            # safety and behavior tests
 
 launchagents/
   *.plist                              # optional macOS LaunchAgent templates
 
 docs/case-studies/
-  *.md                                 # portfolio-readable case study logs
+  *.md                                 # portfolio-readable case studies
 ```
 
 ## Testing

@@ -6,6 +6,9 @@ runtime evidence and may be noisy during overnight runs.
 
 ## Tracks
 
+- `openclaw-speed-autoresearch-portfolio-case-study.md` is the polished
+  portfolio narrative: the product problem, the system evolution, and the speed
+  research arc.
 - `openclaw-speed-harness-case-study.md` tracks the harness, runtime, memory,
   gateway, streaming, tool-calling, and autoresearch bridges.
 - `gemma-janq-drafter-training-case-study.md` tracks Gemma 4 JANQ drafter fit,
