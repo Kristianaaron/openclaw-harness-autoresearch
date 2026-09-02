@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 404" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" role="img" aria-labelledby="title desc">
   <title id="title">OpenClaw implementation safety path</title>
   <desc id="desc">An idea becomes a scoped patch, then a path and secret scan, canary workspace, focused tests, and rollback check. Risk tier sends safe or moderate work to a promotion score, and architectural work through a required sandbox first. The score either promotes the change or rejects and quarantines it.</desc>
   <defs>
@@ -7,7 +7,7 @@
     </marker>
   </defs>
 
-  <rect x="0.5" y="0.5" width="859" height="403" rx="14" fill="#0b1220" stroke="#334155" stroke-width="1"/>
+  <rect x="0.5" y="0.5" width="859" height="419" rx="14" fill="#0b1220" stroke="#334155" stroke-width="1"/>
 
   <!-- Gate path: six equal steps -->
   <rect x="16" y="24" width="128" height="58" rx="8" fill="#0f3d4c" stroke="#5eead4" stroke-width="1.5"/>
