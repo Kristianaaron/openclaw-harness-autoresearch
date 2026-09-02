@@ -110,53 +110,24 @@ zsh environment. They start a local model server and gateway on macOS
 
 ## How The Loop Works
 
-![Harness architecture: profile, supervisor, evidence, gated implementation](docs/assets/architecture.svg)
+![Harness architecture: research profile, supervisor, evidence ledger, and quality review](docs/assets/architecture.svg)
 
-```mermaid
-flowchart TD
-    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
-    classDef decide fill:#3d2f1f,stroke:#e7b549,color:#fefce8
-    classDef ok fill:#1a3d2f,stroke:#4ade80,color:#ecfdf5
-    classDef stop fill:#3f1d24,stroke:#fb7185,color:#fff1f2
-
-    A["Research profile"]:::box --> B["Supervisor"]:::box
-    B --> C{"Can this be done deterministically?"}:::decide
-    C -->|yes| D["Run benchmark / review / source task"]:::box
-    C -->|no| E["Run bounded agent turn"]:::box
-    D --> F["Write evidence"]:::box
-    E --> F
-    F --> G["Quality review"]:::box
-    G --> H{"Actionable next step?"}:::decide
-    H -->|continue| B
-    H -->|blocked| I["Record blocker / route fallback"]:::stop
-    H -->|patch candidate| J["Canary implementation"]:::box
-    I --> B
-    J --> K{"Promotion gates pass?"}:::decide
-    K -->|yes| L["Promote + mark stable"]:::ok
-    K -->|no| M["Reject / rollback / quarantine"]:::stop
-    L --> B
-    M --> B
-```
+Quality review returns continue, a blocker / fallback, or a canary path.
+Watchdog and self-improvement sit beside the loop; they do not ship patches.
 
 ## Research Profiles
 
-A profile defines what the harness is trying to improve.
+A profile defines what the harness is trying to improve. The architecture
+diagram treats the profile as the loop entry; the fields below are what it
+carries.
 
-```mermaid
-flowchart LR
-    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
-    classDef out fill:#1e3a5f,stroke:#7dd3fc,color:#f8fafc
-
-    P["research-profile.json"]:::box --> O["Objective"]:::out
-    P --> M["Metrics"]:::out
-    P --> L["Allowed lanes"]:::out
-    P --> S["Sources"]:::out
-    P --> R["Forbidden scope"]:::out
-    O --> Q["program.md"]:::box
-    M --> V["Quality review"]:::box
-    L --> T["tasks.jsonl"]:::box
-    S --> E["Evidence ledger"]:::box
-```
+| Field | What it shapes |
+| --- | --- |
+| Objective | Installed policy in `program.md` |
+| Metrics | Quality-review scoring |
+| Allowed lanes | Work queued in `tasks.jsonl` |
+| Sources | Inputs into the evidence ledger |
+| Forbidden scope | Safety gates and denied paths |
 
 Set profile fields with environment variables before `openclaw research`, as in
 the Quick Start example. `OPENCLAW_RESEARCH_NAME` is slugified into the
@@ -166,18 +137,6 @@ workspace directory name.
 
 The harness is metric-driven. A research profile can define its own measures;
 every run also tracks general system health.
-
-```mermaid
-flowchart TD
-    classDef box fill:#1e2937,stroke:#94a3b8,color:#f8fafc
-    classDef score fill:#1e3a5f,stroke:#7dd3fc,color:#f8fafc
-
-    A["Progress"]:::box --> F["Run score"]:::score
-    B["Evidence quality"]:::box --> F
-    C["No active noise"]:::box --> F
-    D["Implementation readiness"]:::box --> F
-    E["Runtime stability"]:::box --> F
-```
 
 | Metric | What it answers |
 | --- | --- |
@@ -193,25 +152,7 @@ flowchart TD
 Research does not directly mutate production code. Candidate changes move
 through a gated implementation path.
 
-```mermaid
-flowchart LR
-    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
-    classDef decide fill:#3d2f1f,stroke:#e7b549,color:#fefce8
-    classDef ok fill:#1a3d2f,stroke:#4ade80,color:#ecfdf5
-    classDef stop fill:#3f1d24,stroke:#fb7185,color:#fff1f2
-
-    A["Idea"]:::box --> B["Scoped patch"]:::box
-    B --> C["Path + secret scan"]:::box
-    C --> D["Canary workspace"]:::box
-    D --> E["Focused tests"]:::box
-    E --> F["Rollback check"]:::box
-    F --> G{"Risk tier"}:::decide
-    G -->|safe/moderate| H["Promotion score"]:::box
-    G -->|architectural| I["Sandbox required"]:::box
-    I --> H
-    H -->|pass| J["Promote"]:::ok
-    H -->|fail| K["Reject / quarantine"]:::stop
-```
+![Implementation safety: scoped patch, scan, canary, tests, rollback, then promote or reject](docs/assets/implementation-safety.svg)
 
 Denied by default:
 
@@ -323,7 +264,8 @@ launchagents/
   *.plist                              # optional macOS LaunchAgent templates
 
 docs/assets/
-  architecture.svg                     # loop overview used above
+  architecture.svg                     # runtime loop overview
+  implementation-safety.svg            # gated handoff, promote, rollback
 
 docs/case-studies/
   *.md                                 # portfolio-readable case studies
