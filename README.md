@@ -1,51 +1,139 @@
 # OpenClaw Harness Autoresearch
 
-A modular autoresearch harness for OpenClaw.
+Local OpenClaw-only modular autoresearch harness. It runs a Karpathy-style
+research loop inside a local agent environment, then adds the engineering
+needed to keep that loop evidence-first, gated, and reversible.
 
-It keeps the simple Karpathy autoresearch loop at the center:
+[![Public](https://img.shields.io/badge/visibility-public-2ea44f)](https://github.com/Kristianaaron/openclaw-harness-autoresearch)
+[![Python](https://img.shields.io/badge/python-3-3776AB)](#testing)
+[![OpenClaw-only](https://img.shields.io/badge/scope-OpenClaw--only-0f766e)](#what-this-is-not)
+[![Tests](https://img.shields.io/badge/tests-local%20python3-6e7781)](#testing)
 
 ```text
 question -> experiment -> evidence -> keep/discard -> next question
 ```
 
-Then it adds the engineering needed for that loop to run safely inside a local
-agent environment: deterministic supervision, quality review, memory/crash
-guards, implementation gates, rollback checks, and reusable research profiles.
+The supervisor prefers deterministic work (benchmark, review, source task)
+before a bounded agent turn. Evidence is written to a ledger. Quality review
+decides the next action: continue, record a blocker, or open a canary
+implementation path. Research does not mutate production code directly.
 
-This repo is OpenClaw-only. It does not manage opencode.
+This repo does not manage opencode. Workspaces live under
+`~/.openclaw/research/<profile-slug>`.
+
+## What This Is Not
+
+- Not the npm plugin `@gianfrancopiana/openclaw-autoresearch`.
+- Not a port of pi-autoresearch.
+- Not a packaged CLI on npm or PyPI. There is no installable package name here.
+- Not a fork of [Karpathy autoresearch](https://github.com/karpathy/autoresearch).
+  The loop is inspired by that method; the code in this repo is custom
+  OpenClaw harness work.
+- Not an opencode manager. OpenClaw-owned files only.
+
+## Quick Start
+
+This is a **local Mac / OpenClaw** harness, not a `pip` or `npm` install.
+The `openclaw` commands below are aliases from
+[`openclaw/openclaw-wrapper.zsh`](openclaw/openclaw-wrapper.zsh), a zsh
+autoload function. That wrapper expects a local OpenClaw install (the
+checked-in file points at Homebrew `/opt/homebrew/bin/openclaw`) and syncs
+helpers from this repo into `~/.openclaw/bin`.
+
+```bash
+git clone https://github.com/Kristianaaron/openclaw-harness-autoresearch.git
+cd openclaw-harness-autoresearch
+export OPENCLAW_HARNESS_REPO="$PWD"
+```
+
+`OPENCLAW_HARNESS_REPO` must point at this clone so the wrapper can sync
+helpers. If it is unset, the wrapper uses a machine-local default.
+
+Runtime workspaces are **outside** the git repo:
+
+```text
+~/.openclaw/research/<profile-slug>
+```
+
+Use `OPENCLAW_RESEARCH_DIR=/absolute/path` for an explicit workspace. If you
+do not set a profile name, the default slug is `speed`
+(`~/.openclaw/research/speed`).
+
+Generic research run (wrapper runs `setup`, then the supervisor):
+
+```bash
+OPENCLAW_RESEARCH_NAME="design-wiki" \
+OPENCLAW_RESEARCH_OBJECTIVE="Build an evidence-backed design reference wiki." \
+OPENCLAW_RESEARCH_PRIMARY_METRICS="source_quality,coverage,actionability" \
+OPENCLAW_RESEARCH_LANES="source-scout,evidence-map,implementation-gate,safety" \
+openclaw research --max-hours 4 --cycles 80
+```
+
+Print the bootstrap prompt without starting a run:
+
+```bash
+openclaw research-prompt
+```
+
+These commands assume the wrapper is already loaded in your local OpenClaw
+zsh environment. They start a local model server and gateway on macOS
+(`launchctl`, memory gates). They are not a portable Linux CLI.
+
+## Contents
+
+- [What It Adds](#what-it-adds)
+- [How The Loop Works](#how-the-loop-works)
+- [Research Profiles](#research-profiles)
+- [Key Metrics](#key-metrics)
+- [Implementation Safety](#implementation-safety)
+- [Commands](#commands)
+- [Evidence Files](#evidence-files)
+- [Testing](#testing)
+- [Secret Hygiene](#secret-hygiene)
+- [Referenced Ideas](#referenced-ideas)
+- [Repository Layout](#repository-layout)
+- [Case Studies](#case-studies)
+- [License](#license)
 
 ## What It Adds
 
-| Area | What This Repo Adds |
+| Area | What this repo adds |
 | --- | --- |
 | Research profiles | Swap objective, metrics, lanes, and sources for different research goals |
 | Supervisor loop | Routes work through deterministic tasks before model-bound reasoning |
-| Evidence ledger | Stores compact progress in TSV, JSONL, benchmark, and review artifacts |
+| Evidence ledger | Compact progress in TSV, JSONL, benchmark, and review artifacts |
 | Quality review | Scores evidence quality, duplicate work, noise, blockers, and next action |
 | Safety gates | Blocks unsafe paths, secrets, private config, broad commands, and stale locks |
-| Implementation handoff | Requires scoped patches, canaries, tests, rollback, and promotion gates |
-| Watchdog | Reviews health and quality independently from the active research loop |
-| Self-improvement | Records lessons and candidate skill updates without mutating blindly |
+| Implementation handoff | Scoped patches, canaries, tests, rollback, and promotion gates |
+| Watchdog | Independent health and quality review, separate from the active loop |
+| Self-improvement | Lessons and candidate skill updates without mutating blindly |
 
 ## How The Loop Works
 
+![Harness architecture: profile, supervisor, evidence, gated implementation](docs/assets/architecture.svg)
+
 ```mermaid
 flowchart TD
-    A["Research profile"] --> B["Supervisor"]
-    B --> C{"Can this be done deterministically?"}
-    C -->|yes| D["Run benchmark / review / source task"]
-    C -->|no| E["Run bounded agent turn"]
-    D --> F["Write evidence"]
+    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
+    classDef decide fill:#3d2f1f,stroke:#e7b549,color:#fefce8
+    classDef ok fill:#1a3d2f,stroke:#4ade80,color:#ecfdf5
+    classDef stop fill:#3f1d24,stroke:#fb7185,color:#fff1f2
+
+    A["Research profile"]:::box --> B["Supervisor"]:::box
+    B --> C{"Can this be done deterministically?"}:::decide
+    C -->|yes| D["Run benchmark / review / source task"]:::box
+    C -->|no| E["Run bounded agent turn"]:::box
+    D --> F["Write evidence"]:::box
     E --> F
-    F --> G["Quality review"]
-    G --> H{"Actionable next step?"}
+    F --> G["Quality review"]:::box
+    G --> H{"Actionable next step?"}:::decide
     H -->|continue| B
-    H -->|blocked| I["Record blocker / route fallback"]
-    H -->|patch candidate| J["Canary implementation"]
+    H -->|blocked| I["Record blocker / route fallback"]:::stop
+    H -->|patch candidate| J["Canary implementation"]:::box
     I --> B
-    J --> K{"Promotion gates pass?"}
-    K -->|yes| L["Promote + mark stable"]
-    K -->|no| M["Reject / rollback / quarantine"]
+    J --> K{"Promotion gates pass?"}:::decide
+    K -->|yes| L["Promote + mark stable"]:::ok
+    K -->|no| M["Reject / rollback / quarantine"]:::stop
     L --> B
     M --> B
 ```
@@ -56,50 +144,42 @@ A profile defines what the harness is trying to improve.
 
 ```mermaid
 flowchart LR
-    P["research-profile.json"] --> O["Objective"]
-    P --> M["Metrics"]
-    P --> L["Allowed lanes"]
-    P --> S["Sources"]
-    P --> R["Forbidden scope"]
-    O --> Q["program.md"]
-    M --> V["Quality review"]
-    L --> T["tasks.jsonl"]
-    S --> E["Evidence ledger"]
+    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
+    classDef out fill:#1e3a5f,stroke:#7dd3fc,color:#f8fafc
+
+    P["research-profile.json"]:::box --> O["Objective"]:::out
+    P --> M["Metrics"]:::out
+    P --> L["Allowed lanes"]:::out
+    P --> S["Sources"]:::out
+    P --> R["Forbidden scope"]:::out
+    O --> Q["program.md"]:::box
+    M --> V["Quality review"]:::box
+    L --> T["tasks.jsonl"]:::box
+    S --> E["Evidence ledger"]:::box
 ```
 
-Example generic run:
-
-```bash
-OPENCLAW_RESEARCH_NAME="design-wiki" \
-OPENCLAW_RESEARCH_OBJECTIVE="Build an evidence-backed design reference wiki." \
-OPENCLAW_RESEARCH_PRIMARY_METRICS="source_quality,coverage,actionability" \
-OPENCLAW_RESEARCH_LANES="source-scout,evidence-map,implementation-gate,safety" \
-openclaw research --max-hours 4 --cycles 80
-```
-
-Workspaces live under:
-
-```text
-~/.openclaw/research/<profile-slug>
-```
-
-Use `OPENCLAW_RESEARCH_DIR=/absolute/path` when you want an explicit workspace.
+Set profile fields with environment variables before `openclaw research`, as in
+the Quick Start example. `OPENCLAW_RESEARCH_NAME` is slugified into the
+workspace directory name.
 
 ## Key Metrics
 
-The harness is metric-driven. A research profile can define its own measures,
-but every run also tracks general system health.
+The harness is metric-driven. A research profile can define its own measures;
+every run also tracks general system health.
 
 ```mermaid
 flowchart TD
-    A["Progress"] --> F["Run score"]
-    B["Evidence quality"] --> F
-    C["No active noise"] --> F
-    D["Implementation readiness"] --> F
-    E["Runtime stability"] --> F
+    classDef box fill:#1e2937,stroke:#94a3b8,color:#f8fafc
+    classDef score fill:#1e3a5f,stroke:#7dd3fc,color:#f8fafc
+
+    A["Progress"]:::box --> F["Run score"]:::score
+    B["Evidence quality"]:::box --> F
+    C["No active noise"]:::box --> F
+    D["Implementation readiness"]:::box --> F
+    E["Runtime stability"]:::box --> F
 ```
 
-| Metric | What It Answers |
+| Metric | What it answers |
 | --- | --- |
 | Progress | Did the run produce new durable evidence? |
 | Evidence quality | Are findings specific, reproducible, and tied to artifacts? |
@@ -115,53 +195,52 @@ through a gated implementation path.
 
 ```mermaid
 flowchart LR
-    A["Idea"] --> B["Scoped patch"]
-    B --> C["Path + secret scan"]
-    C --> D["Canary workspace"]
-    D --> E["Focused tests"]
-    E --> F["Rollback check"]
-    F --> G{"Risk tier"}
-    G -->|safe/moderate| H["Promotion score"]
-    G -->|architectural| I["Sandbox required"]
+    classDef box fill:#1e2937,stroke:#7dd3c0,color:#f8fafc
+    classDef decide fill:#3d2f1f,stroke:#e7b549,color:#fefce8
+    classDef ok fill:#1a3d2f,stroke:#4ade80,color:#ecfdf5
+    classDef stop fill:#3f1d24,stroke:#fb7185,color:#fff1f2
+
+    A["Idea"]:::box --> B["Scoped patch"]:::box
+    B --> C["Path + secret scan"]:::box
+    C --> D["Canary workspace"]:::box
+    D --> E["Focused tests"]:::box
+    E --> F["Rollback check"]:::box
+    F --> G{"Risk tier"}:::decide
+    G -->|safe/moderate| H["Promotion score"]:::box
+    G -->|architectural| I["Sandbox required"]:::box
     I --> H
-    H -->|pass| J["Promote"]
-    H -->|fail| K["Reject / quarantine"]
+    H -->|pass| J["Promote"]:::ok
+    H -->|fail| K["Reject / quarantine"]:::stop
 ```
 
 Denied by default:
 
-- opencode files;
-- `.env` files;
-- passwords, API keys, OAuth tokens, private certificates;
-- private model caches;
-- runtime logs;
-- private local config.
+- opencode files
+- `.env` files
+- passwords, API keys, OAuth tokens, private certificates
+- private model caches
+- runtime logs
+- private local config
 
-## Main Commands
+Patch classification also rejects path fragments such as `token`, `secret`,
+`password`, `id_rsa`, `.pem`, and `.key`. Broad local search (`find ~`,
+recursive home greps) is blocked in the research program.
 
-Generic research:
+## Commands
 
-```bash
-openclaw research --max-hours 4 --cycles 80
-```
+Wrapper aliases from [`openclaw/openclaw-wrapper.zsh`](openclaw/openclaw-wrapper.zsh).
+Same commands have `research-*`, `speed-research-*`, and `autoresearch-*` names.
 
-Print the active bootstrap prompt:
+| Command | Purpose |
+| --- | --- |
+| `openclaw research --max-hours 4 --cycles 80` | Run the supervisor loop |
+| `openclaw research-prompt` | Print the active bootstrap prompt |
+| `openclaw research-setup` | Initialize the workspace without starting the loop |
+| `openclaw research-add-source "https://example.com" --kind url --title "Example"` | Add a source (`note`, `url`, `image-url`, `file`, `article`) |
+| `openclaw research-watchdog --allow-degraded` | Independent health review |
 
-```bash
-openclaw research-prompt
-```
-
-Add a source:
-
-```bash
-openclaw research-add-source "https://example.com" --kind url --title "Example"
-```
-
-Run an independent health review:
-
-```bash
-openclaw research-watchdog --allow-degraded
-```
+`--cycles` is a tranche size (autopilot default `48`). `--max-hours` is the
+wall-clock budget (autopilot default `8`). Stop with `Ctrl+C`.
 
 ## Evidence Files
 
@@ -169,16 +248,50 @@ Each workspace contains:
 
 | File | Purpose |
 | --- | --- |
-| `research-profile.json` | objective, metrics, lanes, scope |
-| `program.md` | installed research policy |
-| `STRATEGY.md` | current strategy and synthesis |
-| `RUN_MEMORY.md` | durable progress memory |
-| `tasks.jsonl` | active and completed work queue |
-| `results.tsv` | compact experiment ledger |
-| `findings.jsonl` | durable findings |
-| `experiments.jsonl` | experiment metadata |
-| `benchmarks/*.json` | detailed benchmark/review artifacts |
-| `watchdog/*.json` | independent health reports |
+| `research-profile.json` | Objective, metrics, lanes, scope |
+| `program.md` | Installed research policy |
+| `STRATEGY.md` | Current strategy and synthesis |
+| `RUN_MEMORY.md` | Durable progress memory |
+| `tasks.jsonl` | Active and completed work queue |
+| `results.tsv` | Compact experiment ledger |
+| `findings.jsonl` | Durable findings |
+| `experiments.jsonl` | Experiment metadata |
+| `benchmarks/*.json` | Detailed benchmark/review artifacts |
+| `watchdog/*.json` | Independent health reports |
+
+Related files the supervisor also maintains include `rejections.jsonl`,
+`ideas.md`, `sources/queue.md`, and `implementation-skill.md`. Keep the
+runtime workspace out of git.
+
+## Testing
+
+Common local checks (no GitHub Actions workflow in this repo):
+
+```bash
+python3 openclaw/test-autonomy-policy.py
+python3 openclaw/test-speed-research.py
+python3 openclaw/test-speed-research-autopilot.py
+python3 openclaw/test-self-improvement.py
+python3 openclaw/test-autoresearch-watchdog.py
+python3 -m compileall -q openclaw
+zsh -n openclaw/openclaw-wrapper.zsh
+```
+
+Additional `openclaw/test-*.py` files cover proxy, launcher, overlay, and
+drafter-fit guards.
+
+## Secret Hygiene
+
+Before pushing:
+
+```bash
+git status --short
+find . -maxdepth 3 \( -name '.env*' -o -name '*secret*' -o -name '*token*' -o -name '*key*' -o -name '*.pem' -o -name '*.p12' -o -name 'id_rsa*' -o -name 'id_ed25519*' \) -not -path './.git/*' -print
+rg -n "(API_KEY|SECRET|TOKEN|PASSWORD|BEGIN (RSA|OPENSSH|PRIVATE)|sk-[A-Za-z0-9])" --glob '!*.log' --glob '!**/.git/**'
+```
+
+Expected matches should be placeholder strings, denied-path tests, environment
+variable names, or documentation examples only.
 
 ## Referenced Ideas
 
@@ -201,6 +314,7 @@ openclaw/
   openclaw-model-proxy.py              # OpenAI-compatible proxy guardrails
   openclaw-speed-research.py           # deterministic research helper commands
   openclaw-speed-research-autopilot.py # autonomous supervisor loop
+  openclaw_speed_research_core.py      # shared workspace and ledger helpers
   openclaw-autoresearch-watchdog.py    # independent deterministic reviewer
   openclaw_self_improvement.py         # sidecar memory and skill evolution
   test-*.py                            # safety and behavior tests
@@ -208,33 +322,18 @@ openclaw/
 launchagents/
   *.plist                              # optional macOS LaunchAgent templates
 
+docs/assets/
+  architecture.svg                     # loop overview used above
+
 docs/case-studies/
   *.md                                 # portfolio-readable case studies
 ```
 
-## Testing
+## Case Studies
 
-Common local checks:
+Portfolio-readable logs live in [`docs/case-studies/`](docs/case-studies/).
+They are separate from live workspace evidence under `~/.openclaw/research/`.
 
-```bash
-python3 openclaw/test-autonomy-policy.py
-python3 openclaw/test-speed-research.py
-python3 openclaw/test-speed-research-autopilot.py
-python3 openclaw/test-self-improvement.py
-python3 openclaw/test-autoresearch-watchdog.py
-python3 -m compileall -q openclaw
-zsh -n openclaw/openclaw-wrapper.zsh
-```
+## License
 
-## Secret Hygiene
-
-Before pushing:
-
-```bash
-git status --short
-find . -maxdepth 3 \( -name '.env*' -o -name '*secret*' -o -name '*token*' -o -name '*key*' -o -name '*.pem' -o -name '*.p12' -o -name 'id_rsa*' -o -name 'id_ed25519*' \) -not -path './.git/*' -print
-rg -n "(API_KEY|SECRET|TOKEN|PASSWORD|BEGIN (RSA|OPENSSH|PRIVATE)|sk-[A-Za-z0-9])" --glob '!*.log' --glob '!**/.git/**'
-```
-
-Expected matches should be placeholder strings, denied-path tests, environment
-variable names, or documentation examples only.
+This repository currently has no `LICENSE` file.
