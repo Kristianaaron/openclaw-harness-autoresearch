@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" role="img" aria-labelledby="title desc">
+  <title id="title">OpenClaw harness architecture</title>
+  <desc id="desc">Research profile feeds a supervisor. The supervisor runs deterministic tasks or a bounded agent turn, writes an evidence ledger, then quality review routes to continue, record a blocker, or a canary implementation path with promote or rollback. A watchdog and self-improvement sidecar sit beside the loop.</desc>
+  <defs>
+    <style>
+      .label { font: 600 13px ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #f8fafc; }
+      .sub { font: 500 11px ui-sans-serif, system-ui, -apple-system, sans-serif; fill: #cbd5e1; }
+      .edge { stroke: #64748b; stroke-width: 1.6; fill: none; }
+      .arrow { fill: #64748b; }
+    </style>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" class="arrow"/>
+    </marker>
+  </defs>
+
+  <!-- Profile -->
+  <rect x="280" y="16" width="200" height="44" rx="8" fill="#0f3d4c" stroke="#5eead4" stroke-width="1.5"/>
+  <text x="380" y="43" text-anchor="middle" class="label">Research profile</text>
+
+  <path class="edge" marker-end="url(#arrow)" d="M380 60 V86"/>
+
+  <!-- Supervisor -->
+  <rect x="248" y="90" width="264" height="52" rx="8" fill="#1e3a5f" stroke="#7dd3fc" stroke-width="1.5"/>
+  <text x="380" y="121" text-anchor="middle" class="label">Deterministic supervisor</text>
+
+  <!-- Side cars -->
+  <rect x="16" y="90" width="168" height="52" rx="8" fill="#2d2a4a" stroke="#c4b5fd" stroke-width="1.5"/>
+  <text x="100" y="121" text-anchor="middle" class="label">Watchdog</text>
+  <rect x="576" y="90" width="168" height="52" rx="8" fill="#2d2a4a" stroke="#c4b5fd" stroke-width="1.5"/>
+  <text x="660" y="114" text-anchor="middle" class="label">Self-improvement</text>
+  <text x="660" y="130" text-anchor="middle" class="sub">advisory sidecar</text>
+
+  <path class="edge" marker-end="url(#arrow)" d="M184 116 H244"/>
+  <path class="edge" marker-end="url(#arrow)" d="M512 116 H572"/>
+
+  <path class="edge" marker-end="url(#arrow)" d="M320 142 V168"/>
+  <path class="edge" marker-end="url(#arrow)" d="M440 142 V168"/>
+
+  <!-- Two work paths -->
+  <rect x="196" y="172" width="168" height="48" rx="8" fill="#1e2937" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="280" y="193" text-anchor="middle" class="label">Deterministic task</text>
+  <text x="280" y="209" text-anchor="middle" class="sub">benchmark / review / source</text>
+  <rect x="396" y="172" width="168" height="48" rx="8" fill="#1e2937" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="480" y="193" text-anchor="middle" class="label">Bounded agent turn</text>
+  <text x="480" y="209" text-anchor="middle" class="sub">model-bound reasoning</text>
+
+  <path class="edge" marker-end="url(#arrow)" d="M280 220 V248"/>
+  <path class="edge" marker-end="url(#arrow)" d="M480 220 V248"/>
+
+  <!-- Evidence -->
+  <rect x="248" y="252" width="264" height="44" rx="8" fill="#1a3d2f" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="380" y="279" text-anchor="middle" class="label">Evidence ledger</text>
+
+  <path class="edge" marker-end="url(#arrow)" d="M380 296 V322"/>
+
+  <!-- Review -->
+  <rect x="248" y="326" width="264" height="44" rx="8" fill="#3d2f1f" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="380" y="353" text-anchor="middle" class="label">Quality review</text>
+
+  <!-- Outcomes -->
+  <path class="edge" marker-end="url(#arrow)" d="M280 370 V392"/>
+  <path class="edge" marker-end="url(#arrow)" d="M380 370 V392"/>
+  <path class="edge" marker-end="url(#arrow)" d="M480 370 V392"/>
+
+  <text x="280" y="412" text-anchor="middle" class="sub">continue</text>
+  <text x="380" y="412" text-anchor="middle" class="sub">blocker</text>
+  <text x="480" y="412" text-anchor="middle" class="sub">canary / promote / rollback</text>
+</svg>
